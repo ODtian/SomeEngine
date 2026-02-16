@@ -48,6 +48,11 @@ TestResults/
 
 # NuGet Packages
 *.nupkg
+
+# Python
+.venv/
+__pycache__/
+*.pyc
 # NuGet Symbol Packages
 *.snupkg
 # Custom NuGet mirror settings
