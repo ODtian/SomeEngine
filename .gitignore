@@ -71,3 +71,6 @@ Thumbs.db
 # External dependencies (if any downloaded binaries)
 external/bin/
 external/lib/
+
+samples/
+*.exe

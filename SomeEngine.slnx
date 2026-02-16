@@ -1,0 +1,38 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SomeEngine.Animation/SomeEngine.Animation.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/SomeEngine.Assets/SomeEngine.Assets.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/SomeEngine.Core/SomeEngine.Core.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/SomeEngine.Editor/SomeEngine.Editor.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/SomeEngine.Physics/SomeEngine.Physics.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/SomeEngine.Render/SomeEngine.Render.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/SomeEngine.Runtime/SomeEngine.Runtime.csproj">
+      <Platform Project="x64" />
+    </Project>
+    <Project Path="src/SomeEngine.UI/SomeEngine.UI.csproj">
+      <Platform Project="x64" />
+    </Project>
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SomeEngine.Tests/SomeEngine.Tests.csproj">
+      <Platform Project="x64" />
+    </Project>
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/DagVisualizer/SomeEngine.DagVisualizer.csproj">
+      <Platform Project="x64" />
+    </Project>
+  </Folder>
+</Solution>

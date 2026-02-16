@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <Platforms>x64</Platforms>
+    <Platform Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU' Or '$(Platform)' == 'Any CPU'">x64</Platform>
+    <PlatformTarget Condition="'$(PlatformTarget)' == '' Or '$(PlatformTarget)' == 'AnyCPU' Or '$(PlatformTarget)' == 'Any CPU'">x64</PlatformTarget>
+  </PropertyGroup>
+</Project>

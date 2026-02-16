@@ -1,0 +1,43 @@
+// FlatBuffers schema for MeshAsset
+namespace SomeEngine.Assets.Schema;
+
+attribute "fs_serializer";
+attribute "fs_vector";
+
+struct Vec3 { x:float; y:float; z:float; }
+
+struct Bounds {
+    center:Vec3;
+    radius:float;
+}
+
+enum ValueType : ubyte {
+    Undefined = 0,
+    Int8,
+    Int16,
+    Int32,
+    UInt8,
+    UInt16,
+    UInt32,
+    Float16,
+    Float32,
+    Float64
+}
+
+table VertexAttribute {
+    name: string;
+    type: ValueType;
+    components: ubyte;
+    normalized: bool;
+    offset: ushort;
+}
+
+table MeshAsset (fs_serializer) {
+    name:string;
+    bounds:Bounds;
+    attributes:[VertexAttribute] (fs_vector:"IList");
+    payload:[ubyte] (fs_vector:"Memory");
+}
+
+root_type MeshAsset;
+
