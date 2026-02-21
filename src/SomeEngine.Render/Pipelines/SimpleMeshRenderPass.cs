@@ -4,6 +4,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using Diligent;
 using SomeEngine.Assets.Importers;
+using SomeEngine.Assets.Schema;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
 
@@ -67,8 +68,8 @@ public class SimpleMeshRenderPass : RenderPass, IDisposable
                     BindFlags = BindFlags.VertexBuffer,
                     Size = (ulong)(vertData.Length * sizeof(float))
                 };
-                _vb = device.CreateBuffer(vbDesc);
-                _context.ImmediateContext.UpdateBuffer(_vb, 0, vbDesc.Size, (IntPtr)pVerts, ResourceStateTransitionMode.Transition);
+                _vb = device!.CreateBuffer(vbDesc);
+                _context.ImmediateContext!.UpdateBuffer(_vb, 0, vbDesc.Size, (IntPtr)pVerts, ResourceStateTransitionMode.Transition);
             }
 
             fixed (uint* pInds = indices)
@@ -80,8 +81,8 @@ public class SimpleMeshRenderPass : RenderPass, IDisposable
                     BindFlags = BindFlags.IndexBuffer,
                     Size = (ulong)(indices.Length * sizeof(uint))
                 };
-                _ib = device.CreateBuffer(ibDesc);
-                _context.ImmediateContext.UpdateBuffer(_ib, 0, ibDesc.Size, (IntPtr)pInds, ResourceStateTransitionMode.Transition);
+                _ib = device!.CreateBuffer(ibDesc);
+                _context.ImmediateContext!.UpdateBuffer(_ib, 0, ibDesc.Size, (IntPtr)pInds, ResourceStateTransitionMode.Transition);
             }
         }
 
@@ -93,34 +94,26 @@ public class SimpleMeshRenderPass : RenderPass, IDisposable
             CPUAccessFlags = CpuAccessFlags.Write,
             Size = (ulong)Marshal.SizeOf<Constants>()
         };
-        _cb = device.CreateBuffer(cbDesc);
+        _cb = device!.CreateBuffer(cbDesc);
     }
 
     private void CreatePSO()
     {
-        var device = _context.Device;
+        var device = _context.Device!;
         
-        using var shaderSourceFactory = _context.Factory?.CreateDefaultShaderSourceStreamFactory("assets/Shaders");
+        // Import Slang shader
+        string slangPath = Path.Combine(AppContext.BaseDirectory, "assets", "Shaders", "simple_mesh.slang");
         
-        var vsCI = new ShaderCreateInfo
+        if (!File.Exists(slangPath))
         {
-            FilePath = "simple_mesh.hlsl",
-            EntryPoint = "VSMain",
-            Desc = new ShaderDesc { Name = "SimpleMesh VS", ShaderType = ShaderType.Vertex },
-            SourceLanguage = ShaderSourceLanguage.Hlsl,
-            ShaderSourceStreamFactory = shaderSourceFactory
-        };
-        using var vs = device.CreateShader(vsCI, out _);
-
-        var psCI = new ShaderCreateInfo
-        {
-            FilePath = "simple_mesh.hlsl",
-            EntryPoint = "PSMain",
-            Desc = new ShaderDesc { Name = "SimpleMesh PS", ShaderType = ShaderType.Pixel },
-            SourceLanguage = ShaderSourceLanguage.Hlsl,
-            ShaderSourceStreamFactory = shaderSourceFactory
-        };
-        using var ps = device.CreateShader(psCI, out _);
+             // Fallback to source directory if running from build output but assets not copied
+             slangPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/simple_mesh.slang"));
+        }
+        
+        var shaderAsset = SlangShaderImporter.Import(slangPath);
+        
+        using var vs = shaderAsset.CreateShader(_context, "VSMain");
+        using var ps = shaderAsset.CreateShader(_context, "PSMain");
 
         var layoutElements = new[]
         {
@@ -142,16 +135,8 @@ public class SimpleMeshRenderPass : RenderPass, IDisposable
                 PipelineType = PipelineType.Graphics,
                 ResourceLayout = new PipelineResourceLayoutDesc
                 {
-                    DefaultVariableType = ShaderResourceVariableType.Static,
-                    Variables = new[] 
-                    { 
-                        new ShaderResourceVariableDesc 
-                        { 
-                            Name = "Constants", 
-                            Type = ShaderResourceVariableType.Static,
-                            ShaderStages = ShaderType.Vertex | ShaderType.Pixel
-                        } 
-                    }
+                    DefaultVariableType = Diligent.ShaderResourceVariableType.Static,
+                    Variables = shaderAsset.GetResourceVariables(_context)
                 }
             },
             GraphicsPipeline = new GraphicsPipelineDesc
@@ -173,8 +158,8 @@ public class SimpleMeshRenderPass : RenderPass, IDisposable
         if (_pso == null)
             throw new Exception("Failed to create SimpleMesh PSO");
 
-        _pso.GetStaticVariableByName(ShaderType.Vertex, "Constants")?.Set(_cb, SetShaderResourceFlags.None);
-        _srb = _pso.CreateShaderResourceBinding(true);
+        _pso!.GetStaticVariable(_context, shaderAsset, ShaderType.Vertex, "Constants")?.Set(_cb!, SetShaderResourceFlags.None);
+        _srb = _pso!.CreateShaderResourceBinding(true);
     }
 
     public override void Execute(RenderContext context, RenderGraphContext? graphContext)
@@ -185,8 +170,10 @@ public class SimpleMeshRenderPass : RenderPass, IDisposable
         if (ctx == null) return;
 
         var swapChain = _context.SwapChain;
+        if (swapChain == null) return;
         var rtv = swapChain.GetCurrentBackBufferRTV();
         var dsv = swapChain.GetDepthBufferDSV();
+        if (rtv == null || dsv == null) return;
 
         ctx.SetRenderTargets(new[] { rtv }, dsv, ResourceStateTransitionMode.Transition);
         ctx.SetPipelineState(_pso);

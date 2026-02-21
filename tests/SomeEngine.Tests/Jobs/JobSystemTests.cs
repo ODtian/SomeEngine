@@ -68,7 +68,7 @@ public class JobSystemTests
 
     struct ParallelJob : IJobParallelFor
     {
-        public static int[] Data;
+        public static int[] Data = Array.Empty<int>();
 
         public void Execute(int index)
         {

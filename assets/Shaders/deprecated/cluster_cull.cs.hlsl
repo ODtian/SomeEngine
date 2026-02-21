@@ -158,7 +158,7 @@ bool IsLodSelected(GPUCluster cluster)
 
     // 3. Culling + Runtime LOD Cut
     bool visible =
-        IsVisible(cluster.Center, cluster.Radius) && IsLodSelected(cluster);
+        true && IsLodSelected(cluster);
 
     if (visible)
     {

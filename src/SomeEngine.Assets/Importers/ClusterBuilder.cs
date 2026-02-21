@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
+using System.Buffers;
 using SharpGLTF.Schema2;
 using MeshOptimizer;
 using SomeEngine.Assets.Schema;
@@ -36,8 +37,7 @@ public struct ClusterLodConfig
 
     public static ClusterLodConfig GetDefault(int maxTriangles = 124)
     {
-        return new ClusterLodConfig
-        {
+        return new ClusterLodConfig {
             MaxVertices = 64,
             MinTriangles = maxTriangles / 3,
             MaxTriangles = maxTriangles,
@@ -71,14 +71,15 @@ public static class ClusterBuilder
     private const int PageSize = 128 * 1024; // 128KB
     private const int PageHeaderSize = 32;
 
-    private class BuilderMeshlet
+    private struct BuilderMeshlet
     {
-        public uint[] Indices = Array.Empty<uint>();
+        public int IndicesOffset;
+        public int IndicesCount;
         public int Level;
         public float Error;
         public float ParentError;
-        public int GroupId = -1;
-        public int ParentGroupId = -1;
+        public int GroupId;
+        public int ParentGroupId;
         public Vector3 Center;
         public float Radius;
         public Vector3 LodCenter;
@@ -182,118 +183,195 @@ public static class ClusterBuilder
         return ProcessRaw(rawPos, rawAttributes, rawIndices, mesh.Name ?? "Unnamed");
     }
 
-    private static List<BuilderMeshlet> BuildClusterLod(
+    private static void BuildClusterLod(
         ClusterLodConfig config,
-        Vector3[] positions,
-        uint[] indices
+        ReadOnlySpan<Vector3> positions,
+        ReadOnlySpan<uint> indices,
+        List<BuilderMeshlet> clusters,
+        List<uint> globalIndices
     )
     {
-        var locks = new byte[positions.Length];
-        var remap = new uint[positions.Length];
-        var posSpan = MemoryMarshal.Cast<Vector3, float>(positions.AsSpan());
+        var locks = ArrayPool<byte>.Shared.Rent(positions.Length);
+        var remap = ArrayPool<uint>.Shared.Rent(positions.Length);
 
-        unsafe
+        try
         {
-            fixed (uint* pRemap = remap)
-            fixed (float* pPositions = posSpan)
+            var posSpan = MemoryMarshal.Cast<Vector3, float>(positions);
+            Meshopt.GeneratePositionRemap(
+                remap.AsSpan(0, positions.Length),
+                posSpan,
+                (nuint)Unsafe.SizeOf<Vector3>()
+            );
+
+            Clusterize(config, indices, positions, clusters, globalIndices);
+            int nextGroupId = 0;
+            var globalSpan = CollectionsMarshal.AsSpan(
+                globalIndices
+            ); // Only valid if list doesn't resize?
+            // WARNING: globalIndices grows inside the loop. The span will be
+            // invalidated. We must re-get the span or access via List indexer.
+            // Accessing via list indexer is safe.
+
+            for (int i = 0; i < clusters.Count; i++)
             {
-                Meshopt.GeneratePositionRemap(pRemap, pPositions, (nuint)positions.Length, (nuint)Unsafe.SizeOf<Vector3>());
+                var c = clusters[i];
+                // We need indices for bounds.
+                // To avoid allocation, we loop.
+                // But BoundsCompute takes Span.
+                // We can use CollectionsMarshal.AsSpan(globalIndices).Slice(...)
+                // BUT we added to globalIndices in Clusterize, so it might have
+                // reallocated. It is safe to take span here as we are not adding
+                // now.
+                var currentSpan = CollectionsMarshal.AsSpan(globalIndices)
+                                      .Slice(c.IndicesOffset, c.IndicesCount);
+
+                var b = BoundsCompute(positions, currentSpan, 0);
+                c.Center = b.Center;
+                c.Radius = b.Radius;
+                c.LodCenter = b.Center;
+                c.LodRadius = b.Radius;
+                c.Error = 0;
+                c.Level = 0;
+                c.GroupId = nextGroupId++;
+                clusters[i] = c;
             }
-        }
 
-        var clusters = Clusterize(config, indices, positions);
-        int nextGroupId = 0;
-        foreach (var c in clusters)
-        {
-            var b = BoundsCompute(positions, c.Indices, 0);
-            c.Center = b.Center;
-            c.Radius = b.Radius;
-            c.LodCenter = b.Center;
-            c.LodRadius = b.Radius;
-            c.Error = 0; // Initial clusters have no error
-            c.Level = 0;
-            c.GroupId = nextGroupId++; // Each Level 0 cluster gets its own GroupId
-        }
+            var pending = new List<int>();
+            for (int i = 0; i < clusters.Count; i++)
+                pending.Add(i);
 
-        var pending = new List<int>();
-        for (int i = 0; i < clusters.Count; i++) pending.Add(i);
+            int depth = 0;
+            var groupOffsets = new List<int>();
+            var mergedIndices = new List<uint>();
+            var simplifiedIndices = new List<uint>();
 
-        int depth = 0;
-        while (pending.Count > 1)
-        {
-            var groups = Partition(config, positions, clusters, pending, remap);
-            pending.Clear();
-
-            LockBoundary(locks.AsSpan(), groups, clusters, remap);
-
-            foreach (var group in groups)
+            while (pending.Count > 1)
             {
-                var mergedIndices = new List<uint>();
-                foreach (int idx in group) mergedIndices.AddRange(clusters[idx].Indices);
+                Partition(
+                    config,
+                    positions,
+                    clusters,
+                    globalIndices,
+                    pending,
+                    remap.AsSpan(0, positions.Length),
+                    groupOffsets
+                );
 
-                int targetSize = (int)((mergedIndices.Count / 3) * config.SimplifyRatio) * 3;
-                var groupBounds = BoundsMerge(clusters, group);
+                LockBoundary(
+                    locks.AsSpan(0, positions.Length),
+                    clusters,
+                    globalIndices,
+                    pending,
+                    groupOffsets,
+                    remap.AsSpan(0, positions.Length)
+                );
 
-                float error = 0;
-                var simplified = Simplify(config, positions, mergedIndices.ToArray(), locks, targetSize, out error);
+                var nextPending = new List<int>();
+                var pendingSpan = CollectionsMarshal.AsSpan(pending);
 
-                if (simplified.Length > mergedIndices.Count * config.SimplifyThreshold)
+                for (int g = 0; g < groupOffsets.Count - 1; g++)
                 {
-                    // Terminal group
+                    int start = groupOffsets[g];
+                    int count = groupOffsets[g + 1] - start;
+                    var group = pendingSpan.Slice(start, count);
+
+                    mergedIndices.Clear();
+
+                    var currentGlobalSpan = CollectionsMarshal.AsSpan(globalIndices);
                     foreach (int idx in group)
                     {
-                        clusters[idx].ParentError = float.MaxValue;
+                        var c = clusters[idx];
+                        var cInds =
+                            currentGlobalSpan.Slice(c.IndicesOffset, c.IndicesCount);
+                        for (int k = 0; k < cInds.Length; k++)
+                            mergedIndices.Add(cInds[k]);
                     }
-                    continue;
-                }
 
-                // Error is the maximum error of all child clusters plus the error introduced by this simplification step.
-                float groupError = groupBounds.Error + error;
-                
-                int thisGroupId = nextGroupId++;
+                    int targetSize =
+                        (int)((mergedIndices.Count / 3) * config.SimplifyRatio) * 3;
+                    var groupBounds = BoundsMerge(clusters, group);
 
-                foreach (int idx in group)
-                {
-                    clusters[idx].ParentError = groupError;
-                    clusters[idx].ParentGroupId = thisGroupId;
-                    
-                    // LodCenter/Radius is the sphere used for ParentError evaluation.
-                    // To match the parent's SelfError evaluation, it must be the groupBounds.
-                    clusters[idx].LodCenter = groupBounds.Center;
-                    clusters[idx].LodRadius = groupBounds.Radius;
-                }
+                    float error = 0;
+                    simplifiedIndices.Clear();
+                    Simplify(
+                        config,
+                        positions,
+                        CollectionsMarshal.AsSpan(mergedIndices),
+                        locks.AsSpan(0, positions.Length),
+                        targetSize,
+                        out error,
+                        simplifiedIndices
+                    );
 
-                var split = Clusterize(config, simplified, positions);
-                foreach (var sc in split)
-                {
-                    sc.Level = depth + 1;
-                    
-                    // Center/Radius is used for culling AND for SelfError evaluation.
-                    // For consistency with children, it must be the groupBounds.
-                    sc.Center = groupBounds.Center;
-                    sc.Radius = groupBounds.Radius;
-                    
-                    sc.Error = groupError;
-                    sc.GroupId = thisGroupId;
-                    
-                    // Initial LodCenter/Radius for parents. 
-                    // Will be overwritten when this parent is grouped into the next level.
-                    sc.LodCenter = groupBounds.Center;
-                    sc.LodRadius = groupBounds.Radius;
-                    
-                    clusters.Add(sc);
-                    pending.Add(clusters.Count - 1);
+                    if (simplifiedIndices.Count >
+                        mergedIndices.Count * config.SimplifyThreshold)
+                    {
+                        foreach (int idx in group)
+                        {
+                            var c = clusters[idx];
+                            c.ParentError = float.MaxValue;
+                            clusters[idx] = c;
+                        }
+                        continue;
+                    }
+
+                    float groupError = groupBounds.Error + error;
+                    int thisGroupId = nextGroupId++;
+
+                    foreach (int idx in group)
+                    {
+                        var c = clusters[idx];
+                        c.ParentError = groupError;
+                        c.ParentGroupId = thisGroupId;
+                        c.LodCenter = groupBounds.Center;
+                        c.LodRadius = groupBounds.Radius;
+                        clusters[idx] = c;
+                    }
+
+                    int newClustersStart = clusters.Count;
+
+                    // Clusterize adds to globalIndices, invalidating
+                    // currentGlobalSpan!
+                    Clusterize(
+                        config,
+                        CollectionsMarshal.AsSpan(simplifiedIndices),
+                        positions,
+                        clusters,
+                        globalIndices
+                    );
+
+                    int newClustersEnd = clusters.Count;
+
+                    for (int k = newClustersStart; k < newClustersEnd; k++)
+                    {
+                        var sc = clusters[k];
+                        sc.Level = depth + 1;
+                        sc.Center = groupBounds.Center;
+                        sc.Radius = groupBounds.Radius;
+                        sc.Error = groupError;
+                        sc.GroupId = thisGroupId;
+                        sc.LodCenter = groupBounds.Center;
+                        sc.LodRadius = groupBounds.Radius;
+                        clusters[k] = sc;
+                        nextPending.Add(k);
+                    }
                 }
+                pending = nextPending;
+                depth++;
             }
-            depth++;
-        }
 
-        if (pending.Count == 1)
+            if (pending.Count == 1)
+            {
+                var c = clusters[pending[0]];
+                c.ParentError = float.MaxValue;
+                clusters[pending[0]] = c;
+            }
+        }
+        finally
         {
-            clusters[pending[0]].ParentError = float.MaxValue;
+            ArrayPool<byte>.Shared.Return(locks);
+            ArrayPool<uint>.Shared.Return(remap);
         }
-
-        return clusters;
     }
 
     public static MeshAsset ProcessRaw(
@@ -312,302 +390,345 @@ public static class ClusterBuilder
             4096,
             FileOptions.DeleteOnClose
         );
-        byte[] reusablePageBuffer = new byte[PageSize + 65536]; // Extra buffer
+        byte[] reusablePageBuffer = ArrayPool<byte>.Shared.Rent(PageSize + 65536);
 
         // 1. Meshopt Logic
-        var remap = new uint[rawPos.Length];
+        var remap = ArrayPool<uint>.Shared.Rent(rawPos.Length);
+        Vector3[]? pPos = null;
+        uint[]? pInd = null;
+        List<RawAttribute>? pAttributes = null;
+        List<float[]>? pAttributeBuffers = null;
 
-        // GenerateVertexRemap reorders vertices to be contiguous in order of
-        // appearance
-        nuint vertexCount = Meshopt.GenerateVertexRemap(
-            remap.AsSpan(), rawIndices.AsSpan(), rawPos.AsSpan()
-        );
-
-        var pPos = new Vector3[(int)vertexCount];
-        var pInd = new uint[rawIndices.Length];
-
-        // Manual Vertex Remap (old vertex -> new vertex)
-        for (int oldIndex = 0; oldIndex < rawPos.Length; oldIndex++)
+        try
         {
-            uint newIndex = remap[oldIndex];
-            if (newIndex == uint.MaxValue || newIndex >= vertexCount)
-                continue;
+            nuint vertexCount = Meshopt.GenerateVertexRemap(
+                remap.AsSpan(0, rawPos.Length), rawIndices.AsSpan(), rawPos.AsSpan()
+            );
 
-            pPos[newIndex] = rawPos[oldIndex];
-        }
+            pPos = ArrayPool<Vector3>.Shared.Rent((int)vertexCount);
+            pInd = ArrayPool<uint>.Shared.Rent(rawIndices.Length);
 
-        // Remap Indices
-        Meshopt.RemapIndexBuffer(pInd.AsSpan(), rawIndices.AsSpan(), remap.AsSpan());
-
-        // Remap Attributes
-        var pAttributes = new List<RawAttribute>();
-        foreach (var attr in rawAttributes)
-        {
-            var newData = new float[(int)vertexCount * attr.Dimension];
-            int dim = attr.Dimension;
-            var srcData = attr.Data;
-
-            // Manual Scatter: old vertex -> new vertex
+            // Manual Vertex Remap
             for (int oldIndex = 0; oldIndex < rawPos.Length; oldIndex++)
             {
                 uint newIndex = remap[oldIndex];
                 if (newIndex == uint.MaxValue || newIndex >= vertexCount)
                     continue;
 
-                int srcBase = oldIndex * dim;
-                int dstBase = (int)newIndex * dim;
-
-                for (int k = 0; k < dim; ++k)
-                    newData[dstBase + k] = srcData[srcBase + k];
-            }
-            pAttributes.Add(new RawAttribute(
-                attr.Name,
-                newData,
-                attr.Dimension,
-                attr.TargetType,
-                attr.NumComponents,
-                attr.Normalized
-            ));
-        }
-
-        Meshopt.OptimizeVertexCache(pInd.AsSpan(), pInd.AsSpan(), vertexCount);
-
-        // NOTE: keep fetch order optimization disabled for now to guarantee
-        // deterministic/debug-correct geometry.
-        var finalAttributes = pAttributes;
-
-        var finalPositions = new List<Vector3>();
-        for (int i = 0; i < (int)vertexCount; i++)
-        {
-            finalPositions.Add(pPos[i]);
-        }
-
-        // Build Cluster LOD hierarchy
-        var allMeshlets = BuildClusterLod(ClusterLodConfig.GetDefault(), finalPositions.ToArray(), pInd);
-
-        // Sort clusters by LODLevel and then ParentGroupId to keep groups together
-        allMeshlets = allMeshlets.OrderBy(m => m.Level).ThenBy(m => m.ParentGroupId).ToList();
-
-        // 2. Page Generation & Quantization
-        var pagesDataList = new List<MeshPageInfo>();
-
-        var currentClusters = new List<GPUCluster>();
-        var currentPositions = new List<ushort>();
-        var currentAttrs = new List<byte>(); // Changed to bytes
-        var currentIndices = new List<byte>();
-
-        int currentBytes = PageHeaderSize;
-
-        // Build Layout
-        var descriptors = new List<VertexAttributeDescriptor>();
-        ushort currentOffset = 0;
-        int vertexStride = 0;
-        foreach (var attr in finalAttributes)
-        {
-            var desc = new VertexAttributeDescriptor {
-                Name = attr.Name,
-                Type = attr.TargetType,
-                NumComponents = attr.NumComponents,
-                IsNormalized = attr.Normalized,
-                Offset = currentOffset
-            };
-            int size = desc.GetSize();
-            vertexStride += size;
-            currentOffset += (ushort)size;
-            descriptors.Add(desc);
-        }
-
-        void FlushPage()
-        {
-            if (currentClusters.Count == 0)
-                return;
-
-            // Align offsets to 4 bytes?
-            // Current structure assumes offsets are just sequential byte offsets
-            // relative to page start.
-
-            uint clustersOffset = PageHeaderSize;
-            int clustersSize = currentClusters.Count * Unsafe.SizeOf<GPUCluster>();
-
-            uint positionsOffset = clustersOffset + (uint)clustersSize;
-            int positionsSize = currentPositions.Count * sizeof(ushort);
-
-            uint attributesOffset = positionsOffset + (uint)positionsSize;
-            int attrsSize = currentAttrs.Count;
-
-            uint indicesOffset = attributesOffset + (uint)attrsSize;
-            int indicesSize = currentIndices.Count;
-
-            // Check buffer size
-            int totalSize = (int)indicesOffset + indicesSize;
-            if (totalSize > reusablePageBuffer.Length)
-            {
-                // Should not happen if page logic is correct, but safe to expand if
-                // needed or throw
-                throw new Exception(
-                    $"Page buffer overflow: {totalSize} > {reusablePageBuffer.Length}"
-                );
+                pPos[newIndex] = rawPos[oldIndex];
             }
 
-            Array.Clear(reusablePageBuffer, 0, reusablePageBuffer.Length);
-            var span = new Span<byte>(reusablePageBuffer);
+            // Remap Indices
+            Meshopt.RemapIndexBuffer(
+                pInd.AsSpan(0, rawIndices.Length),
+                rawIndices.AsSpan(),
+                remap.AsSpan(0, rawPos.Length)
+            );
 
-            ref var header = ref Unsafe.As<byte, MeshPageHeader>(ref span[0]);
-            header.ClusterCount = (uint)currentClusters.Count;
-            header.TotalVertexCount = (uint)(currentPositions.Count / 3);
-            header.TotalTriangleCount = (uint)(currentIndices.Count / 3);
-            header.PageSize = (uint)totalSize;
-            header.ClustersOffset = clustersOffset;
-            header.PositionsOffset = positionsOffset;
-            header.AttributesOffset = attributesOffset;
-            header.IndicesOffset = indicesOffset;
+            // Remap Attributes
+            pAttributes = new List<RawAttribute>();
+            pAttributeBuffers = new List<float[]>();
 
-            MemoryMarshal
-                .Cast<GPUCluster, byte>(CollectionsMarshal.AsSpan(currentClusters))
-                .CopyTo(span.Slice((int)clustersOffset, clustersSize));
-            MemoryMarshal
-                .Cast<ushort, byte>(CollectionsMarshal.AsSpan(currentPositions))
-                .CopyTo(span.Slice((int)positionsOffset, positionsSize));
-            CollectionsMarshal.AsSpan(currentAttrs)
-                .CopyTo(span.Slice((int)attributesOffset, attrsSize));
-            CollectionsMarshal.AsSpan(currentIndices)
-                .CopyTo(span.Slice((int)indicesOffset, indicesSize));
-
-            fs.Write(reusablePageBuffer, 0, totalSize);
-
-            pagesDataList.Add(new MeshPageInfo {
-                ClusterCount = (uint)currentClusters.Count,
-                TotalVertexCount = (uint)(currentPositions.Count / 3),
-                TotalTriangleCount = (uint)(currentIndices.Count / 3),
-                ClustersOffset = clustersOffset,
-                PositionsOffset = positionsOffset,
-                AttributesOffset = attributesOffset,
-                IndicesOffset = indicesOffset,
-                FileOffset = fs.Position - totalSize
-            });
-
-            currentClusters.Clear();
-            currentPositions.Clear();
-            currentAttrs.Clear();
-            currentIndices.Clear();
-            currentBytes = PageHeaderSize;
-        }
-
-        foreach (var m in allMeshlets)
-        {
-            int vCount = 0;
-            var mIndices = m.Indices;
-            var usedMap = new Dictionary<uint, ushort>();
-            var localPos = new List<ushort>();
-            var localIndices = new List<byte>();
-
-            var localAttrBytes = new List<byte>();
-
-            Vector3 center = m.Center;
-            float radius = m.Radius;
-            if (radius < 1e-6f)
-                radius = 1.0f;
-
-            foreach (var globalIdx in mIndices)
+            foreach (var attr in rawAttributes)
             {
-                if (!usedMap.TryGetValue(globalIdx, out ushort localIdx))
+                var newData =
+                    ArrayPool<float>.Shared.Rent((int)vertexCount * attr.Dimension);
+                pAttributeBuffers.Add(newData);
+
+                int dim = attr.Dimension;
+                var srcData = attr.Data;
+
+                for (int oldIndex = 0; oldIndex < rawPos.Length; oldIndex++)
                 {
-                    localIdx = (ushort)vCount;
-                    usedMap[globalIdx] = localIdx;
-                    vCount++;
+                    uint newIndex = remap[oldIndex];
+                    if (newIndex == uint.MaxValue || newIndex >= vertexCount)
+                        continue;
 
-                    // 1. Pack Position (Quantized)
-                    Vector3 p = finalPositions[(int)globalIdx];
-                    Vector3 rel = (p - center) / radius;
-                    ushort qx = (ushort)((Math.Clamp(rel.X, -1f, 1f) * 0.5f + 0.5f) *
-                                         65535f);
-                    ushort qy = (ushort)((Math.Clamp(rel.Y, -1f, 1f) * 0.5f + 0.5f) *
-                                         65535f);
-                    ushort qz = (ushort)((Math.Clamp(rel.Z, -1f, 1f) * 0.5f + 0.5f) *
-                                         65535f);
+                    int srcBase = oldIndex * dim;
+                    int dstBase = (int)newIndex * dim;
 
-                    localPos.Add(qx);
-                    localPos.Add(qy);
-                    localPos.Add(qz);
-
-                    // 2. Pack Attributes (Generic)
-                    for (int i = 0; i < finalAttributes.Count; ++i)
-                    {
-                        PackAttribute(
-                            localAttrBytes, finalAttributes[i], (int)globalIdx
-                        );
-                    }
+                    for (int k = 0; k < dim; ++k)
+                        newData[dstBase + k] = srcData[srcBase + k];
                 }
-                localIndices.Add((byte)localIdx);
+                pAttributes.Add(new RawAttribute(
+                    attr.Name,
+                    newData,
+                    attr.Dimension,
+                    attr.TargetType,
+                    attr.NumComponents,
+                    attr.Normalized
+                ));
             }
 
-            int clusterSize = Unsafe.SizeOf<GPUCluster>();
-            int vSize = localPos.Count * 2;
-            int aSize = localAttrBytes.Count;
-            int iSize = localIndices.Count;
-            int totalAdded = clusterSize + vSize + aSize + iSize;
+            Meshopt.OptimizeVertexCache(
+                pInd.AsSpan(0, rawIndices.Length),
+                pInd.AsSpan(0, rawIndices.Length),
+                vertexCount
+            );
 
-            if (currentBytes + totalAdded > PageSize)
-            {
-                FlushPage();
-            }
+            var finalAttributes = pAttributes;
+            // pPos is finalPositions (array)
 
-            uint vStart = (uint)(currentPositions.Count / 3);
-            uint tStart = (uint)currentIndices.Count;
+            // Build Cluster LOD hierarchy
+            var allMeshlets = new List<BuilderMeshlet>();
+            var globalIndices = new List<uint>();
 
-            currentPositions.AddRange(localPos);
-            currentAttrs.AddRange(localAttrBytes);
-            currentIndices.AddRange(localIndices);
-            currentBytes += totalAdded;
+            BuildClusterLod(
+                ClusterLodConfig.GetDefault() with { ClusterSpatial = true },
+                new ReadOnlySpan<Vector3>(pPos, 0, (int)vertexCount),
+                new ReadOnlySpan<uint>(pInd, 0, rawIndices.Length),
+                allMeshlets,
+                globalIndices
+            );
 
-            currentClusters.Add(new GPUCluster {
-                Center = m.Center,
-                Radius = m.Radius,
-                LodCenter = m.LodCenter,
-                LodRadius = m.LodRadius,
-                LODError = m.Error,
-                ParentLODError = m.ParentError,
-                VertexStart = vStart,
-                TriangleStart = tStart,
-                GroupId = m.GroupId,
-                ParentGroupId = m.ParentGroupId,
-                VertexCount = (byte)vCount,
-                TriangleCount = (byte)(localIndices.Count / 3),
-                LODLevel = (byte)m.Level,
-                _Pad1 = 0
+            // Sort clusters
+            allMeshlets.Sort((a, b) => {
+                int c = a.Level.CompareTo(b.Level);
+                if (c != 0) return c;
+                return a.ParentGroupId.CompareTo(b.ParentGroupId);
             });
+
+            // 2. Page Generation & Quantization
+            var pagesDataList = new List<MeshPageInfo>();
+
+            var currentClusters = new List<GPUCluster>();
+            var currentPositions = new List<ushort>();
+            var currentAttrs = new List<byte>();
+            var currentIndices = new List<byte>();
+
+            int currentBytes = PageHeaderSize;
+
+            // Build Layout
+            var descriptors = new List<VertexAttributeDescriptor>();
+            ushort currentOffset = 0;
+            int vertexStride = 0;
+            foreach (var attr in finalAttributes)
+            {
+                var desc = new VertexAttributeDescriptor {
+                    Name = attr.Name,
+                    Type = attr.TargetType,
+                    NumComponents = attr.NumComponents,
+                    IsNormalized = attr.Normalized,
+                    Offset = currentOffset
+                };
+                int size = desc.GetSize();
+                vertexStride += size;
+                currentOffset += (ushort)size;
+                descriptors.Add(desc);
+            }
+
+            void FlushPage()
+            {
+                if (currentClusters.Count == 0)
+                    return;
+
+                uint clustersOffset = PageHeaderSize;
+                int clustersSize =
+                    currentClusters.Count * Unsafe.SizeOf<GPUCluster>();
+
+                uint positionsOffset = clustersOffset + (uint)clustersSize;
+                int positionsSize = currentPositions.Count * sizeof(ushort);
+
+                uint attributesOffset = positionsOffset + (uint)positionsSize;
+                int attrsSize = currentAttrs.Count;
+
+                uint indicesOffset = attributesOffset + (uint)attrsSize;
+                int indicesSize = currentIndices.Count;
+
+                int totalSize = (int)indicesOffset + indicesSize;
+                if (totalSize > reusablePageBuffer.Length)
+                {
+                    throw new Exception(
+                        $"Page buffer overflow: {totalSize} > {reusablePageBuffer.Length}"
+                    );
+                }
+
+                Array.Clear(
+                    reusablePageBuffer, 0, totalSize
+                ); // Only clear used part or optimize? Clear all is safer.
+                var span = new Span<byte>(reusablePageBuffer);
+
+                ref var header = ref Unsafe.As<byte, MeshPageHeader>(ref span[0]);
+                header.ClusterCount = (uint)currentClusters.Count;
+                header.TotalVertexCount = (uint)(currentPositions.Count / 3);
+                header.TotalTriangleCount = (uint)(currentIndices.Count / 3);
+                header.PageSize = (uint)totalSize;
+                header.ClustersOffset = clustersOffset;
+                header.PositionsOffset = positionsOffset;
+                header.AttributesOffset = attributesOffset;
+                header.IndicesOffset = indicesOffset;
+
+                MemoryMarshal
+                    .Cast<GPUCluster, byte>(
+                        CollectionsMarshal.AsSpan(currentClusters)
+                    )
+                    .CopyTo(span.Slice((int)clustersOffset, clustersSize));
+                MemoryMarshal
+                    .Cast<ushort, byte>(CollectionsMarshal.AsSpan(currentPositions))
+                    .CopyTo(span.Slice((int)positionsOffset, positionsSize));
+                CollectionsMarshal.AsSpan(currentAttrs)
+                    .CopyTo(span.Slice((int)attributesOffset, attrsSize));
+                CollectionsMarshal.AsSpan(currentIndices)
+                    .CopyTo(span.Slice((int)indicesOffset, indicesSize));
+
+                fs.Write(reusablePageBuffer, 0, totalSize);
+
+                pagesDataList.Add(new MeshPageInfo {
+                    ClusterCount = (uint)currentClusters.Count,
+                    TotalVertexCount = (uint)(currentPositions.Count / 3),
+                    TotalTriangleCount = (uint)(currentIndices.Count / 3),
+                    ClustersOffset = clustersOffset,
+                    PositionsOffset = positionsOffset,
+                    AttributesOffset = attributesOffset,
+                    IndicesOffset = indicesOffset,
+                    FileOffset = fs.Position - totalSize
+                });
+
+                currentClusters.Clear();
+                currentPositions.Clear();
+                currentAttrs.Clear();
+                currentIndices.Clear();
+                currentBytes = PageHeaderSize;
+            }
+
+            var usedMap = new Dictionary<uint, ushort>(MaxVerticesPerMeshlet);
+            var localPos = new List<ushort>(MaxVerticesPerMeshlet * 3);
+            var localIndices = new List<byte>(MaxTrianglesPerMeshlet * 3);
+            var localAttrBytes =
+                new List<byte>(MaxVerticesPerMeshlet * vertexStride);
+
+            var globalIndicesSpan = CollectionsMarshal.AsSpan(globalIndices);
+
+            foreach (var m in allMeshlets)
+            {
+                int vCount = 0;
+                var mIndices =
+                    globalIndicesSpan.Slice(m.IndicesOffset, m.IndicesCount);
+
+                usedMap.Clear();
+                localPos.Clear();
+                localIndices.Clear();
+                localAttrBytes.Clear();
+
+                Vector3 center = m.Center;
+                float radius = m.Radius;
+                if (radius < 1e-6f)
+                    radius = 1.0f;
+
+                foreach (var globalIdx in mIndices)
+                {
+                    if (!usedMap.TryGetValue(globalIdx, out ushort localIdx))
+                    {
+                        localIdx = (ushort)vCount;
+                        usedMap[globalIdx] = localIdx;
+                        vCount++;
+
+                        Vector3 p = pPos[(int)globalIdx];
+                        Vector3 rel = (p - center) / radius;
+                        ushort qx =
+                            (ushort)((Math.Clamp(rel.X, -1f, 1f) * 0.5f + 0.5f) *
+                                     65535f);
+                        ushort qy =
+                            (ushort)((Math.Clamp(rel.Y, -1f, 1f) * 0.5f + 0.5f) *
+                                     65535f);
+                        ushort qz =
+                            (ushort)((Math.Clamp(rel.Z, -1f, 1f) * 0.5f + 0.5f) *
+                                     65535f);
+
+                        localPos.Add(qx);
+                        localPos.Add(qy);
+                        localPos.Add(qz);
+
+                        for (int i = 0; i < finalAttributes.Count; ++i)
+                        {
+                            PackAttribute(
+                                localAttrBytes, finalAttributes[i], (int)globalIdx
+                            );
+                        }
+                    }
+                    localIndices.Add((byte)localIdx);
+                }
+
+                int clusterSize = Unsafe.SizeOf<GPUCluster>();
+                int vSize = localPos.Count * 2;
+                int aSize = localAttrBytes.Count;
+                int iSize = localIndices.Count;
+                int totalAdded = clusterSize + vSize + aSize + iSize;
+
+                if (currentBytes + totalAdded > PageSize)
+                {
+                    FlushPage();
+                }
+
+                uint vStart = (uint)(currentPositions.Count / 3);
+                uint tStart = (uint)currentIndices.Count;
+
+                currentPositions.AddRange(localPos);
+                currentAttrs.AddRange(localAttrBytes);
+                currentIndices.AddRange(localIndices);
+                currentBytes += totalAdded;
+
+                currentClusters.Add(new GPUCluster {
+                    Center = m.Center,
+                    Radius = m.Radius,
+                    LodCenter = m.LodCenter,
+                    LodRadius = m.LodRadius,
+                    LODError = m.Error,
+                    ParentLODError = m.ParentError,
+                    VertexStart = vStart,
+                    TriangleStart = tStart,
+                    GroupId = m.GroupId,
+                    ParentGroupId = m.ParentGroupId,
+                    VertexCount = (byte)vCount,
+                    TriangleCount = (byte)(localIndices.Count / 3),
+                    LODLevel = (byte)m.Level,
+                    _Pad1 = 0
+                });
+            }
+
+            FlushPage();
+
+            var schemaAttrs =
+                new SomeEngine.Assets.Schema.VertexAttribute[descriptors.Count];
+            for (int i = 0; i < descriptors.Count; ++i)
+            {
+                schemaAttrs[i] = new SomeEngine.Assets.Schema.VertexAttribute(
+                ) { Name = descriptors[i].Name,
+                    Type = (SomeEngine.Assets.Schema.ValueType)descriptors[i].Type,
+                    Components = descriptors[i].NumComponents,
+                    Normalized = descriptors[i].IsNormalized,
+                    Offset = descriptors[i].Offset };
+            }
+
+            var meshAsset = new MeshAsset {
+                Name = name,
+                Bounds = new SomeEngine.Assets.Schema.Bounds(
+                ) { Center =
+                        new SomeEngine.Assets.Schema.Vec3() { X = 0, Y = 0, Z = 0 },
+                    Radius = 0 },
+                Payload = new byte[fs.Length],
+                Attributes = schemaAttrs
+            };
+
+            fs.Seek(0, SeekOrigin.Begin);
+            fs.ReadExactly(meshAsset.Payload.Value.Span);
+
+            return meshAsset;
         }
-
-        FlushPage();
-
-        // Serialize
-        // Convert descriptors to Schema format
-        var schemaAttrs =
-            new SomeEngine.Assets.Schema.VertexAttribute[descriptors.Count];
-        for (int i = 0; i < descriptors.Count; ++i)
+        finally
         {
-            schemaAttrs[i] = new SomeEngine.Assets.Schema.VertexAttribute(
-            ) { Name = descriptors[i].Name,
-                Type = (SomeEngine.Assets.Schema.ValueType)descriptors[i].Type,
-                Components = descriptors[i].NumComponents,
-                Normalized = descriptors[i].IsNormalized,
-                Offset = descriptors[i].Offset };
+            ArrayPool<byte>.Shared.Return(reusablePageBuffer);
+            ArrayPool<uint>.Shared.Return(remap);
+            if (pPos != null)
+                ArrayPool<Vector3>.Shared.Return(pPos);
+            if (pInd != null)
+                ArrayPool<uint>.Shared.Return(pInd);
+            if (pAttributeBuffers != null)
+            {
+                foreach (var buf in pAttributeBuffers)
+                    ArrayPool<float>.Shared.Return(buf);
+            }
         }
-
-        var meshAsset = new MeshAsset {
-            Name = name,
-            Bounds = new SomeEngine.Assets.Schema.Bounds(
-            ) { Center = new SomeEngine.Assets.Schema.Vec3(
-                ) { X = 0, Y = 0, Z = 0 }, // TODO: Compute Global Bounds
-                Radius = 0 },
-            Payload = new byte[fs.Length],
-            Attributes = schemaAttrs
-        };
-
-        fs.Seek(0, SeekOrigin.Begin);
-        fs.ReadExactly(meshAsset.Payload.Value.Span);
-
-        return meshAsset;
     }
 
     private static void PackAttribute(
@@ -669,192 +790,319 @@ public static class ClusterBuilder
         }
     }
 
-    private static List<BuilderMeshlet> Clusterize(
+    private static void Clusterize(
         ClusterLodConfig config,
-        uint[] indices,
-        Vector3[] positions
+        ReadOnlySpan<uint> indices,
+        ReadOnlySpan<Vector3> positions,
+        List<BuilderMeshlet> clusters,
+        List<uint> globalIndices
     )
     {
-        if (indices.Length == 0) return new List<BuilderMeshlet>();
+        if (indices.IsEmpty)
+            return;
 
         nuint maxMeshlets = Meshopt.BuildMeshletsBound(
-            (nuint)indices.Length, (nuint)config.MaxVertices, (nuint)config.MaxTriangles
+            (nuint)indices.Length,
+            (nuint)config.MaxVertices,
+            (nuint)config.MaxTriangles
         );
 
-        var meshlets = new MeshOptimizer.Meshlet[maxMeshlets];
-        var meshletVertices = new uint[(int)maxMeshlets * config.MaxVertices];
-        var meshletTriangles = new byte[(int)maxMeshlets * config.MaxTriangles * 3];
+        var meshlets =
+            ArrayPool<MeshOptimizer.Meshlet>.Shared.Rent((int)maxMeshlets);
+        var meshletVertices =
+            ArrayPool<uint>.Shared.Rent((int)maxMeshlets * config.MaxVertices);
+        var meshletTriangles =
+            ArrayPool<byte>.Shared.Rent((int)maxMeshlets * config.MaxTriangles * 3);
 
-        nuint meshletCount;
-        var posSpan = MemoryMarshal.Cast<Vector3, float>(positions.AsSpan());
-        var indSpan = indices.AsSpan();
-
-        unsafe
+        try
         {
-            fixed (MeshOptimizer.Meshlet* pMeshlets = meshlets)
-            fixed (uint* pMeshletVertices = meshletVertices)
-            fixed (byte* pMeshletTriangles = meshletTriangles)
-            fixed (uint* pIndices = indSpan)
-            fixed (float* pPositions = posSpan)
+            nuint meshletCount;
+            var posSpan = MemoryMarshal.Cast<Vector3, float>(positions);
+            var indSpan = indices;
+
+            if (config.ClusterSpatial)
             {
-                if (config.ClusterSpatial)
-                {
-                    meshletCount = Meshopt.BuildMeshletsSpatial(
-                        pMeshlets, pMeshletVertices, pMeshletTriangles,
-                        pIndices, (nuint)indSpan.Length,
-                        pPositions, (nuint)positions.Length, (nuint)Unsafe.SizeOf<Vector3>(),
-                        (nuint)config.MaxVertices, (nuint)config.MinTriangles, (nuint)config.MaxTriangles,
-                        config.ClusterFillWeight
-                    );
-                }
-                else
-                {
-                    meshletCount = Meshopt.BuildMeshletsFlex(
-                        pMeshlets, pMeshletVertices, pMeshletTriangles,
-                        pIndices, (nuint)indSpan.Length,
-                        pPositions, (nuint)positions.Length, (nuint)Unsafe.SizeOf<Vector3>(),
-                        (nuint)config.MaxVertices, (nuint)config.MinTriangles, (nuint)config.MaxTriangles,
-                        0.0f, config.ClusterSplitFactor
-                    );
-                }
+                meshletCount = Meshopt.BuildMeshletsSpatial(
+                    meshlets.AsSpan(),
+                    meshletVertices.AsSpan(),
+                    meshletTriangles.AsSpan(),
+                    indSpan,
+                    posSpan,
+                    (nuint)Unsafe.SizeOf<Vector3>(),
+                    (nuint)config.MaxVertices,
+                    (nuint)config.MinTriangles,
+                    (nuint)config.MaxTriangles,
+                    config.ClusterFillWeight
+                );
             }
-        }
-
-        var result = new List<BuilderMeshlet>();
-        for (int i = 0; i < (int)meshletCount; i++)
-        {
-            ref var m = ref meshlets[i];
-            if (config.OptimizeClusters)
+            else
             {
-                Meshopt.OptimizeMeshlet(
-                    meshletVertices.AsSpan((int)m.vertex_offset, (int)m.vertex_count),
-                    meshletTriangles.AsSpan((int)m.triangle_offset, (int)m.triangle_count * 3),
-                    m.triangle_count, m.vertex_count
+                meshletCount = Meshopt.BuildMeshletsFlex(
+                    meshlets.AsSpan(),
+                    meshletVertices.AsSpan(),
+                    meshletTriangles.AsSpan(),
+                    indSpan,
+                    posSpan,
+                    (nuint)Unsafe.SizeOf<Vector3>(),
+                    (nuint)config.MaxVertices,
+                    (nuint)config.MinTriangles,
+                    (nuint)config.MaxTriangles,
+                    0.0f,
+                    config.ClusterSplitFactor
                 );
             }
 
-            var mIndices = new uint[m.triangle_count * 3];
-            for (uint t = 0; t < m.triangle_count; t++)
+            for (int i = 0; i < (int)meshletCount; i++)
             {
-                int triOffset = (int)m.triangle_offset + (int)t * 3;
-                mIndices[t * 3 + 0] = meshletVertices[(int)m.vertex_offset + meshletTriangles[triOffset + 0]];
-                mIndices[t * 3 + 1] = meshletVertices[(int)m.vertex_offset + meshletTriangles[triOffset + 1]];
-                mIndices[t * 3 + 2] = meshletVertices[(int)m.vertex_offset + meshletTriangles[triOffset + 2]];
-            }
+                ref var m = ref meshlets[i];
+                if (config.OptimizeClusters)
+                {
+                    Meshopt.OptimizeMeshlet(
+                        meshletVertices.AsSpan(
+                            (int)m.vertex_offset, (int)m.vertex_count
+                        ),
+                        meshletTriangles.AsSpan(
+                            (int)m.triangle_offset, (int)m.triangle_count * 3
+                        ),
+                        m.triangle_count,
+                        m.vertex_count
+                    );
+                }
 
-            result.Add(new BuilderMeshlet
-            {
-                Indices = mIndices,
-                VertexCount = (int)m.vertex_count
-            });
+                int startIndex = globalIndices.Count;
+                int count = (int)m.triangle_count * 3;
+
+                // Instead of adding one by one, we can batch add if List supports it
+                // or ensure capacity List<T> doesn't expose span-based add easily
+                // without CollectionsMarshal We'll resize globalIndices manually if
+                // needed or just loop. Or better: ensure capacity.
+
+                // Calculate required capacity
+                // int required = startIndex + count;
+                // if (globalIndices.Capacity < required) globalIndices.Capacity =
+                // required; Wait, Capacity setter might copy.
+
+                // We'll just loop for now, optimization of list add is secondary to
+                // algorithm structure. Or use CollectionsMarshal to get span to the
+                // end.
+
+                // Using CollectionsMarshal for zero-copy add:
+                // globalIndices.EnsureCapacity(globalIndices.Count + count);
+                // But List doesn't expose size easily.
+
+                for (uint t = 0; t < m.triangle_count; t++)
+                {
+                    int triOffset = (int)m.triangle_offset + (int)t * 3;
+                    globalIndices.Add(
+                        meshletVertices
+                        [(int)m.vertex_offset + meshletTriangles[triOffset + 0]]
+                    );
+                    globalIndices.Add(
+                        meshletVertices
+                        [(int)m.vertex_offset + meshletTriangles[triOffset + 1]]
+                    );
+                    globalIndices.Add(
+                        meshletVertices
+                        [(int)m.vertex_offset + meshletTriangles[triOffset + 2]]
+                    );
+                }
+
+                clusters.Add(new BuilderMeshlet {
+                    IndicesOffset = startIndex,
+                    IndicesCount = count,
+                    VertexCount = (int)m.vertex_count,
+                    GroupId = -1,
+                    ParentGroupId = -1
+                });
+            }
         }
-        return result;
+        finally
+        {
+            ArrayPool<MeshOptimizer.Meshlet>.Shared.Return(meshlets);
+            ArrayPool<uint>.Shared.Return(meshletVertices);
+            ArrayPool<byte>.Shared.Return(meshletTriangles);
+        }
     }
 
-    private static List<List<int>> Partition(
+    private static int Partition(
         ClusterLodConfig config,
-        Vector3[] positions,
+        ReadOnlySpan<Vector3> positions,
         List<BuilderMeshlet> clusters,
+        List<uint> globalIndices,
         List<int> pending,
-        uint[] remap
+        ReadOnlySpan<uint> remap,
+        List<int> groupOffsets
     )
     {
+        groupOffsets.Clear();
         if (pending.Count <= config.PartitionSize)
-            return new List<List<int>> { new List<int>(pending) };
+        {
+            groupOffsets.Add(0);
+            groupOffsets.Add(pending.Count);
+            return 1;
+        }
 
         int totalIndexCount = 0;
-        foreach (int idx in pending) totalIndexCount += clusters[idx].Indices.Length;
+        var globalIndicesSpan = CollectionsMarshal.AsSpan(globalIndices);
 
-        var clusterIndices = new uint[totalIndexCount];
-        var clusterCounts = new uint[pending.Count];
-        int offset = 0;
         for (int i = 0; i < pending.Count; i++)
         {
-            var cluster = clusters[pending[i]];
-            clusterCounts[i] = (uint)cluster.Indices.Length;
-            foreach (var idx in cluster.Indices)
-                clusterIndices[offset++] = remap[idx];
+            var c = clusters[pending[i]];
+            totalIndexCount += c.IndicesCount;
         }
 
-        var clusterPart = new uint[pending.Count];
-        nuint partitionCount;
-        var posSpan = MemoryMarshal.Cast<Vector3, float>(positions.AsSpan());
-
-        unsafe
-        {
-            fixed (uint* pClusterPart = clusterPart)
-            fixed (uint* pClusterIndices = clusterIndices)
-            fixed (uint* pClusterCounts = clusterCounts)
-            fixed (float* pPositions = posSpan)
-            {
-                partitionCount = Meshopt.PartitionClusters(
-                    pClusterPart, pClusterIndices, (nuint)clusterIndices.Length,
-                    pClusterCounts, (nuint)clusterCounts.Length,
-                    config.PartitionSpatial ? pPositions : null, (nuint)remap.Length, (nuint)Unsafe.SizeOf<Vector3>(),
-                    (nuint)config.PartitionSize
-                );
-            }
-        }
-
-        var partitions = new List<List<int>>((int)partitionCount);
-        for (int i = 0; i < (int)partitionCount; i++) partitions.Add(new List<int>());
-
+        var clusterIndices = ArrayPool<uint>.Shared.Rent(totalIndexCount);
+        var clusterCounts = ArrayPool<uint>.Shared.Rent(pending.Count);
+        var clusterPart = ArrayPool<uint>.Shared.Rent(pending.Count);
         uint[]? partitionRemap = null;
-        if (config.PartitionSort)
+
+        try
         {
-            var partitionPoint = new float[partitionCount * 3];
+            int offset = 0;
             for (int i = 0; i < pending.Count; i++)
             {
-                var center = clusters[pending[i]].Center;
-                partitionPoint[clusterPart[i] * 3 + 0] = center.X;
-                partitionPoint[clusterPart[i] * 3 + 1] = center.Y;
-                partitionPoint[clusterPart[i] * 3 + 2] = center.Z;
+                var c = clusters[pending[i]];
+                clusterCounts[i] = (uint)c.IndicesCount;
+                var cIndices =
+                    globalIndicesSpan.Slice(c.IndicesOffset, c.IndicesCount);
+                for (int j = 0; j < cIndices.Length; j++)
+                    clusterIndices[offset++] = remap[(int)cIndices[j]];
             }
-            partitionRemap = new uint[partitionCount];
-            Meshopt.SpatialSortRemap(partitionRemap.AsSpan(), partitionPoint.AsSpan(), (nuint)Unsafe.SizeOf<Vector3>());
-        }
 
-        for (int i = 0; i < pending.Count; i++)
+            nuint partitionCount;
+            var posSpan = MemoryMarshal.Cast<Vector3, float>(positions);
+
+            partitionCount = Meshopt.PartitionClusters(
+                clusterPart.AsSpan(0, pending.Count),
+                clusterIndices.AsSpan(0, totalIndexCount),
+                clusterCounts.AsSpan(0, pending.Count),
+                config.PartitionSpatial ? posSpan : default,
+                (nuint)Unsafe.SizeOf<Vector3>(),
+                (nuint)config.PartitionSize
+            );
+
+            if (config.PartitionSort)
+            {
+                var partitionPoint =
+                    ArrayPool<float>.Shared.Rent((int)partitionCount * 3);
+                partitionRemap = ArrayPool<uint>.Shared.Rent((int)partitionCount);
+                try
+                {
+                    for (int i = 0; i < pending.Count; i++)
+                    {
+                        var center = clusters[pending[i]].Center;
+                        uint partId = clusterPart[i];
+                        partitionPoint[(int)partId * 3 + 0] = center.X;
+                        partitionPoint[(int)partId * 3 + 1] = center.Y;
+                        partitionPoint[(int)partId * 3 + 2] = center.Z;
+                    }
+
+                    Meshopt.SpatialSortRemap(
+                        partitionRemap.AsSpan(0, (int)partitionCount),
+                        partitionPoint.AsSpan(0, (int)partitionCount * 3),
+                        (nuint)Unsafe.SizeOf<Vector3>()
+                    );
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(partitionPoint);
+                }
+            }
+
+            var sortedPending = ArrayPool<int>.Shared.Rent(pending.Count);
+            var partitionSizes = ArrayPool<int>.Shared.Rent((int)partitionCount);
+            Array.Clear(partitionSizes, 0, (int)partitionCount);
+
+            for (int i = 0; i < pending.Count; i++)
+            {
+                uint partId = clusterPart[i];
+                if (partitionRemap != null)
+                    partId = partitionRemap[partId];
+                partitionSizes[(int)partId]++;
+            }
+
+            var offsets = ArrayPool<int>.Shared.Rent((int)partitionCount);
+            int runningOffset = 0;
+            groupOffsets.Add(0);
+            for (int i = 0; i < (int)partitionCount; i++)
+            {
+                offsets[i] = runningOffset;
+                runningOffset += partitionSizes[i];
+                groupOffsets.Add(runningOffset);
+            }
+
+            for (int i = 0; i < pending.Count; i++)
+            {
+                uint partId = clusterPart[i];
+                if (partitionRemap != null)
+                    partId = partitionRemap[partId];
+
+                int dest = offsets[partId]++;
+                sortedPending[dest] = pending[i];
+            }
+
+            new Span<int>(sortedPending, 0, pending.Count)
+                .CopyTo(CollectionsMarshal.AsSpan(pending));
+
+            ArrayPool<int>.Shared.Return(sortedPending);
+            ArrayPool<int>.Shared.Return(partitionSizes);
+            ArrayPool<int>.Shared.Return(offsets);
+            if (partitionRemap != null)
+                ArrayPool<uint>.Shared.Return(partitionRemap);
+
+            return (int)partitionCount;
+        }
+        finally
         {
-            uint partId = clusterPart[i];
-            int finalPartId = partitionRemap == null ? (int)partId : (int)partitionRemap[partId];
-            partitions[finalPartId].Add(pending[i]);
+            ArrayPool<uint>.Shared.Return(clusterIndices);
+            ArrayPool<uint>.Shared.Return(clusterCounts);
+            ArrayPool<uint>.Shared.Return(clusterPart);
         }
-
-        return partitions;
     }
 
     private static void LockBoundary(
         Span<byte> locks,
-        List<List<int>> groups,
         List<BuilderMeshlet> clusters,
-        uint[] remap
+        List<uint> globalIndices,
+        List<int> pending,
+        List<int> groupOffsets,
+        ReadOnlySpan<uint> remap
     )
     {
-        // For each remapped vertex, use bit 7 as temporary storage to indicate that 
-        // the vertex has been used by a different group previously
         const byte LockBit = 1 << 0;
         const byte SeenBit = 1 << 7;
         const byte SimplifyProtect = 2; // meshopt_SimplifyVertex_Protect
 
         for (int i = 0; i < locks.Length; i++)
-            locks[i] &= unchecked((byte)~(LockBit | SeenBit));
+            locks[i] &= unchecked((byte) ~(LockBit | SeenBit));
 
-        foreach (var group in groups)
+        var globalIndicesSpan = CollectionsMarshal.AsSpan(globalIndices);
+
+        for (int g = 0; g < groupOffsets.Count - 1; g++)
         {
+            int start = groupOffsets[g];
+            int count = groupOffsets[g + 1] - start;
+            var group = CollectionsMarshal.AsSpan(pending).Slice(start, count);
+
             foreach (int clusterIdx in group)
             {
-                foreach (var v in clusters[clusterIdx].Indices)
+                var c = clusters[clusterIdx];
+                var indices =
+                    globalIndicesSpan.Slice(c.IndicesOffset, c.IndicesCount);
+                foreach (var v in indices)
                 {
-                    uint r = remap[v];
+                    uint r = remap[(int)v];
                     locks[(int)r] |= (byte)((locks[(int)r] & SeenBit) >> 7);
                 }
             }
             foreach (int clusterIdx in group)
             {
-                foreach (var v in clusters[clusterIdx].Indices)
+                var c = clusters[clusterIdx];
+                var indices =
+                    globalIndicesSpan.Slice(c.IndicesOffset, c.IndicesCount);
+                foreach (var v in indices)
                 {
-                    uint r = remap[v];
+                    uint r = remap[(int)v];
                     locks[(int)r] |= SeenBit;
                 }
             }
@@ -866,127 +1114,164 @@ public static class ClusterBuilder
         }
     }
 
-    private static uint[] Simplify(
+    private static void Simplify(
         ClusterLodConfig config,
-        Vector3[] positions,
-        uint[] indices,
-        byte[] locks,
+        ReadOnlySpan<Vector3> positions,
+        ReadOnlySpan<uint> indices,
+        ReadOnlySpan<byte> locks,
         int targetCount,
-        out float error
+        out float error,
+        List<uint> outputIndices
     )
     {
         if (targetCount >= indices.Length)
         {
             error = 0;
-            return indices;
+            // outputIndices.AddRange(indices); // Add range span...
+            // Assuming we want to copy indices to output.
+            var span = CollectionsMarshal.AsSpan(outputIndices);
+            // Wait, AddRange(Span) is not available on List<T> standard
+            foreach (var i in indices)
+                outputIndices.Add(i);
+            return;
         }
 
-        var simplified = new uint[indices.Length];
-        var posSpan = MemoryMarshal.Cast<Vector3, float>(positions.AsSpan());
-        
-        // Standard meshoptimizer SimplifyOptions values:
-        // LockBorder = 1, Sparse = 2, ErrorAbsolute = 4, Regularize = 16, Permissive = 32
-        var options = SimplificationOptions.SimplifyLockBorder; // 1
-        options |= (SimplificationOptions)2; // Sparse
-        options |= (SimplificationOptions)4; // ErrorAbsolute
-        if (config.SimplifyPermissive) options |= (SimplificationOptions)32;
-        if (config.SimplifyRegularize) options |= (SimplificationOptions)16;
+        var simplified = ArrayPool<uint>.Shared.Rent(indices.Length);
+        var posSpan = MemoryMarshal.Cast<Vector3, float>(positions);
 
-        nuint newCount = Meshopt.SimplifyWithAttributes(
-            simplified.AsSpan(),
-            indices.AsSpan(),
-            posSpan, (nuint)Unsafe.SizeOf<Vector3>(),
-            null, 0, null, 0,
-            locks.AsSpan(),
-            (nuint)targetCount,
-            float.MaxValue,
-            options,
-            out error
-        );
-
-        if (newCount > (nuint)targetCount && config.SimplifyFallbackSloppy)
+        try
         {
-            // SimplifyFallback logic from clusterlod.h
-            // For simplicity in C#, we use SimplifySloppy directly if available
-            newCount = Meshopt.SimplifySloppy(
+            // Standard meshoptimizer SimplifyOptions values:
+            // LockBorder = 1, Sparse = 2, ErrorAbsolute = 4, Regularize = 16,
+            // Permissive = 32
+            var options = SimplificationOptions.SimplifyLockBorder; // 1
+            options |= (SimplificationOptions)2;                    // Sparse
+            options |= (SimplificationOptions)4;                    // ErrorAbsolute
+            if (config.SimplifyPermissive)
+                options |= (SimplificationOptions)32;
+            if (config.SimplifyRegularize)
+                options |= (SimplificationOptions)16;
+
+            nuint newCount = Meshopt.SimplifyWithAttributes(
                 simplified.AsSpan(),
-                indices.AsSpan(),
-                posSpan, (nuint)Unsafe.SizeOf<Vector3>(),
+                indices,
+                posSpan,
+                (nuint)Unsafe.SizeOf<Vector3>(),
+                null,
+                0,
+                null,
+                0,
+                locks,
                 (nuint)targetCount,
                 float.MaxValue,
+                options,
                 out error
             );
-            error *= config.SimplifyErrorFactorSloppy;
-        }
 
-        if (config.SimplifyErrorEdgeLimit > 0)
-        {
-            float maxEdgeSq = 0;
-            for (int i = 0; i < indices.Length; i += 3)
+            if (newCount > (nuint)targetCount && config.SimplifyFallbackSloppy)
             {
-                var va = positions[indices[i + 0]];
-                var vb = positions[indices[i + 1]];
-                var vc = positions[indices[i + 2]];
-                float eab = Vector3.DistanceSquared(va, vb);
-                float eac = Vector3.DistanceSquared(va, vc);
-                float ebc = Vector3.DistanceSquared(vb, vc);
-                float emax = Math.Max(Math.Max(eab, eac), ebc);
-                float emin = Math.Min(Math.Min(eab, eac), ebc);
-                maxEdgeSq = Math.Max(maxEdgeSq, Math.Max(emin, emax / 4.0f));
+                newCount = Meshopt.SimplifySloppy(
+                    simplified.AsSpan(),
+                    indices,
+                    posSpan,
+                    (nuint)Unsafe.SizeOf<Vector3>(),
+                    (nuint)targetCount,
+                    float.MaxValue,
+                    out error
+                );
+                error *= config.SimplifyErrorFactorSloppy;
             }
-            error = Math.Min(error, (float)Math.Sqrt(maxEdgeSq) * config.SimplifyErrorEdgeLimit);
-        }
 
-        var result = new uint[newCount];
-        simplified.AsSpan(0, (int)newCount).CopyTo(result);
-        return result;
-    }
-
-    private static ClusterLodBounds BoundsCompute(Vector3[] positions, uint[] indices, float error)
-    {
-        var posSpan = MemoryMarshal.Cast<Vector3, float>(positions.AsSpan());
-        var b = Meshopt.ComputeClusterBounds(indices.AsSpan(), posSpan, (nuint)Unsafe.SizeOf<Vector3>());
-        
-        Vector3 center;
-        unsafe { center = *(Vector3*)b.center; }
-        
-        return new ClusterLodBounds { Center = center, Radius = b.radius, Error = error };
-    }
-
-    private static ClusterLodBounds BoundsMerge(List<BuilderMeshlet> clusters, List<int> group)
-    {
-        var centers = new float[group.Count * 3];
-        var radii = new float[group.Count];
-        float maxError = 0;
-        for (int i = 0; i < group.Count; i++)
-        {
-            var c = clusters[group[i]];
-            centers[i * 3 + 0] = c.LodCenter.X;
-            centers[i * 3 + 1] = c.LodCenter.Y;
-            centers[i * 3 + 2] = c.LodCenter.Z;
-            radii[i] = c.LodRadius;
-            maxError = Math.Max(maxError, c.Error);
-        }
-
-        MeshOptimizer.Bounds merged;
-        unsafe
-        {
-            fixed (float* pCenters = centers)
-            fixed (float* pRadii = radii)
+            if (config.SimplifyErrorEdgeLimit > 0)
             {
-                merged = Meshopt.ComputeSphereBounds(
-                    pCenters,
-                    (nuint)group.Count,
-                    (nuint)(sizeof(float) * 3),
-                    pRadii,
-                    (nuint)sizeof(float)
+                float maxEdgeSq = 0;
+                for (int i = 0; i < indices.Length; i += 3)
+                {
+                    var va = positions[(int)indices[i + 0]];
+                    var vb = positions[(int)indices[i + 1]];
+                    var vc = positions[(int)indices[i + 2]];
+                    float eab = Vector3.DistanceSquared(va, vb);
+                    float eac = Vector3.DistanceSquared(va, vc);
+                    float ebc = Vector3.DistanceSquared(vb, vc);
+                    float emax = Math.Max(Math.Max(eab, eac), ebc);
+                    float emin = Math.Min(Math.Min(eab, eac), ebc);
+                    maxEdgeSq = Math.Max(maxEdgeSq, Math.Max(emin, emax / 4.0f));
+                }
+                error = Math.Min(
+                    error,
+                    (float)Math.Sqrt(maxEdgeSq) * config.SimplifyErrorEdgeLimit
                 );
             }
+
+            for (int i = 0; i < (int)newCount; ++i)
+                outputIndices.Add(simplified[i]);
+        }
+        finally
+        {
+            ArrayPool<uint>.Shared.Return(simplified);
+        }
+    }
+
+    private static ClusterLodBounds BoundsCompute(
+        ReadOnlySpan<Vector3> positions, ReadOnlySpan<uint> indices, float error
+    )
+    {
+        var posSpan = MemoryMarshal.Cast<Vector3, float>(positions);
+        var b = Meshopt.ComputeClusterBounds(
+            indices, posSpan, (nuint)Unsafe.SizeOf<Vector3>()
+        );
+
+        Vector3 center;
+        unsafe
+        {
+            center = *(Vector3 *)b.center;
         }
 
-        Vector3 mergedCenter;
-        unsafe { mergedCenter = *(Vector3*)merged.center; }
+        return new ClusterLodBounds {
+            Center = center, Radius = b.radius, Error = error
+        };
+    }
 
-        return new ClusterLodBounds { Center = mergedCenter, Radius = merged.radius, Error = maxError };
+    private static ClusterLodBounds BoundsMerge(
+        List<BuilderMeshlet> clusters, ReadOnlySpan<int> group
+    )
+    {
+        var centers = ArrayPool<float>.Shared.Rent(group.Length * 3);
+        var radii = ArrayPool<float>.Shared.Rent(group.Length);
+
+        try
+        {
+            float maxError = 0;
+            for (int i = 0; i < group.Length; i++)
+            {
+                var c = clusters[group[i]];
+                centers[i * 3 + 0] = c.LodCenter.X;
+                centers[i * 3 + 1] = c.LodCenter.Y;
+                centers[i * 3 + 2] = c.LodCenter.Z;
+                radii[i] = c.LodRadius;
+                maxError = Math.Max(maxError, c.Error);
+            }
+
+            var merged = Meshopt.ComputeSphereBounds(
+                centers.AsSpan(0, group.Length * 3),
+                sizeof(float) * 3,
+                radii.AsSpan(0, group.Length),
+                sizeof(float)
+            );
+
+            Vector3 mergedCenter;
+            unsafe
+            {
+                mergedCenter = *(Vector3 *)merged.center;
+            }
+            return new ClusterLodBounds {
+                Center = mergedCenter, Radius = merged.radius, Error = maxError
+            };
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(centers);
+            ArrayPool<float>.Shared.Return(radii);
+        }
     }
 }

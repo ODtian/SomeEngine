@@ -109,6 +109,6 @@ public class IcoSphereTest
 
         scene.ToGltf2().SaveGLB(outputPath);
 
-        TestContext.WriteLine($"Exported GLTF to {outputPath}");
+        TestContext.Out.WriteLine($"Exported GLTF to {outputPath}");
     }
 }

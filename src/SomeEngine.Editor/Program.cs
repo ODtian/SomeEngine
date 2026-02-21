@@ -137,14 +137,14 @@ class Program
         // Or if it has no inputs/outputs...
         
         // Let's manually invoke for test:
-        var ctx = _renderContext.ImmediateContext;
+        var ctx = _renderContext!.ImmediateContext!;
         ITextureView[] rtv = { bbView };
-        ctx.SetRenderTargets(rtv, _renderContext.SwapChain.GetDepthBufferDSV(), ResourceStateTransitionMode.Transition);
+        ctx.SetRenderTargets(rtv, _renderContext.SwapChain!.GetDepthBufferDSV(), ResourceStateTransitionMode.Transition);
         var clearColor = new Vector4(0.1f, 0.2f, 0.4f, 1.0f);
         ctx.ClearRenderTarget(bbView, clearColor, ResourceStateTransitionMode.Transition);
         ctx.ClearDepthStencil(_renderContext.SwapChain.GetDepthBufferDSV(), ClearDepthStencilFlags.Depth, 1.0f, 0, ResourceStateTransitionMode.Transition);
         
-        _clusterPass.Execute(_renderContext, null!); 
+        _clusterPass!.Execute(_renderContext, null!); 
         // graphContext null might crash if I used it. I didn't use it in Execute implementation.
 
         _renderContext.Present();

@@ -15,6 +15,7 @@ struct PSInput
     float3 Normal : NORMAL;
 };
 
+[shader("vertex")]
 PSInput VSMain(VSInput input)
 {
     PSInput output;
@@ -23,6 +24,7 @@ PSInput VSMain(VSInput input)
     return output;
 }
 
+[shader("pixel")]
 float4 PSMain(PSInput input) : SV_TARGET
 {
     float3 lightDir = normalize(float3(1.0, 1.0, -1.0));

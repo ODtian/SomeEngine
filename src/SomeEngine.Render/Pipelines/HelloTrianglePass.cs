@@ -9,7 +9,6 @@ public unsafe class HelloTrianglePass : IDisposable
 {
     private readonly RenderContext _context;
     private IPipelineState? _pso;
-    private IShaderResourceBinding? _srb;
 
     public HelloTrianglePass(RenderContext context)
     {
@@ -91,7 +90,6 @@ public unsafe class HelloTrianglePass : IDisposable
 
     public void Dispose()
     {
-        _srb?.Dispose();
         _pso?.Dispose();
     }
 }

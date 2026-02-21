@@ -1,12 +1,17 @@
-#include "common.hlsl"
+#include "common.slang"
 
-cbuffer DrawUniforms
+struct DrawUniforms
 {
     float4x4 ViewProj;
     float4x4 View; // Needed for billboard/impostors if any
     uint PageTableSize;
     uint DebugMode;
 };
+
+cbuffer DrawUniformsBuffer
+{
+    DrawUniforms Uniforms;
+}
 
 // Hash Function for Cluster Visualization
 uint PCGHash(uint input)
@@ -26,13 +31,13 @@ float3 ColorFromHash(uint hash)
 }
 
 // Page Table: Maps PageID to ByteOffset in PageHeap
-StructuredBuffer<uint> PageTable : register(t0);
+StructuredBuffer<uint> PageTable;
 
 // Huge bindless heap
-ByteAddressBuffer PageHeap : register(t1);
+ByteAddressBuffer PageHeap;
 
 // Debug/Impostor Instances if needed
-StructuredBuffer<GpuTransform> Instances : register(t2);
+StructuredBuffer<GpuTransform> Instances;
 
 struct DrawRequest
 {
@@ -41,7 +46,8 @@ struct DrawRequest
     uint InstanceID;
     uint Pad;
 };
-StructuredBuffer<DrawRequest> RequestBuffer : register(t3);
+
+StructuredBuffer<DrawRequest> RequestBuffer;
 
 struct PSInput
 {
@@ -90,6 +96,8 @@ void LoadClusterInfo(uint pageOffset, uint clusterId, out float3 center, out flo
     tStart = v1.y;
 }
 
+[shader("vertex")]
+[shader("vertex")]
 PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     PSInput output;
@@ -130,6 +138,7 @@ PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         output.Normal = float3(0,0,0);
         output.UV = float2(0,0);
         output.Color = float3(0,0,0);
+        output.ClusterID = clusterID;
         return output;
     }
     
@@ -169,11 +178,14 @@ PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
         p0 = rawPosWords.x >> 16;
         p1 = rawPosWords.y & 0xFFFF;
         p2 = rawPosWords.y >> 16;
-    } else { // offset 1 or 3, shouldn't happen for u16 stream aligned to 2 bytes?
-             // Since base offsets in header are uint (4 bytes), and stride is 6.
-             // 6 * N can be 2-aligned.
-             // It is possible.
-             p0 = 0; p1=0; p2=0; // Fail safe
+    } else { // offset 1 or 3
+             // Should not happen if posOffset is aligned to 2?
+             // Since positions are u16[3] (6 bytes).
+             // We assume 2-byte alignment.
+             // If posByteAddr % 4 == 1 or 3, then it's misaligned relative to 4.
+             // But u16 requires 2-byte alignment.
+             // Let's assume valid alignment.
+             p0 = 0; p1=0; p2=0; 
     }
     
     // Dequantize
@@ -185,7 +197,7 @@ PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     float3 position = center + localPos * radius;
     
     // 8. Transform
-    output.Pos = mul(float4(position, 1.0), ViewProj);
+    output.Pos = mul(float4(position, 1.0), Uniforms.ViewProj);
     
     // 9. Fake Normal/Color for Debug
     float3 N = normalize(localPos); // Approx normal from sphere center
@@ -196,21 +208,17 @@ PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     
     // Apply Instance Transform
     GpuTransform t = Instances[realInstanceID];
-    float3 p = ApplyTransform(position, t); // Reuse common.hlsl logic
-    output.Pos = mul(float4(p, 1.0), ViewProj);
-    
-    // Rotate Normal
-    // ... Copy logic from old shader or common.hlsl
-    
-    // TODO: Load real Attributes
-    // Need to know stride and format.
-    
+    float3 p = ApplyTransform(position, t); // Reuse common.slang logic
+    output.Pos = mul(float4(p, 1.0), Uniforms.ViewProj);
+
     return output;
 }
 
+[shader("pixel")]
+[shader("pixel")]
 float4 PSMain(PSInput input) : SV_TARGET
 {
-    if (DebugMode == 1)
+    if (Uniforms.DebugMode == 1)
     {
         uint h = PCGHash(input.ClusterID);
         return float4(ColorFromHash(h), 1.0);
@@ -219,6 +227,7 @@ float4 PSMain(PSInput input) : SV_TARGET
     return float4(input.Color, 1.0);
 }
 
+[shader("pixel")]
 float4 PSOverdraw(PSInput input) : SV_TARGET
 {
     // Return small additive value

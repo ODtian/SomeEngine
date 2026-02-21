@@ -1,11 +1,12 @@
-RWByteAddressBuffer IndirectArgs : register(u0); // The main draw args
-RWByteAddressBuffer DebugArgs : register(u1);    // The debug sphere draw args
+RWByteAddressBuffer IndirectArgs; // The main draw args
+RWByteAddressBuffer DebugArgs;    // The debug sphere draw args
 
-cbuffer CopyUniforms : register(b0)
+cbuffer CopyUniforms
 {
     uint SphereVertexCount;
 };
 
+[shader("compute")]
 [numthreads(1, 1, 1)]
 void main()
 {

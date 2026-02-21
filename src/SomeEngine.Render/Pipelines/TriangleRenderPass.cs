@@ -80,6 +80,8 @@ public class TriangleRenderPass : RenderPass, IDisposable
                             DefaultVariableType = ShaderResourceVariableType.Static,
                             Variables = [new ShaderResourceVariableDesc {
                                 Name = "Transforms",
+                                Binding = 0, Set = 0,
+                                ResourceType = ShaderResourceType.BufferSrv,
                                 Type = ShaderResourceVariableType.Mutable,
                                 ShaderStages = ShaderType.Vertex
                             }]
@@ -165,9 +167,9 @@ public class TriangleRenderPass : RenderPass, IDisposable
             TransformSystem.GlobalTransformBuffer != null &&
             TransformSystem.Count > 0)
         {
-            // Update Binding
+            // Update Binding by slot
             var varTransforms =
-                _srb?.GetVariableByName(ShaderType.Vertex, "Transforms");
+                _srb?.GetVariableByBinding(ShaderType.Vertex, 0, 0, ShaderResourceType.BufferSrv);
             if (varTransforms != null &&
                 TransformSystem.GlobalTransformBuffer != null)
             {

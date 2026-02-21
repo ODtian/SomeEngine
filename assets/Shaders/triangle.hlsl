@@ -15,6 +15,7 @@ struct PSInput
     float4 Color : COLOR;
 };
 
+[shader("vertex")]
 PSInput VSMain(uint VertID : SV_VertexID, uint InstID : SV_InstanceID)
 {
     PSInput ps;
@@ -35,6 +36,7 @@ PSInput VSMain(uint VertID : SV_VertexID, uint InstID : SV_InstanceID)
     return ps;
 }
 
+[shader("pixel")]
 float4 PSMain(PSInput input) : SV_TARGET
 {
     return input.Color;

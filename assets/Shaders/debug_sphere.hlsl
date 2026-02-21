@@ -8,11 +8,11 @@ struct DrawRequest
     uint Pad;
 };
 
-StructuredBuffer<DrawRequest> RequestBuffer : register(t0);
-StructuredBuffer<uint> PageTable : register(t1);
-ByteAddressBuffer PageHeap : register(t2);
+StructuredBuffer<DrawRequest> RequestBuffer;
+StructuredBuffer<uint> PageTable;
+ByteAddressBuffer PageHeap;
 
-cbuffer DrawUniforms : register(b0)
+cbuffer DrawUniforms
 {
     float4x4 ViewProj;
     float4x4 View;
@@ -43,6 +43,7 @@ struct PSInput
     float3 Color : COLOR;
 };
 
+[shader("vertex")]
 PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
 {
     PSInput output;
@@ -90,7 +91,7 @@ PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     // Load Cluster Center/Radius
     // Header is 32 bytes. Cluster stride is 60 bytes.
     // Center (12) + Radius (4) = 16 bytes.
-    uint clusterOffset = pageOffset + 32 + clusterID * 60 + 16; 
+    uint clusterOffset = pageOffset + 32 + clusterID * 60; 
     float4 v0 = asfloat(PageHeap.Load4(clusterOffset));
     float3 center = v0.xyz;
     float radius = v0.w;
@@ -102,6 +103,7 @@ PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     return output;
 }
 
+[shader("pixel")]
 float4 PSMain(PSInput input) : SV_TARGET
 {
     return float4(input.Color, 0.5);

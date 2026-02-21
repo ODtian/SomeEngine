@@ -5,19 +5,23 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Alimer.Bindings.MeshOptimizer" Version="1.2.0" />
+    <PackageReference Include="Alimer.Bindings.MeshOptimizer" Version="1.2.2" />
     <PackageReference Include="FlatSharp.Compiler" Version="7.9.0">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="FlatSharp.Runtime" Version="7.9.0" />
     <PackageReference Include="SharpGLTF.Core" Version="1.0.6" />
+    <PackageReference Include="SlangShaderSharp" Version="1.0.0" />
   </ItemGroup>
 
   <ItemGroup>
     <FlatSharpSchema Include="..\..\assets\Schema\mesh_asset.fbs" />
+    <FlatSharpSchema Include="..\..\assets\Schema\shader_asset.fbs" />
   </ItemGroup>
 </Project>

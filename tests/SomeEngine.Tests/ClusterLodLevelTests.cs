@@ -24,7 +24,7 @@ public class ClusterLodLevelTests
         var meshAsset = ClusterBuilder.ProcessRaw(vertices, attributes, indices, "TestLOD");
         
         // 3. Inspect Payload manually
-        var payload = meshAsset.Payload.Value;
+        var payload = meshAsset.Payload!.Value;
         
         // 4. Verify Levels
         int maxLevel = 0;

@@ -1,7 +1,7 @@
-<Project>
+<Project TreatAsLocalProperty="Platform">
   <PropertyGroup>
-    <Platforms>x64</Platforms>
-    <Platform Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU' Or '$(Platform)' == 'Any CPU'">x64</Platform>
-    <PlatformTarget Condition="'$(PlatformTarget)' == '' Or '$(PlatformTarget)' == 'AnyCPU' Or '$(PlatformTarget)' == 'Any CPU'">x64</PlatformTarget>
+    <!-- Diligent 不支持 AnyCPU，自动重定向为 x64 -->
+    <Platform
+      Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU' Or '$(Platform)' == 'Any CPU'">x64</Platform>
   </PropertyGroup>
 </Project>

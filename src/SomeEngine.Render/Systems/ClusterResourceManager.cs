@@ -89,7 +89,7 @@ public class ClusterResourceManager : IDisposable
                 Mode = BufferMode.Structured,
                 ElementByteStride = 4
             };
-            PageTableBuffer = _context.Device.CreateBuffer(tableDesc);
+            PageTableBuffer = _context.Device!.CreateBuffer(tableDesc);
         }
 
         unsafe
@@ -97,7 +97,7 @@ public class ClusterResourceManager : IDisposable
             var span = CollectionsMarshal.AsSpan(_pageOffsets);
             fixed (uint* ptr = span)
             {
-                _context.ImmediateContext.UpdateBuffer(PageTableBuffer, 0, requiredSize, (IntPtr)ptr, ResourceStateTransitionMode.Transition);
+                _context.ImmediateContext!.UpdateBuffer(PageTableBuffer, 0, requiredSize, (IntPtr)ptr, ResourceStateTransitionMode.Transition);
             }
         }
         _pageTableDirty = false;

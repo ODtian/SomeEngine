@@ -137,7 +137,7 @@ public class ClusterLodAutoCutTests
                 }
             }
             
-            TestContext.WriteLine($"Distance {camDist:F2}: Selected {selectedIndices.Count} clusters. Cut is valid.");
+            TestContext.Out.WriteLine($"Distance {camDist:F2}: Selected {selectedIndices.Count} clusters. Cut is valid.");
         }
     }
 

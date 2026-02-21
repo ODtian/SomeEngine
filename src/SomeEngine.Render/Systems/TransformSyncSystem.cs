@@ -15,7 +15,6 @@ public class TransformSyncSystem : QuerySystem<TransformQvvs>
     private IBuffer? _gpuBuffer; // The StructuredBuffer on GPU
     private GpuTransform[] _cpuBuffer; // Shadow copy for updates
     private int _capacity = 1024;
-    private bool _dirty = false;
     
     // Mapping from Entity ID to Index in buffer
     // For now, we might just compact it every frame or use a component to store index

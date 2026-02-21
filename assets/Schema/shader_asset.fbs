@@ -1,0 +1,68 @@
+// FlatBuffers schema for ShaderAsset
+namespace SomeEngine.Assets.Schema;
+
+attribute "fs_serializer";
+
+enum ShaderStage : ubyte {
+    Vertex,
+    Hull,
+    Domain,
+    Geometry,
+    Pixel,
+    Compute,
+    Amplification,
+    Mesh,
+    RayGen,
+    RayMiss,
+    RayClosestHit,
+    RayAnyHit,
+    RayIntersection,
+    Callable
+}
+
+enum ShaderResourceVariableType : ubyte {
+    Static,
+    Mutable,
+    Dynamic
+}
+
+enum ShaderResourceCategory : ubyte {
+    ConstantBuffer,
+    ShaderResource, // t
+    UnorderedAccess, // u
+    SamplerState,    // s
+    Unknown
+}
+
+table ShaderResourceReflection {
+    name: string;
+    type: ShaderResourceVariableType;
+    category: ShaderResourceCategory;
+    binding: uint = 4294967295;
+    set: uint = 4294967295;
+    stages: uint; // Diligent SHADER_TYPE bitmask
+}
+
+table ShaderReflectionData {
+    resources: [ShaderResourceReflection];
+}
+
+table ShaderBytecode {
+    backend: string; // "dxil", "spirv"
+    data: [ubyte];
+    entry_point: string;
+    stage: ShaderStage;
+}
+
+table BackendReflection {
+    backend: string; // "dxil", "spirv", etc.
+    reflection: ShaderReflectionData;
+}
+
+table ShaderAsset {
+    name: string;
+    variants: [ShaderBytecode];
+    reflections: [BackendReflection];
+}
+
+root_type ShaderAsset;

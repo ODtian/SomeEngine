@@ -1,4 +1,6 @@
 using Diligent;
+using SomeEngine.Assets.Importers;
+using SomeEngine.Assets.Schema;
 using SomeEngine.Render.Data;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
@@ -21,6 +23,8 @@ struct CullingUniforms
     public uint PageID;
     public uint BaseInstanceID;
     public int ForcedLODLevel;
+    public uint InstanceCount;
+    public Vector2 Pad;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -47,6 +51,11 @@ public class ClusterRenderPass : RenderPass, IDisposable
     private readonly RenderContext _context;
     private readonly TransformSyncSystem _transformSystem;
     private readonly ClusterResourceManager _clusterManager;
+
+    private ShaderAsset? _cullAsset;
+    private ShaderAsset? _drawAsset;
+    private ShaderAsset? _copyAsset;
+    private ShaderAsset? _debugSphereAsset;
 
     private IPipelineState? _computePSO;
     private IShaderResourceBinding? _computeSRB;
@@ -211,61 +220,31 @@ public class ClusterRenderPass : RenderPass, IDisposable
         cppsCi.PSODesc.Name = "Cluster Culling PSO";
         cppsCi.PSODesc.PipelineType = PipelineType.Compute;
 
-        // Shader
-        using var shaderFactory =
-            _context.Factory?.CreateDefaultShaderSourceStreamFactory(
-                "assets/Shaders"
-            );
-        ShaderCreateInfo creationAttrs = new ShaderCreateInfo {
-            SourceLanguage = ShaderSourceLanguage.Hlsl,
-            Desc =
-                new ShaderDesc {
-                    ShaderType = ShaderType.Compute, Name = "Cluster Culling CS"
-                },
-            EntryPoint = "main",
-            FilePath = "cluster_cull.cs.hlsl",
-            ShaderSourceStreamFactory = shaderFactory
-        };
-        var cs = device.CreateShader(creationAttrs, out _);
+        // Slang Shader Import
+        string cullSlangPath = Path.Combine(AppContext.BaseDirectory, "assets", "Shaders", "cluster_cull.slang");
+        if (!File.Exists(cullSlangPath))
+        {
+             // Fallback: search up from bin/Debug/net10.0/.../src/SomeEngine.Runtime/../../../../assets
+             // BaseDirectory: .../SomeEngine.Runtime/bin/Debug/net10.0/
+             // Go up 5 levels to root: ../../../../..
+             cullSlangPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/cluster_cull.slang"));
+        }
+        
+        _cullAsset = SlangShaderImporter.Import(cullSlangPath);
+        using var cs = _cullAsset.CreateShader(_context, "main");
         cppsCi.Cs = cs;
 
         // Resources
-        cppsCi.PSODesc.ResourceLayout.DefaultVariableType =
-            ShaderResourceVariableType.Static;
-
-        ShaderResourceVariableDesc[] vars = {
-            new ShaderResourceVariableDesc {
-                ShaderStages = ShaderType.Compute,
-                Name = "PageBuffer",
-                Type = ShaderResourceVariableType.Mutable
-            },
-            new ShaderResourceVariableDesc {
-                ShaderStages = ShaderType.Compute,
-                Name = "IndirectDrawArgs",
-                Type = ShaderResourceVariableType.Mutable
-            }, // Was DrawArgs
-            new ShaderResourceVariableDesc {
-                ShaderStages = ShaderType.Compute,
-                Name = "RequestBuffer",
-                Type = ShaderResourceVariableType.Mutable
-            },
-            new ShaderResourceVariableDesc {
-                ShaderStages = ShaderType.Compute,
-                Name = "CullingUniforms",
-                Type = ShaderResourceVariableType.Static
-            }
-        };
-        cppsCi.PSODesc.ResourceLayout.Variables = vars;
-
-        cppsCi.PSODesc.ResourceLayout.DefaultVariableType =
-            ShaderResourceVariableType.Mutable;
+        cppsCi.PSODesc.ResourceLayout.DefaultVariableType = Diligent.ShaderResourceVariableType.Mutable;
+        
+        // Use reflected variables instead of manual definition
+        cppsCi.PSODesc.ResourceLayout.Variables = _cullAsset.GetResourceVariables(_context);
 
         _computePSO = device.CreateComputePipelineState(cppsCi);
         if (_computePSO != null)
         {
-            // Bind Static Uniform
-            _computePSO
-                .GetStaticVariableByName(ShaderType.Compute, "CullingUniforms")
+            // Bind Static Uniform by name using reflection extension
+            _computePSO.GetStaticVariable(_context, _cullAsset, ShaderType.Compute, "CullingUniformsBuffer")
                 ?.Set(_cullingUniformBuffer, SetShaderResourceFlags.None);
             _computeSRB = _computePSO.CreateShaderResourceBinding(true);
         }
@@ -277,7 +256,7 @@ public class ClusterRenderPass : RenderPass, IDisposable
 
         // Render Target formats (Should match SwapChain)
         psCi.GraphicsPipeline.NumRenderTargets = 1;
-        psCi.GraphicsPipeline.RTVFormats[0] = TextureFormat.RGBA8_UNorm;
+        psCi.GraphicsPipeline.RTVFormats = new[] { TextureFormat.RGBA8_UNorm };
         psCi.GraphicsPipeline.DSVFormat = TextureFormat.D32_Float;
 
         // Input Layout
@@ -289,26 +268,27 @@ public class ClusterRenderPass : RenderPass, IDisposable
         psCi.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = true;
 
         // Shaders
-        creationAttrs.Desc.ShaderType = ShaderType.Vertex;
-        creationAttrs.Desc.Name = "Cluster Draw VS";
-        creationAttrs.EntryPoint = "VSMain";
-        creationAttrs.FilePath = "cluster_draw.hlsl";
-        var vs = device.CreateShader(creationAttrs, out _);
+        string drawSlangPath = Path.Combine(AppContext.BaseDirectory, "assets", "Shaders", "cluster_draw.slang");
+        if (!File.Exists(drawSlangPath))
+        {
+             drawSlangPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../assets/Shaders/cluster_draw.slang"));
+        }
+        
+        _drawAsset = SlangShaderImporter.Import(drawSlangPath);
+        using var vs = _drawAsset.CreateShader(_context, "VSMain");
+        using var ps = _drawAsset.CreateShader(_context, "PSMain");
+        
         psCi.Vs = vs;
-
-        creationAttrs.Desc.ShaderType = ShaderType.Pixel;
-        creationAttrs.Desc.Name = "Cluster Draw PS";
-        creationAttrs.EntryPoint = "PSMain";
-        creationAttrs.FilePath = "cluster_draw.hlsl";
-        var ps = device.CreateShader(creationAttrs, out _);
         psCi.Ps = ps;
 
-        psCi.PSODesc.ResourceLayout.DefaultVariableType =
-            ShaderResourceVariableType.Mutable;
+        psCi.PSODesc.ResourceLayout.DefaultVariableType = Diligent.ShaderResourceVariableType.Mutable;
+        psCi.PSODesc.ResourceLayout.Variables = _drawAsset.GetResourceVariables(_context);
 
         _drawPSO = device.CreateGraphicsPipelineState(psCi);
         if (_drawPSO != null)
         {
+            _drawPSO.GetStaticVariable(_context, _drawAsset, ShaderType.Vertex, "DrawUniformsBuffer")?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
+            _drawPSO.GetStaticVariable(_context, _drawAsset, ShaderType.Pixel, "DrawUniformsBuffer")?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
             _drawSRB = _drawPSO.CreateShaderResourceBinding(true);
         }
 
@@ -320,8 +300,11 @@ public class ClusterRenderPass : RenderPass, IDisposable
         _drawWireframePSO = device.CreateGraphicsPipelineState(psCi);
         if (_drawWireframePSO != null)
         {
+             _drawWireframePSO.GetStaticVariable(_context, _drawAsset, ShaderType.Vertex, "DrawUniformsBuffer")?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
+             _drawWireframePSO.GetStaticVariable(_context, _drawAsset, ShaderType.Pixel, "DrawUniformsBuffer")?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
             _drawWireframeSRB = _drawWireframePSO.CreateShaderResourceBinding(true);
         }
+
 
         // 5. Draw Pipeline (Overdraw)
         psCi.PSODesc.Name = "Cluster Draw Overdraw PSO";
@@ -336,19 +319,29 @@ public class ClusterRenderPass : RenderPass, IDisposable
         psCi.GraphicsPipeline.BlendDesc.RenderTargets[0].DestBlend = BlendFactor.One;
 
         // Use PSOverdraw
-        creationAttrs.EntryPoint = "PSOverdraw";
-        var psOverdraw = device.CreateShader(creationAttrs, out _);
+        using var psOverdraw = _drawAsset.CreateShader(_context, "PSOverdraw");
         psCi.Ps = psOverdraw;
 
         _drawOverdrawPSO = device.CreateGraphicsPipelineState(psCi);
         if (_drawOverdrawPSO != null)
         {
+             _drawOverdrawPSO.GetStaticVariable(_context, _drawAsset, ShaderType.Vertex, "DrawUniformsBuffer")?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
+             _drawOverdrawPSO.GetStaticVariable(_context, _drawAsset, ShaderType.Pixel, "DrawUniformsBuffer")?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
             _drawOverdrawSRB = _drawOverdrawPSO.CreateShaderResourceBinding(true);
         }
 
         // 6. Debug Pipelines
         // Debug Indirect Args Buffer (Reuse argsDesc)
-        _debugIndirectArgsBuffer = device.CreateBuffer(argsDesc);
+        var debugArgsDesc = argsDesc;
+        debugArgsDesc.Name = "Debug Indirect Args Buffer";
+        _debugIndirectArgsBuffer = device.CreateBuffer(debugArgsDesc);
+
+        // Re-create creationAttrs for HLSL debug shaders
+        using var debugShaderFactory = _context.Factory?.CreateDefaultShaderSourceStreamFactory("assets/Shaders");
+        ShaderCreateInfo creationAttrs = new ShaderCreateInfo {
+            SourceLanguage = ShaderSourceLanguage.Hlsl,
+            ShaderSourceStreamFactory = debugShaderFactory
+        };
 
         // Copy Uniforms Buffer
         BufferDesc cubDesc = new BufferDesc {
@@ -365,37 +358,18 @@ public class ClusterRenderPass : RenderPass, IDisposable
         dcCi.PSODesc.Name = "Debug Copy PSO";
         dcCi.PSODesc.PipelineType = PipelineType.Compute;
 
-        creationAttrs.Desc.ShaderType = ShaderType.Compute;
-        creationAttrs.Desc.Name = "Debug Copy CS";
-        creationAttrs.EntryPoint = "main";
-        creationAttrs.FilePath = "debug_args_copy.cs.hlsl";
-        var copyCS = device.CreateShader(creationAttrs, out _);
+        string copySlangPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/debug_args_copy.cs.hlsl"));
+        _copyAsset = SlangShaderImporter.Import(copySlangPath);
+        using var copyCS = _copyAsset.CreateShader(_context, "main");
         dcCi.Cs = copyCS;
 
-        dcCi.PSODesc.ResourceLayout.DefaultVariableType = ShaderResourceVariableType.Mutable;
-        ShaderResourceVariableDesc[] copyVars = {
-             new ShaderResourceVariableDesc {
-                ShaderStages = ShaderType.Compute,
-                Name = "IndirectArgs",
-                Type = ShaderResourceVariableType.Mutable
-            },
-            new ShaderResourceVariableDesc {
-                ShaderStages = ShaderType.Compute,
-                Name = "DebugArgs",
-                Type = ShaderResourceVariableType.Mutable
-            },
-             new ShaderResourceVariableDesc {
-                ShaderStages = ShaderType.Compute,
-                Name = "CopyUniforms",
-                Type = ShaderResourceVariableType.Static
-            }
-        };
-        dcCi.PSODesc.ResourceLayout.Variables = copyVars;
+        dcCi.PSODesc.ResourceLayout.DefaultVariableType = Diligent.ShaderResourceVariableType.Mutable;
+        dcCi.PSODesc.ResourceLayout.Variables = _copyAsset.GetResourceVariables(_context);
 
         _debugCopyPSO = device.CreateComputePipelineState(dcCi);
         if (_debugCopyPSO != null)
-        {
-            _debugCopyPSO.GetStaticVariableByName(ShaderType.Compute, "CopyUniforms")
+        {   
+            _debugCopyPSO.GetStaticVariable(_context, _copyAsset, ShaderType.Compute, "CopyUniforms")
                 ?.Set(_copyUniformBuffer, SetShaderResourceFlags.None);
             _debugCopySRB = _debugCopyPSO.CreateShaderResourceBinding(true);
         }
@@ -404,6 +378,7 @@ public class ClusterRenderPass : RenderPass, IDisposable
         // Reuse psCi (GraphicsPipelineStateCreateInfo)
         // Reset necessary fields
         psCi.PSODesc.Name = "Debug Sphere PSO";
+        // ... (rest of psCi setup)
         psCi.GraphicsPipeline.NumRenderTargets = 1;
         psCi.GraphicsPipeline.RTVFormats[0] = TextureFormat.RGBA8_UNorm;
         psCi.GraphicsPipeline.DSVFormat = TextureFormat.D32_Float;
@@ -418,25 +393,21 @@ public class ClusterRenderPass : RenderPass, IDisposable
         psCi.GraphicsPipeline.BlendDesc.RenderTargets[0].SrcBlend = BlendFactor.SrcAlpha;
         psCi.GraphicsPipeline.BlendDesc.RenderTargets[0].DestBlend = BlendFactor.InvSrcAlpha;
 
-        creationAttrs.Desc.ShaderType = ShaderType.Vertex;
-        creationAttrs.Desc.Name = "Debug Sphere VS";
-        creationAttrs.EntryPoint = "VSMain";
-        creationAttrs.FilePath = "debug_sphere.hlsl";
-        var debugVS = device.CreateShader(creationAttrs, out _);
+        string debugSpherePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/debug_sphere.hlsl"));
+        _debugSphereAsset = SlangShaderImporter.Import(debugSpherePath);
+        using var debugVS = _debugSphereAsset.CreateShader(_context, "VSMain");
+        using var debugPS = _debugSphereAsset.CreateShader(_context, "PSMain");
         psCi.Vs = debugVS;
-
-        creationAttrs.Desc.ShaderType = ShaderType.Pixel;
-        creationAttrs.Desc.Name = "Debug Sphere PS";
-        creationAttrs.EntryPoint = "PSMain";
-        creationAttrs.FilePath = "debug_sphere.hlsl";
-        var debugPS = device.CreateShader(creationAttrs, out _);
         psCi.Ps = debugPS;
 
-        psCi.PSODesc.ResourceLayout.DefaultVariableType = ShaderResourceVariableType.Mutable;
+        psCi.PSODesc.ResourceLayout.DefaultVariableType = Diligent.ShaderResourceVariableType.Mutable;
+        psCi.PSODesc.ResourceLayout.Variables = _debugSphereAsset.GetResourceVariables(_context);
         
         _debugSpherePSO = device.CreateGraphicsPipelineState(psCi);
         if (_debugSpherePSO != null)
         {
+            _debugSpherePSO.GetStaticVariable(_context, _debugSphereAsset, ShaderType.Vertex, "DrawUniforms")
+                ?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
             _debugSphereSRB = _debugSpherePSO.CreateShaderResourceBinding(true);
         }
 
@@ -481,26 +452,23 @@ public class ClusterRenderPass : RenderPass, IDisposable
             return;
 
         // Bind Resources
-        _computeSRB.GetVariableByName(ShaderType.Compute, "PageBuffer")
-            ?.Set(
-                pageHeap.GetDefaultView(BufferViewType.ShaderResource),
-                SetShaderResourceFlags.None
-            );
-        _computeSRB.GetVariableByName(ShaderType.Compute, "IndirectDrawArgs")
-            ?.Set(
-                _indirectArgsBuffer.GetDefaultView(BufferViewType.UnorderedAccess),
-                SetShaderResourceFlags.None
-            );
-        _computeSRB.GetVariableByName(ShaderType.Compute, "RequestBuffer")
-            ?.Set(
-                _drawCountBuffer.GetDefaultView(BufferViewType.UnorderedAccess),
-                SetShaderResourceFlags.None
-            ); // _drawCountBuffer is RequestBuffer
+        _computeSRB.GetVariable(_context, _cullAsset, ShaderType.Compute, "PageBuffer")
+            ?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        
+        _computeSRB.GetVariable(_context, _cullAsset, ShaderType.Compute, "IndirectDrawArgs")
+            ?.Set(_indirectArgsBuffer.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+            
+        _computeSRB.GetVariable(_context, _cullAsset, ShaderType.Compute, "RequestBuffer")
+            ?.Set(_drawCountBuffer.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+
+        if (_transformSystem.GlobalTransformBuffer != null)
+        {
+             _computeSRB.GetVariable(_context, _cullAsset, ShaderType.Compute, "InstanceData")
+                ?.Set(_transformSystem.GlobalTransformBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        }
 
         ctx.SetPipelineState(_computePSO);
-        ctx.CommitShaderResources(
-            _computeSRB, ResourceStateTransitionMode.Transition
-        );
+        ctx.CommitShaderResources(_computeSRB, ResourceStateTransitionMode.Transition);
 
         // Loop over pages and dispatch
         uint totalDispatches = 0;
@@ -527,7 +495,9 @@ public class ClusterRenderPass : RenderPass, IDisposable
                     LodScale = _lodScale,
                     PageID = page.PageID,
                     BaseInstanceID = 0,
-                    ForcedLODLevel = _forcedLODLevel
+                    ForcedLODLevel = _forcedLODLevel,
+                    InstanceCount = (uint)_transformSystem.Count,
+                    Pad = Vector2.Zero
                 };
 
                 ctx.UnmapBuffer(_cullingUniformBuffer, MapType.Write);
@@ -535,18 +505,30 @@ public class ClusterRenderPass : RenderPass, IDisposable
                 // Dispatch
                 uint groupSize = 64;
                 // Check DispatchComputeAttribs syntax
-                ctx.DispatchCompute(new DispatchComputeAttribs {
-                    ThreadGroupCountX =
-                        (page.ClusterCount + groupSize - 1) / groupSize
-                });
+                if (_transformSystem.Count > 0)
+                {
+                    ctx.DispatchCompute(new DispatchComputeAttribs {
+                        ThreadGroupCountX = (page.ClusterCount + groupSize - 1) / groupSize,
+                        ThreadGroupCountY = (uint)_transformSystem.Count,
+                        ThreadGroupCountZ = 1
+                    });
+                    totalDispatches++;
+                }
 
-                totalDispatches++;
                 if (totalDispatches >= _maxDraws)
                     break;
             }
             if (totalDispatches >= _maxDraws)
                 break;
         }
+        // Transition IndirectArgs to IndirectArgument state
+        ctx.TransitionResourceStates( [new StateTransitionDesc{
+            Resource = _indirectArgsBuffer,
+            OldState = ResourceState.Unknown,
+            NewState = ResourceState.IndirectArgument,
+            Flags = StateTransitionFlags.UpdateState
+        }]);
+        // ctx.TransitionResourceStates(1, [new StateTransitionDesc(_indirectArgsBuffer, ResourceState.Unknown, ResourceState.IndirectArgument, StateTransitionFlags.UpdateState)]);
 
         // 2. Draw
 
@@ -590,53 +572,32 @@ public class ClusterRenderPass : RenderPass, IDisposable
 
         ctx.SetPipelineState(currentDrawPSO);
 
-        // Bind Draw Uniforms
-        currentDrawSRB.GetVariableByName(ShaderType.Vertex, "DrawUniforms")
-            ?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
-        currentDrawSRB.GetVariableByName(ShaderType.Pixel, "DrawUniforms")
-            ?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
-
-        // Bind PageHeap to VS (Corrected name from PageBuffer)
-        currentDrawSRB.GetVariableByName(ShaderType.Vertex, "PageHeap")
-            ?.Set(
-                pageHeap.GetDefaultView(BufferViewType.ShaderResource),
-                SetShaderResourceFlags.None
-            );
+        // Bind PageHeap to VS
+        currentDrawSRB.GetVariable(_context, _drawAsset, ShaderType.Vertex, "PageHeap")
+            ?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
 
         // Bind Instances
-        if (_transformSystem != null &&
-            _transformSystem.GlobalTransformBuffer != null)
+        if (_transformSystem != null && _transformSystem.GlobalTransformBuffer != null)
         {
-            currentDrawSRB.GetVariableByName(ShaderType.Vertex, "Instances")
-                ?.Set(
-                    _transformSystem.GlobalTransformBuffer.GetDefaultView(
-                        BufferViewType.ShaderResource
-                    ),
-                    SetShaderResourceFlags.None
-                );
+            currentDrawSRB.GetVariable(_context, _drawAsset, ShaderType.Vertex, "Instances")
+                ?.Set(_transformSystem.GlobalTransformBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
         }
 
         // Bind RequestBuffer to VS
-        currentDrawSRB.GetVariableByName(ShaderType.Vertex, "RequestBuffer")
-            ?.Set(
-                _drawCountBuffer.GetDefaultView(BufferViewType.ShaderResource),
-                SetShaderResourceFlags.None
-            );
-        // Bind PageTable to VS (Missing in previous code)
-        currentDrawSRB.GetVariableByName(ShaderType.Vertex, "PageTable")
-            ?.Set(
-                pageTable.GetDefaultView(BufferViewType.ShaderResource),
-                SetShaderResourceFlags.None
-            );
+        currentDrawSRB.GetVariable(_context, _drawAsset, ShaderType.Vertex, "RequestBuffer")
+            ?.Set(_drawCountBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+
+        // Bind PageTable to VS
+        currentDrawSRB.GetVariable(_context, _drawAsset, ShaderType.Vertex, "PageTable")
+            ?.Set(pageTable.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
 
         ctx.CommitShaderResources(currentDrawSRB, ResourceStateTransitionMode.Transition);
 
         // Execute Indirect (Single Draw)
         DrawIndirectAttribs drawAttrs = new DrawIndirectAttribs {
-            Flags = DrawFlags.None,
+            Flags = DrawFlags.VerifyAll,
             AttribsBuffer = _indirectArgsBuffer,
-            DrawArgsOffset = 0,
-            DrawCount = 1 // One "Instanced" Draw executing all clusters
+            DrawArgsOffset = 0
         };
         ctx.DrawIndirect(drawAttrs);
 
@@ -648,10 +609,10 @@ public class ClusterRenderPass : RenderPass, IDisposable
             copyMap[0] = new CopyUniforms { SphereVertexCount = 1536 }; // 16x16x2x3 = 1536 for Lat-Long Sphere
             ctx.UnmapBuffer(_copyUniformBuffer, MapType.Write);
 
-            _debugCopySRB.GetVariableByName(ShaderType.Compute, "IndirectArgs")
-                ?.Set(_indirectArgsBuffer.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-             _debugCopySRB.GetVariableByName(ShaderType.Compute, "DebugArgs")
-                ?.Set(_debugIndirectArgsBuffer.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+            _debugCopySRB.GetVariable(_context, _copyAsset, ShaderType.Compute, "IndirectArgs")
+                ?.Set(_indirectArgsBuffer?.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+             _debugCopySRB.GetVariable(_context, _copyAsset, ShaderType.Compute, "DebugArgs")
+                ?.Set(_debugIndirectArgsBuffer?.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
             
             ctx.SetPipelineState(_debugCopyPSO);
             ctx.CommitShaderResources(_debugCopySRB, ResourceStateTransitionMode.Transition);
@@ -660,13 +621,13 @@ public class ClusterRenderPass : RenderPass, IDisposable
             // 2. Draw Spheres
             ctx.SetPipelineState(_debugSpherePSO);
             
-            _debugSphereSRB.GetVariableByName(ShaderType.Vertex, "DrawUniforms")
+            _debugSphereSRB.GetVariable(_context, _debugSphereAsset, ShaderType.Vertex, "DrawUniforms")
                 ?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
-            _debugSphereSRB.GetVariableByName(ShaderType.Vertex, "PageHeap")
+            _debugSphereSRB.GetVariable(_context, _debugSphereAsset, ShaderType.Vertex, "PageHeap")
                 ?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-            _debugSphereSRB.GetVariableByName(ShaderType.Vertex, "PageTable")
+            _debugSphereSRB.GetVariable(_context, _debugSphereAsset, ShaderType.Vertex, "PageTable")
                 ?.Set(pageTable.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-            _debugSphereSRB.GetVariableByName(ShaderType.Vertex, "RequestBuffer")
+            _debugSphereSRB.GetVariable(_context, _debugSphereAsset, ShaderType.Vertex, "RequestBuffer")
                 ?.Set(_drawCountBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
             
             ctx.CommitShaderResources(_debugSphereSRB, ResourceStateTransitionMode.Transition);
@@ -674,6 +635,7 @@ public class ClusterRenderPass : RenderPass, IDisposable
             DrawIndirectAttribs debugDrawAttrs = new DrawIndirectAttribs {
                 Flags = DrawFlags.None,
                 AttribsBuffer = _debugIndirectArgsBuffer,
+                AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Transition,
                 DrawArgsOffset = 0,
                 DrawCount = 1
             };
