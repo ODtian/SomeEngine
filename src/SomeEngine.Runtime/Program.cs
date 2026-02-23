@@ -263,6 +263,12 @@ class Program
                         bool debugSpheres = clusterPass.DebugSpheresEnabled;
                         if (ImGui.Checkbox("Debug Spheres", ref debugSpheres)) clusterPass.DebugSpheresEnabled = debugSpheres;
                         
+                        bool visualizeBVH = clusterPass.VisualiseBVH;
+                        if (ImGui.Checkbox("Visualize BVH", ref visualizeBVH)) clusterPass.VisualiseBVH = visualizeBVH;
+                        
+                        int bvhDepth = clusterPass.DebugBVHDepth;
+                        if (ImGui.SliderInt("BVH Depth (-1=All)", ref bvhDepth, -1, 16)) clusterPass.DebugBVHDepth = bvhDepth;
+
                         bool clusterId = clusterPass.DebugClusterID;
                         if (ImGui.Checkbox("Debug Cluster ID", ref clusterId)) clusterPass.DebugClusterID = clusterId;
 

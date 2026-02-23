@@ -135,8 +135,13 @@ public class SimpleMeshRenderPass : RenderPass, IDisposable
                 PipelineType = PipelineType.Graphics,
                 ResourceLayout = new PipelineResourceLayoutDesc
                 {
-                    DefaultVariableType = Diligent.ShaderResourceVariableType.Static,
-                    Variables = shaderAsset.GetResourceVariables(_context)
+                    DefaultVariableType = Diligent.ShaderResourceVariableType.Mutable,
+                    Variables = shaderAsset.GetResourceVariables(_context, (name, cat) => 
+                    {
+                        if (name.Contains("Uniforms") || name == "Uniforms" || name == "Constants" || name == "g_Constants" || cat == ShaderResourceCategory.ConstantBuffer)
+                            return Diligent.ShaderResourceVariableType.Static;
+                        return null;
+                    })
                 }
             },
             GraphicsPipeline = new GraphicsPipelineDesc
@@ -158,7 +163,7 @@ public class SimpleMeshRenderPass : RenderPass, IDisposable
         if (_pso == null)
             throw new Exception("Failed to create SimpleMesh PSO");
 
-        _pso!.GetStaticVariable(_context, shaderAsset, ShaderType.Vertex, "Constants")?.Set(_cb!, SetShaderResourceFlags.None);
+        _pso!.GetStaticVariable(_context, shaderAsset, ShaderType.Vertex, "g_Constants")?.Set(_cb!, SetShaderResourceFlags.None);
         _srb = _pso!.CreateShaderResourceBinding(true);
     }
 

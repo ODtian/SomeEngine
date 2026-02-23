@@ -5,6 +5,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Buffers;
+using System.Linq;
 using SharpGLTF.Schema2;
 using MeshOptimizer;
 using SomeEngine.Assets.Schema;
@@ -84,6 +85,8 @@ public static class ClusterBuilder
         public float Radius;
         public Vector3 LodCenter;
         public float LodRadius;
+        public Vector3 SelfLodCenter;
+        public float SelfLodRadius;
         public int VertexCount;
     }
 
@@ -104,6 +107,148 @@ public static class ClusterBuilder
         public uint AttributesOffset;
         public uint IndicesOffset;
         public long FileOffset;
+    }
+
+    private struct ClusterInfo
+    {
+        public Vector3 BoundMin;
+        public Vector3 BoundMax;
+        public Vector4 LODSphere; // xyz: center, w: radius
+        public float LODError;
+        public uint PageIndex;
+        public uint ClusterStart;
+        public int ParentGroupId;
+    }
+
+    // Morton Code Helpers
+    private static uint ExpandBits(uint v)
+    {
+        v = (v * 0x00010001u) & 0xFF0000FFu;
+        v = (v * 0x00000101u) & 0x0F00F00Fu;
+        v = (v * 0x00000011u) & 0xC30C30C3u;
+        v = (v * 0x00000005u) & 0x49249249u;
+        return v;
+    }
+
+    private static uint Morton3D(Vector3 p)
+    {
+        p.X = Math.Min(Math.Max(p.X * 1024.0f, 0.0f), 1023.0f);
+        p.Y = Math.Min(Math.Max(p.Y * 1024.0f, 0.0f), 1023.0f);
+        p.Z = Math.Min(Math.Max(p.Z * 1024.0f, 0.0f), 1023.0f);
+        return ExpandBits((uint)p.X) * 4 + ExpandBits((uint)p.Y) * 2 + ExpandBits((uint)p.Z);
+    }
+
+    private static List<ClusterBVHNode> BuildBVH(List<ClusterInfo> clusters)
+    {
+        var nodes = new List<ClusterBVHNode>();
+        if (clusters.Count == 0) return nodes;
+
+        // Clusters are already sorted by Morton Code in ProcessRaw
+
+        // 1. Create Leaf Nodes
+        var currentLevelIndices = new List<int>();
+        int leafSize = 16;
+        int i = 0;
+
+        while (i < clusters.Count)
+        {
+            // Group clusters by ParentGroupId and PageIndex
+            uint currentPage = clusters[i].PageIndex;
+            int currentParent = clusters[i].ParentGroupId;
+            
+            int count = 0;
+            while (i + count < clusters.Count && 
+                   clusters[i + count].PageIndex == currentPage && 
+                   clusters[i + count].ParentGroupId == currentParent &&
+                   count < 128) // Reasonable leaf size, but still grouping same parent
+            {
+                count++;
+            }
+
+            var node = new ClusterBVHNode();
+            Vector3 bMin = new Vector3(float.MaxValue);
+            Vector3 bMax = new Vector3(float.MinValue);
+
+            for (int k = 0; k < count; ++k)
+            {
+                var c = clusters[i + k];
+                bMin = Vector3.Min(bMin, c.BoundMin);
+                bMax = Vector3.Max(bMax, c.BoundMax);
+            }
+
+            node.BoundMin = new Vector4(bMin, 0);
+            node.BoundMax = new Vector4(bMax, 0);
+            
+            // Leaf node represents the parent state for LOD cutting
+            // It MUST contain the LOD information of the shared parent of this cluster group
+            node.LODSphere = clusters[i].LODSphere;
+            node.LODError = clusters[i].LODError;
+            
+            // Leaf Node Pointer: PageIndex (High 20) | ClusterStart (Low 12)
+            // Assumes max 4096 clusters per page.
+            uint pageIndex = clusters[i].PageIndex;
+            uint clusterStart = clusters[i].ClusterStart;
+            node.ChildPointer = (pageIndex << 12) | (clusterStart & 0xFFF);
+            node.ChildCount = (uint)count;
+            node.NodeType = 1;
+
+            nodes.Add(node);
+            currentLevelIndices.Add(nodes.Count - 1);
+
+            i += count;
+        }
+
+        // 2. Build Internal Levels
+        while (currentLevelIndices.Count > 1) // Loop until we have a single root
+        {
+            var nextLevelIndices = new List<int>();
+            for (int j = 0; j < currentLevelIndices.Count; j += 16)
+            {
+                int count = Math.Min(16, currentLevelIndices.Count - j);
+                var node = new ClusterBVHNode();
+                
+                // Internal Node Pointer: Index in BVH Buffer
+                node.ChildPointer = (uint)currentLevelIndices[j];
+                node.ChildCount = (uint)count;
+                node.NodeType = 0;
+
+                Vector3 bMin = new Vector3(float.MaxValue);
+                Vector3 bMax = new Vector3(float.MinValue);
+                float maxError = 0;
+                Vector3 centerSum = Vector3.Zero;
+
+                for (int k = 0; k < count; ++k)
+                {
+                    var child = nodes[currentLevelIndices[j + k]];
+                    var childMin = new Vector3(child.BoundMin.X, child.BoundMin.Y, child.BoundMin.Z);
+                    var childMax = new Vector3(child.BoundMax.X, child.BoundMax.Y, child.BoundMax.Z);
+                    bMin = Vector3.Min(bMin, childMin);
+                    bMax = Vector3.Max(bMax, childMax);
+                    maxError = Math.Max(maxError, child.LODError);
+                    centerSum += new Vector3(child.LODSphere.X, child.LODSphere.Y, child.LODSphere.Z);
+                }
+
+                Vector3 center = centerSum / count;
+                float maxRadius = 0;
+                for (int k = 0; k < count; ++k)
+                {
+                    var child = nodes[currentLevelIndices[j + k]];
+                    float d = Vector3.Distance(center, new Vector3(child.LODSphere.X, child.LODSphere.Y, child.LODSphere.Z)) + child.LODSphere.W;
+                    maxRadius = Math.Max(maxRadius, d);
+                }
+
+                node.BoundMin = new Vector4(bMin, 0);
+                node.BoundMax = new Vector4(bMax, 0);
+                node.LODSphere = new Vector4(center.X, center.Y, center.Z, maxRadius);
+                node.LODError = maxError;
+
+                nodes.Add(node);
+                nextLevelIndices.Add(nodes.Count - 1);
+            }
+            currentLevelIndices = nextLevelIndices;
+        }
+
+        return nodes;
     }
 
     public static MeshAsset Process(string filePath)
@@ -230,6 +375,8 @@ public static class ClusterBuilder
                 c.Radius = b.Radius;
                 c.LodCenter = b.Center;
                 c.LodRadius = b.Radius;
+                c.SelfLodCenter = b.Center;
+                c.SelfLodRadius = b.Radius;
                 c.Error = 0;
                 c.Level = 0;
                 c.GroupId = nextGroupId++;
@@ -345,13 +492,20 @@ public static class ClusterBuilder
                     for (int k = newClustersStart; k < newClustersEnd; k++)
                     {
                         var sc = clusters[k];
+                        
+                        // Compute tight geometry bounds for the new parent cluster
+                        var cInds = CollectionsMarshal.AsSpan(globalIndices).Slice(sc.IndicesOffset, sc.IndicesCount);
+                        var b = BoundsCompute(positions, cInds, 0);
+                        
                         sc.Level = depth + 1;
-                        sc.Center = groupBounds.Center;
-                        sc.Radius = groupBounds.Radius;
+                        sc.Center = b.Center;
+                        sc.Radius = b.Radius;
                         sc.Error = groupError;
                         sc.GroupId = thisGroupId;
                         sc.LodCenter = groupBounds.Center;
                         sc.LodRadius = groupBounds.Radius;
+                        sc.SelfLodCenter = groupBounds.Center;
+                        sc.SelfLodRadius = groupBounds.Radius;
                         clusters[k] = sc;
                         nextPending.Add(k);
                     }
@@ -481,15 +635,37 @@ public static class ClusterBuilder
                 globalIndices
             );
 
-            // Sort clusters
-            allMeshlets.Sort((a, b) => {
-                int c = a.Level.CompareTo(b.Level);
-                if (c != 0) return c;
-                return a.ParentGroupId.CompareTo(b.ParentGroupId);
+            // Compute Bounds for Morton Code
+            Vector3 sceneMin = new Vector3(float.MaxValue);
+            Vector3 sceneMax = new Vector3(float.MinValue);
+            for (int i = 0; i < pPos.Length; ++i)
+            {
+                sceneMin = Vector3.Min(sceneMin, pPos[i]);
+                sceneMax = Vector3.Max(sceneMax, pPos[i]);
+            }
+            Vector3 sceneExtent = sceneMax - sceneMin;
+            sceneExtent = Vector3.Max(sceneExtent, new Vector3(1e-6f));
+
+            // Sort clusters by PageIndex, then ParentGroupId, then Morton Code
+            // This ensures consistent grouping in the BVH leaf nodes
+            allMeshlets.Sort((a, b) =>
+            {
+                // Note: We don't have PageIndex here yet, but clusters are already 
+                // in the order they will be assigned to pages if we don't sort here.
+                // Actually, the page generation loop uses the order of allMeshlets.
+                // So we should sort by ParentGroupId first to group them for BVH.
+                
+                if (a.ParentGroupId != b.ParentGroupId) 
+                    return a.ParentGroupId.CompareTo(b.ParentGroupId);
+
+                uint codeA = Morton3D((a.LodCenter - sceneMin) / sceneExtent);
+                uint codeB = Morton3D((b.LodCenter - sceneMin) / sceneExtent);
+                return codeA.CompareTo(codeB);
             });
 
             // 2. Page Generation & Quantization
             var pagesDataList = new List<MeshPageInfo>();
+            var clusterInfos = new List<ClusterInfo>();
 
             var currentClusters = new List<GPUCluster>();
             var currentPositions = new List<ushort>();
@@ -615,8 +791,15 @@ public static class ClusterBuilder
                 if (radius < 1e-6f)
                     radius = 1.0f;
 
+                Vector3 cMin = new Vector3(float.MaxValue);
+                Vector3 cMax = new Vector3(float.MinValue);
+
                 foreach (var globalIdx in mIndices)
                 {
+                    Vector3 p_bound = pPos[(int)globalIdx];
+                    cMin = Vector3.Min(cMin, p_bound);
+                    cMax = Vector3.Max(cMax, p_bound);
+
                     if (!usedMap.TryGetValue(globalIdx, out ushort localIdx))
                     {
                         localIdx = (ushort)vCount;
@@ -671,22 +854,36 @@ public static class ClusterBuilder
                 currentClusters.Add(new GPUCluster {
                     Center = m.Center,
                     Radius = m.Radius,
-                    LodCenter = m.LodCenter,
-                    LodRadius = m.LodRadius,
+                    LODCenter = m.SelfLodCenter,
+                    LODRadius = m.SelfLodRadius,
                     LODError = m.Error,
-                    ParentLODError = m.ParentError,
                     VertexStart = vStart,
                     TriangleStart = tStart,
                     GroupId = m.GroupId,
-                    ParentGroupId = m.ParentGroupId,
                     VertexCount = (byte)vCount,
                     TriangleCount = (byte)(localIndices.Count / 3),
                     LODLevel = (byte)m.Level,
                     _Pad1 = 0
                 });
+
+                clusterInfos.Add(new ClusterInfo {
+                    BoundMin = cMin,
+                    BoundMax = cMax,
+                    LODSphere = new Vector4(m.LodCenter.X, m.LodCenter.Y, m.LodCenter.Z, m.LodRadius),
+                    LODError = m.ParentError,
+                    PageIndex = (uint)pagesDataList.Count,
+                    ClusterStart = (uint)(currentClusters.Count - 1),
+                    ParentGroupId = m.ParentGroupId
+                });
             }
 
             FlushPage();
+
+            var bvhNodes = BuildBVH(clusterInfos);
+            long bvhOffset = fs.Position;
+            var bvhSpan = CollectionsMarshal.AsSpan(bvhNodes);
+            var bvhBytes = MemoryMarshal.Cast<ClusterBVHNode, byte>(bvhSpan);
+            fs.Write(bvhBytes);
 
             var schemaAttrs =
                 new SomeEngine.Assets.Schema.VertexAttribute[descriptors.Count];
@@ -707,7 +904,8 @@ public static class ClusterBuilder
                         new SomeEngine.Assets.Schema.Vec3() { X = 0, Y = 0, Z = 0 },
                     Radius = 0 },
                 Payload = new byte[fs.Length],
-                Attributes = schemaAttrs
+                Attributes = schemaAttrs,
+                BvhOffset = (ulong)bvhOffset
             };
 
             fs.Seek(0, SeekOrigin.Begin);
@@ -1245,10 +1443,10 @@ public static class ClusterBuilder
             for (int i = 0; i < group.Length; i++)
             {
                 var c = clusters[group[i]];
-                centers[i * 3 + 0] = c.LodCenter.X;
-                centers[i * 3 + 1] = c.LodCenter.Y;
-                centers[i * 3 + 2] = c.LodCenter.Z;
-                radii[i] = c.LodRadius;
+                centers[i * 3 + 0] = c.SelfLodCenter.X;
+                centers[i * 3 + 1] = c.SelfLodCenter.Y;
+                centers[i * 3 + 2] = c.SelfLodCenter.Z;
+                radii[i] = c.SelfLodRadius;
                 maxError = Math.Max(maxError, c.Error);
             }
 

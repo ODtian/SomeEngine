@@ -80,8 +80,7 @@ public static class SlangShaderImporter
             string,
             Dictionary<
                 (string Name, uint Set, uint Binding),
-                (ShaderResourceVariableType Type,
-                 HashSet<ShaderStage> Stages,
+                (HashSet<ShaderStage> Stages,
                  ShaderResourceCategory Category)>>();
         for (int t = 0; t < targets.Length; t++)
         {
@@ -89,8 +88,7 @@ public static class SlangShaderImporter
                 targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv";
             backendResourceMaps[backendName] = new Dictionary<
                 (string Name, uint Set, uint Binding),
-                (ShaderResourceVariableType Type,
-                 HashSet<ShaderStage> Stages,
+                (HashSet<ShaderStage> Stages,
                  ShaderResourceCategory Category)>();
         }
 
@@ -209,8 +207,7 @@ public static class SlangShaderImporter
     private static void FinalizeReflection(
         Dictionary<
             (string Name, uint Set, uint Binding),
-            (ShaderResourceVariableType Type,
-             HashSet<ShaderStage> Stages,
+            (HashSet<ShaderStage> Stages,
              ShaderResourceCategory Category)> resourceMap,
         ShaderReflectionData dest
     )
@@ -228,7 +225,6 @@ public static class SlangShaderImporter
                 Name = kvp.Key.Name,
                 Set = kvp.Key.Set,
                 Binding = kvp.Key.Binding,
-                Type = kvp.Value.Type,
                 Category = kvp.Value.Category,
                 Stages = stageMask
             });
@@ -240,8 +236,7 @@ public static class SlangShaderImporter
         ShaderStage stage,
         Dictionary<
             (string Name, uint Set, uint Binding),
-            (ShaderResourceVariableType Type,
-             HashSet<ShaderStage> Stages,
+            (HashSet<ShaderStage> Stages,
              ShaderResourceCategory Category)> resources
     )
     {
@@ -271,13 +266,9 @@ public static class SlangShaderImporter
         if (!resources.TryGetValue((name, set, binding), out var entry))
         {
             var mappedCategory = MapCategory(varLayout);
-            var varType = mappedCategory == ShaderResourceCategory.ConstantBuffer
-                              ? ShaderResourceVariableType.Static
-                              : ShaderResourceVariableType.Mutable;
 
             entry =
-                (varType,
-                 new HashSet<ShaderStage>(),
+                (new HashSet<ShaderStage>(),
                  mappedCategory);
             resources[(name, set, binding)] = entry;
         }
@@ -288,17 +279,45 @@ public static class SlangShaderImporter
         VariableLayoutReflection varLayout
     )
     {
-        return varLayout.Category switch {
-            SlangParameterCategory.ConstantBuffer =>
-                ShaderResourceCategory.ConstantBuffer,
-            SlangParameterCategory.ShaderResource =>
-                ShaderResourceCategory.ShaderResource,
-            SlangParameterCategory.UnorderedAccess =>
-                ShaderResourceCategory.UnorderedAccess,
-            SlangParameterCategory.SamplerState =>
-                ShaderResourceCategory.SamplerState,
-            _ => ShaderResourceCategory.Unknown
-        };
+        var category = varLayout.Category;
+        var typeLayout = varLayout.TypeLayout;
+        var typeReflection = typeLayout.Type;
+        var shape = typeReflection.ResourceShape;
+        var baseShape = shape & SlangResourceShape.BaseShapeMask;
+
+        if (category == SlangParameterCategory.ConstantBuffer)
+            return ShaderResourceCategory.ConstantBuffer;
+
+        if (category == SlangParameterCategory.SamplerState)
+            return ShaderResourceCategory.Sampler;
+
+        if (category == SlangParameterCategory.ShaderResource)
+        {
+            if (baseShape == SlangResourceShape.AccelerationStructure)
+                return ShaderResourceCategory.AccelStruct;
+
+            if (baseShape == SlangResourceShape.StructuredBuffer ||
+                baseShape == SlangResourceShape.ByteAddressBuffer ||
+                baseShape == SlangResourceShape.TextureBuffer)
+                return ShaderResourceCategory.BufferSRV;
+
+            if (baseShape == SlangResourceShape.TextureSubpass)
+                return ShaderResourceCategory.InputAttachment;
+
+            return ShaderResourceCategory.TextureSRV;
+        }
+
+        if (category == SlangParameterCategory.UnorderedAccess)
+        {
+            if (baseShape == SlangResourceShape.StructuredBuffer ||
+                baseShape == SlangResourceShape.ByteAddressBuffer ||
+                baseShape == SlangResourceShape.TextureBuffer)
+                return ShaderResourceCategory.BufferUAV;
+
+            return ShaderResourceCategory.TextureUAV;
+        }
+
+        return ShaderResourceCategory.Unknown;
     }
 
     private static uint GetDiligentStageFlags(ShaderStage stage)

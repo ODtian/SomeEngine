@@ -22,37 +22,33 @@ public static class ClusterSelection
         float lodThreshold,
         List<int> selectedIndices)
     {
+        // Linear selection is no longer fully supported because Parent Error 
+        // is now stored in the BVH nodes, not in the cluster itself.
+        // To do a full selection, use the BVH traversal.
+        
         for (int i = 0; i < clusters.Length; i++)
         {
-            if (IsClusterSelected(in clusters[i], cameraPos, lodThreshold))
-            {
-                selectedIndices.Add(i);
-            }
+            selectedIndices.Add(i);
         }
     }
 
     /// <summary>
     /// Determines if a single cluster should be selected.
-    /// Based on dual-sphere logic to ensure LOD continuity:
-    /// SelfError evaluated with cluster.Center/Radius (Group sphere of children)
-    /// ParentError evaluated with cluster.LodCenter/Radius (Group sphere of parent)
+    /// Note: This is now only half the check (Self Error).
+    /// The other half (Parent Error) must be checked via the BVH node.
     /// </summary>
-    public static bool IsClusterSelected(ref readonly GPUCluster cluster, Vector3 cameraPos, float lodThreshold)
+    public static bool IsClusterSelected(ref readonly GPUCluster cluster, Vector3 cameraPos, float lodThreshold, Vector4 parentSphere, float parentError)
     {
-        // 1. Check Self Error
-        float d_self = Math.Max(0.001f, Vector3.Distance(cameraPos, cluster.Center) - cluster.Radius);
-        bool selfGood = (cluster.LODError / d_self) <= lodThreshold;
-        
-        if (!selfGood) 
-            return false; // This cluster is too coarse. (Should draw children)
+        // 1. Check Parent Error (Skip if parent is already good enough)
+        float d_parent = Math.Max(0.001f, Vector3.Distance(cameraPos, new Vector3(parentSphere.X, parentSphere.Y, parentSphere.Z)) - parentSphere.W);
+        if ((parentError / d_parent) <= lodThreshold)
+            return false;
 
-        // 2. Check Parent Error
-        if (cluster.ParentLODError >= float.MaxValue)
-            return true;
-
-        float d_parent = Math.Max(0.001f, Vector3.Distance(cameraPos, cluster.LodCenter) - cluster.LodRadius);
-        bool parentBad = (cluster.ParentLODError / d_parent) > lodThreshold;
+        // 2. Check Self Error (Skip if I am not good enough, need children)
+        // Note: For Self Error evaluation, we use the SAME sphere as the parent 
+        // check to maintain hierarchy consistency.
+        bool selfGood = (cluster.LODError / d_parent) <= lodThreshold;
         
-        return parentBad;
+        return selfGood;
     }
 }

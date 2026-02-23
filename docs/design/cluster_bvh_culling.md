@@ -54,10 +54,10 @@ struct ClusterBVHNode
 1.  **Global BVH Buffer**: `StructuredBuffer<ClusterBVHNode>` (Persistent)
     *   存储场景中所有静态物体的 Cluster BVH 节点。
     *   动态物体可能需要单独的结构或每帧重建/更新（暂时聚焦静态）。
-2.  **Page Offset Table**: `Buffer<uint>` (Dynamic)
-    *   映射 `PageIndex` -> `ByteOffset`。
-    *   由于 Cluster Page 是流式加载的，其在 `ByteAddressBuffer` 中的位置每一帧可能不同。
-    *   叶子节点解包出 `PageIndex` 后，查此表获取 Page 的实际 GPU 地址。
+2.  **Page Buffer**: `ByteAddressBuffer` (Bindless Heap)
+    *   存储所有 Cluster Pages。
+    *   每个 Page 大小固定（例如 128KB），因此 `ByteOffset` = `GlobalPageID` * `PageSize`。
+    *   **无需**额外的 `PageOffsetTable`。
 3.  **Work Queues**: `RWStructuredBuffer<uint>` (Ping-Pong)
     *   用于存储待处理的节点索引。
     *   `Queue_Current`: 当前层级待处理节点。
@@ -101,33 +101,9 @@ struct ClusterBVHNode
         *   **LOD Culling**:
             *   计算 `Dist = distance(Camera, Node.LODSphere.Center) - Node.LODSphere.Radius`.
             *   如果是 Leaf Node:
-                *   这里存储的是 `ParentError`。检查 `ParentError / Dist > Threshold` ?
                 *   如果满足 (Parent 误差够大，需要细分)，则说明该 Leaf 下的 Clusters **可能** 需要被渲染（进入 Cluster 级判断）。
-                *   如果 `ParentError / Dist <= Threshold`，说明 Parent 已经足够精细，不需要展开到这一层？(注意 Cluster LOD 通常是切图逻辑：找误差满足要求的**最粗**层级)。
-                *   **Cluster LOD 逻辑修正**: 
-                    *   通常我们寻找 `Error <= Threshold` 且 `ParentError > Threshold` 的节点。
-                    *   BVH 遍历用于快速找到这些节点。
-                    *   如果 Node 的 `LODError / Dist <= Threshold`: 该节点足够精细，可以渲染（如果是 Cluster/Leaf），或者不需要继续细分（如果是 Internal，代表其下的所有 Cluster 都太精细了？不，通常是 Error 越往下越小）。
-                    *   **Nanite/Cluster 逻辑**: 总是尝试渲染满足误差的**最大** Cluster。
-                    *   遍历时：如果当前节点 `Error / Dist > Threshold`，说明当前节点误差太大，不能渲染，必须**分裂**（访问子节点）。
-                    *   如果 `Error / Dist <= Threshold`，说明当前节点误差达标，**可以渲染**。
-                        *   如果是 Leaf，将其加入渲染列表。
-                        *   如果是 Internal，这代表该 Internal 节点覆盖的区域整体误差达标？这在 Cluster 渲染中比较少见，通常精确到 Cluster 粒度。但如果 Internal Node 代表一个聚合体（Imposter），可以渲染 Imposter。如果仅仅是加速结构，则必须遍历到 Leaf。
-                        *   **假设**: 纯加速结构，必须遍历到 Leaf。
-                        *   **修正**: 遍历仅做视锥剔除。LOD 检查用于判断是否需要**展开**。
-                        *   但在 Cluster 渲染中，LOD 决定了我们是否渲染该 Cluster。
-                        *   **Leaf Node Check**:
-                            *   Leaf 存储了 `ParentError`。
-                            *   如果 `ParentError / Dist <= Threshold`: 说明 Parent 就已经足够好，不需要切分到这个 Leaf Group。剔除（Implicitly culled by parent selection, but here we traverse top-down）。
-                            *   Wait, standard top-down: start root. If root error ok, draw root. Else children.
-                            *   But here we have a BVH over a list of Clusters (which are the finest or intermediate levels?).
-                            *   User says: "Leaf node stores parent lod bound and parent error (so cluster culling doesn't need these)".
-                            *   这意味着 Leaf Node 代表了一组 Clusters，这组 Clusters 的 Parent 是同一个。
-                            *   如果 `ParentError / Dist <= Threshold`，说明 Parent 这一层级就够了，不需要这一组 Clusters。所以剔除该 Leaf（不处理其包含的 Clusters）。
-                            *   如果 `ParentError / Dist > Threshold`，说明 Parent 误差太大，必须使用这一组 Clusters（或更细的）。
-                            *   进入 Leaf 内部，对每个 Cluster：
-                                *   检查 `Cluster.Error / Dist <= Threshold`。如果满足，则渲染该 Cluster。
-                                *   如果 `Cluster.Error` 还不满足？说明需要更细的？但如果这是最细级，只能渲染它。
+                *   如果 `ParentError / Dist <= Threshold`，说明 Parent 已经足够精细，不需要展开到这一层
+        
     4.  **分类处理**:
         *   **Internal Node**:
             *   如果通过剔除（Frustum 可见 && LOD 需要细分），将所有子节点索引写入 `Queue_Next`。
@@ -149,49 +125,14 @@ struct ClusterBVHNode
 
 ## 5. 关键实现细节 (Implementation Details)
 
-### 5.1 动态 Page Offset 计算 (Dynamic Page Offset Resolution)
-
-由于 Cluster 数据是以 Page 为单位流式加载的，每个 Page 在 GPU 的 `GlobalPageBuffer` (巨大的 ByteAddressBuffer) 中的物理地址在每一帧都可能变化（例如加载新 Page，卸载旧 Page）。因此，BVH 的叶子节点不能存储绝对的显存地址，而必须存储逻辑上的 `PageIndex`。
-
-#### 1. Page Table (页表)
-系统维护一个全局的页表 `StructuredBuffer<uint> PageOffsetTable`，索引为 `PageIndex`，值为该 Page 在 `GlobalPageBuffer` 中的字节偏移量 (`ByteOffset`)。
-*   **大小**: `MaxPages * 4 bytes`。
-*   **更新**: CPU 在每帧流式加载/卸载 Page 后，更新此 Buffer。
-*   **无效值**: 若 Page 未加载，值为 `0xFFFFFFFF`。
-
-#### 2. 叶子节点编码
-叶子节点的 `ChildPointer` 字段是一个 32 位整数，压缩存储了 `PageIndex` 和 `ClusterStart` (该 Node 包含的第一个 Cluster 在 Page 内的索引)。
-*   **格式**: `[ PageIndex (20 bits) | ClusterStart (12 bits) ]`
-    *   **20 bits**: 支持最多 $2^{20} \approx 100$ 万个 Pages。
-    *   **12 bits**: 每个 Page 最多支持 $2^{12} = 4096$ 个 Clusters (通常一个 128KB Page 仅包含数百个 Cluster，远小于 4096)。
-
-#### 3. Shader 中的计算流程
-当 Compute Shader 遍历到叶子节点并判定需要绘制时：
-```hlsl
-// 1. 解包逻辑索引
-uint packedPtr = node.ChildPointer;
-uint pageIndex = packedPtr >> 12;      // 高 20 位
-uint clusterStart = packedPtr & 0xFFF; // 低 12 位
-
-// 2. 查表获取物理偏移
-uint pageByteOffset = PageOffsetTable[pageIndex];
-
-// 3. 驻留性检查 (可选，若保证 BVH 只包含已加载 Page 可跳过)
-if (pageByteOffset == 0xFFFFFFFF) return; 
-
-// 4. 计算 Cluster 的实际 GPU 地址
-// Cluster 数据紧跟在 PageHeader 之后
-// Address = PageOffset + SizeOf(PageHeader) + ClusterStart * SizeOf(GPUCluster)
-// 注意：ClusterStart 是索引，需要乘以 Cluster 结构体大小
-uint clusterByteOffset = pageByteOffset + PAGE_HEADER_SIZE + clusterStart * GPU_CLUSTER_STRIDE;
-
-// 5. 读取 Cluster 数据
-GPUCluster cluster = LoadCluster(GlobalPageBuffer, clusterByteOffset);
-```
-
-#### 4. 优势
-*   **Zero-Copy**: 磁盘上的 BVH 数据无需修改即可直接上传（PageIndex 是静态的）。
-*   **灵活性**: 允许内存碎片整理或 Page 移动，只需更新 PageOffsetTable。
+### 5.1 动态 Page Offset 计算
+*   叶子节点中 `ChildPointer` 存储的是逻辑索引。
+*   `uint packed = node.ChildPointer;`
+*   `uint localPageIndex = packed >> 12;`
+*   `uint clusterStart = packed & 0xFFF;`
+*   `uint globalPageID = InstanceData[instanceID].BasePageID + localPageIndex;`
+*   `uint pageByteOffset = globalPageID * PAGE_SIZE; // Fixed size pages (e.g. 128KB)`
+*   `uint clusterByteOffset = pageByteOffset + PageHeaderSize + clusterStart * ClusterStride;`
 
 ### 5.2 队列管理
 *   使用 `InterlockedAdd` 在 GPU 上分配队列槽位。

@@ -57,11 +57,13 @@ public class DagView : Control
                                         .Where(x => x.c.LODLevel == i)
                                         .ToList();
             
+            /*
             if (i < levels.Count - 1)
             {
                 // Order clusters by their ParentGroupId to keep groups together
                 levelIndices = levelIndices.OrderBy(x => x.c.ParentGroupId).ToList();
             }
+            */
 
             double xStep = Math.Max(120, width / (levelIndices.Count + 1));
             double y = height - (i + 1) * yStep;
@@ -181,6 +183,7 @@ public class DagView : Control
             var pen = new Pen(Brushes.DimGray, 0.5);
             var highlightPen = new Pen(Brushes.Yellow, 2.0);
 
+            /*
             // Draw all DAG connections (Many-to-Many)
             for (int i = 0; i < _clusters.Count; i++)
             {
@@ -205,6 +208,7 @@ public class DagView : Control
                     }
                 }
             }
+            */
 
             // Draw Nodes
             var typeface = new Typeface(FontFamily.Default);
@@ -219,10 +223,8 @@ public class DagView : Control
                 
                 if (!isHighlight && _hoverIndex != -1)
                 {
-                    var h = _clusters[_hoverIndex];
-                    // Highlight if related via DAG
-                    if (cluster.ParentGroupId != -1 && cluster.ParentGroupId == h.GroupId && cluster.LODLevel == h.LODLevel + 1) isHighlight = true;
-                    if (h.ParentGroupId != -1 && h.ParentGroupId == cluster.GroupId && h.LODLevel == cluster.LODLevel + 1) isHighlight = true;
+                    // var h = _clusters[_hoverIndex];
+                    // Highlight if related via DAG (removed)
                 }
 
                 context.DrawEllipse(brush, isHighlight ? highlightPen : null, pos, 8, 8);

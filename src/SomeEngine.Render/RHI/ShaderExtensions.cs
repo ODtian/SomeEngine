@@ -18,7 +18,10 @@ public static class ShaderExtensions
         return asset.Reflections?.FirstOrDefault(r => r.Backend == backend)?.Reflection;
     }
 
-    public static ShaderResourceVariableDesc[] GetResourceVariables(this ShaderAsset asset, RenderContext context)
+    public static ShaderResourceVariableDesc[] GetResourceVariables(
+        this ShaderAsset asset, 
+        RenderContext context, 
+        Func<string, ShaderResourceCategory, Diligent.ShaderResourceVariableType?>? typePolicy = null)
     {
         var reflection = asset.GetReflection(context);
         if (reflection?.Resources == null)
@@ -38,10 +41,17 @@ public static class ShaderExtensions
             var regClass = (int)GetShaderResourceRegisterClass(type);
             var key = (r.Set, r.Binding, regClass);
 
+            var varType = typePolicy?.Invoke(r.Name ?? "", r.Category);
+            if (varType == null)
+            {
+                // Log skipped variable
+                continue;
+            }
+
             var desc = new ShaderResourceVariableDesc
             {
                 Name = r.Name,
-                Type = MapVariableType(r.Type),
+                Type = varType.Value,
                 ShaderStages = (Diligent.ShaderType)r.Stages,
                 Binding = r.Binding,
                 Set = r.Set,
@@ -69,9 +79,13 @@ public static class ShaderExtensions
             string categoryChar = r.Category switch
             {
                 ShaderResourceCategory.ConstantBuffer => "b",
-                ShaderResourceCategory.ShaderResource => "t",
-                ShaderResourceCategory.UnorderedAccess => "u",
-                ShaderResourceCategory.SamplerState => "s",
+                ShaderResourceCategory.TextureSRV => "t",
+                ShaderResourceCategory.BufferSRV => "t",
+                ShaderResourceCategory.TextureUAV => "u",
+                ShaderResourceCategory.BufferUAV => "u",
+                ShaderResourceCategory.Sampler => "s",
+                ShaderResourceCategory.InputAttachment => "t",
+                ShaderResourceCategory.AccelStruct => "t",
                 _ => "?"
             };
             Console.WriteLine($"  [{categoryChar}] Set={r.Set}, Binding={r.Binding}, Name={r.Name}, Stages={(Diligent.ShaderType)r.Stages}");
@@ -106,9 +120,13 @@ public static class ShaderExtensions
         return category switch
         {
             SomeEngine.Assets.Schema.ShaderResourceCategory.ConstantBuffer => Diligent.ShaderResourceType.ConstantBuffer,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.ShaderResource => Diligent.ShaderResourceType.TextureSrv,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.UnorderedAccess => Diligent.ShaderResourceType.TextureUav,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.SamplerState => Diligent.ShaderResourceType.Sampler,
+            SomeEngine.Assets.Schema.ShaderResourceCategory.TextureSRV => Diligent.ShaderResourceType.TextureSrv,
+            SomeEngine.Assets.Schema.ShaderResourceCategory.BufferSRV => Diligent.ShaderResourceType.BufferSrv,
+            SomeEngine.Assets.Schema.ShaderResourceCategory.TextureUAV => Diligent.ShaderResourceType.TextureUav,
+            SomeEngine.Assets.Schema.ShaderResourceCategory.BufferUAV => Diligent.ShaderResourceType.BufferUav,
+            SomeEngine.Assets.Schema.ShaderResourceCategory.Sampler => Diligent.ShaderResourceType.Sampler,
+            SomeEngine.Assets.Schema.ShaderResourceCategory.InputAttachment => Diligent.ShaderResourceType.InputAttachment,
+            SomeEngine.Assets.Schema.ShaderResourceCategory.AccelStruct => Diligent.ShaderResourceType.AccelStruct,
             _ => Diligent.ShaderResourceType.Unknown
         };
     }
@@ -136,17 +154,6 @@ public static class ShaderExtensions
         var (binding, set, type) = asset.GetResourceBinding(context, name);
         if (binding == uint.MaxValue) return null;
         return srb.GetVariableByBinding(stage, binding, set, type);
-    }
-
-    private static Diligent.ShaderResourceVariableType MapVariableType(SomeEngine.Assets.Schema.ShaderResourceVariableType type)
-    {
-        return type switch
-        {
-            SomeEngine.Assets.Schema.ShaderResourceVariableType.Static => Diligent.ShaderResourceVariableType.Static,
-            SomeEngine.Assets.Schema.ShaderResourceVariableType.Mutable => Diligent.ShaderResourceVariableType.Mutable,
-            SomeEngine.Assets.Schema.ShaderResourceVariableType.Dynamic => Diligent.ShaderResourceVariableType.Dynamic,
-            _ => Diligent.ShaderResourceVariableType.Static
-        };
     }
 
     public static IShader CreateShader(

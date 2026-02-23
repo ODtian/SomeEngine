@@ -8,14 +8,12 @@ public struct GPUCluster
 {
     public Vector3 Center;
     public float Radius;
-    public Vector3 LodCenter;
-    public float LodRadius;
+    public Vector3 LODCenter;
+    public float LODRadius;
     public float LODError;
-    public float ParentLODError;
     public uint VertexStart;
     public uint TriangleStart;
     public int GroupId;
-    public int ParentGroupId;
     public byte VertexCount;
     public byte TriangleCount;
     public byte LODLevel;

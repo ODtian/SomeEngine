@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Diligent;
 using SomeEngine.Assets.Schema;
+using SomeEngine.Assets.Data;
 using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Systems;
@@ -14,6 +15,11 @@ public class ClusterResourceManager : IDisposable
     // Page-Based Streaming Heap
     public IBuffer? PageHeap { get; private set; }
     
+    // Global BVH Buffer
+    public IBuffer? GlobalBVHBuffer { get; private set; }
+    private uint _bvhNodeCount = 0;
+    private const uint BVHMaxNodes = 262144; // 256K nodes * 64B = 16MB
+
     // Track loaded pages
     public struct PageInfo
     {
@@ -25,7 +31,8 @@ public class ClusterResourceManager : IDisposable
     
     // Key: Mesh Name, Value: List of Pages
     public Dictionary<string, List<PageInfo>> PageRegistry { get; } = new();
-    
+    public Dictionary<string, uint> MeshBVHRoots { get; } = new();
+
     // Page Table
     public IBuffer? PageTableBuffer { get; private set; }
     public uint PageCount => (uint)_pageOffsets.Count;
@@ -52,11 +59,23 @@ public class ClusterResourceManager : IDisposable
             Name = "Global Page Heap",
             Size = HeapSize,
             Usage = Usage.Default,
-            BindFlags = BindFlags.ShaderResource,
+            BindFlags = BindFlags.ShaderResource | BindFlags.IndexBuffer,
             Mode = BufferMode.Raw
         };
         
         PageHeap = _context.Device.CreateBuffer(heapDesc);
+
+        // Global BVH Buffer (Structured)
+        BufferDesc bvhDesc = new BufferDesc
+        {
+            Name = "Global BVH Buffer",
+            Size = BVHMaxNodes * 64, // 64 bytes per node
+            Usage = Usage.Default,
+            BindFlags = BindFlags.ShaderResource,
+            Mode = BufferMode.Structured,
+            ElementByteStride = 64
+        };
+        GlobalBVHBuffer = _context.Device.CreateBuffer(bvhDesc);
 
         // Initial Page Table (size 1024, growable later)
         BufferDesc tableDesc = new BufferDesc
@@ -70,6 +89,8 @@ public class ClusterResourceManager : IDisposable
         };
         PageTableBuffer = _context.Device.CreateBuffer(tableDesc);
     }
+
+    public IBuffer? GetIndexBuffer() => PageHeap;
 
     public void CommitPageTable()
     {
@@ -103,26 +124,30 @@ public class ClusterResourceManager : IDisposable
         _pageTableDirty = false;
     }
 
-    public void AddMesh(MeshAsset mesh)
+    public uint AddMesh(MeshAsset mesh)
     {
         if (!mesh.Payload.HasValue || mesh.Payload.Value.IsEmpty)
-            return;
+            return uint.MaxValue;
             
         string meshName = mesh.Name ?? "Unnamed";
-        if (PageRegistry.ContainsKey(meshName)) return; // Already loaded
+        if (PageRegistry.ContainsKey(meshName)) 
+            return MeshBVHRoots.GetValueOrDefault(meshName, uint.MaxValue);
 
         var payload = mesh.Payload.Value;
+        int payloadLength = payload.Length;
+        int pageDataEnd = (mesh.BvhOffset > 0) ? (int)mesh.BvhOffset : payloadLength;
+
         var pageList = new List<PageInfo>();
         PageRegistry[meshName] = pageList;
 
         int offset = 0;
-        int payloadLength = payload.Length;
+        uint meshStartPageID = (uint)_pageOffsets.Count;
 
-        while (offset < payloadLength)
+        while (offset < pageDataEnd)
         {
             // Read Header to get PageSize
             // Header: ClusterCount(0), VertexCount(4), IndexCount(8), PageSize(12)
-            if (offset + 16 > payloadLength) break;
+            if (offset + 16 > pageDataEnd) break;
             
             var headerSpan = payload.Span.Slice(offset, 16);
             uint pageSize = MemoryMarshal.Read<uint>(headerSpan.Slice(12, 4));
@@ -131,7 +156,7 @@ public class ClusterResourceManager : IDisposable
             // Fallback for old assets or if PageSize was 0 (pad)
             if (pageSize == 0) pageSize = 131072; 
 
-            if (offset + pageSize > payloadLength) pageSize = (uint)(payloadLength - offset);
+            if (offset + pageSize > pageDataEnd) pageSize = (uint)(pageDataEnd - offset);
 
             // Allocate
             uint heapOffset = AllocateHeap(pageSize);
@@ -153,8 +178,65 @@ public class ClusterResourceManager : IDisposable
             
             offset += (int)pageSize;
         }
+
+        uint bvhRootIndex = uint.MaxValue;
+
+        // Load BVH
+        if (mesh.BvhOffset > 0 && (int)mesh.BvhOffset < payloadLength)
+        {
+             int bvhStart = (int)mesh.BvhOffset;
+             var bvhSpan = payload.Span.Slice(bvhStart);
+             int nodeCount = bvhSpan.Length / 64; // 64 bytes per node
+             
+             if (nodeCount > 0)
+             {
+                 uint globalNodeBase = _bvhNodeCount;
+                 // TODO: Check buffer overflow
+                 
+                 var nodes = MemoryMarshal.Cast<byte, ClusterBVHNode>(bvhSpan);
+                 ClusterBVHNode[] patchedNodes = new ClusterBVHNode[nodeCount];
+                 nodes.CopyTo(patchedNodes);
+                 
+                 for (int i = 0; i < nodeCount; i++)
+                 {
+                     if (patchedNodes[i].NodeType == 0) // Internal
+                     {
+                         patchedNodes[i].ChildPointer += globalNodeBase;
+                     }
+                     else // Leaf
+                     {
+                         uint packed = patchedNodes[i].ChildPointer;
+                         uint localPageIdx = packed >> 12;
+                         uint clusterStart = packed & 0xFFF;
+                         uint globalPageIdx = localPageIdx + meshStartPageID;
+                         patchedNodes[i].ChildPointer = (globalPageIdx << 12) | clusterStart;
+                     }
+                 }
+                 
+                 UploadBVH(globalNodeBase * 64, patchedNodes);
+                 
+                 _bvhNodeCount += (uint)nodeCount;
+                 
+                 // Root is the last node in the list
+                 bvhRootIndex = globalNodeBase + (uint)nodeCount - 1;
+                 MeshBVHRoots[meshName] = bvhRootIndex;
+             }
+        }
         
         _pageTableDirty = true;
+        return bvhRootIndex;
+    }
+
+    private void UploadBVH(uint offset, ClusterBVHNode[] data)
+    {
+        if (_context.ImmediateContext == null || GlobalBVHBuffer == null) return;
+        unsafe
+        {
+            fixed (ClusterBVHNode* ptr = data)
+            {
+                _context.ImmediateContext.UpdateBuffer(GlobalBVHBuffer, offset, (uint)(data.Length * 64), (IntPtr)ptr, ResourceStateTransitionMode.Transition);
+            }
+        }
     }
 
     private uint AllocateHeap(uint size)
@@ -190,5 +272,6 @@ public class ClusterResourceManager : IDisposable
     {
         PageHeap?.Dispose();
         PageTableBuffer?.Dispose();
+        GlobalBVHBuffer?.Dispose();
     }
 }
