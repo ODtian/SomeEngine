@@ -4,10 +4,11 @@ using SomeEngine.Core.Jobs.Internal;
 
 namespace SomeEngine.Core.Jobs;
 
-public static class JobDataStore<T> where T : struct, IJob
+public static class JobDataStore<T>
+    where T : struct, IJob
 {
     public static readonly ushort TypeId;
-    
+
     // Storage
     private static readonly T[] _jobs = new T[JobPools.MaxCounters]; // Reuse max constants
     private static readonly int[] _freeStack = new int[JobPools.MaxCounters];
@@ -17,10 +18,11 @@ public static class JobDataStore<T> where T : struct, IJob
     static JobDataStore()
     {
         _freeTop = JobPools.MaxCounters;
-        for (int i = 0; i < JobPools.MaxCounters; i++) _freeStack[i] = i; // 0-based indices for data store
-        
+        for (int i = 0; i < JobPools.MaxCounters; i++)
+            _freeStack[i] = i; // 0-based indices for data store
+
         _lock = new SpinLock();
-        
+
         // Register execution delegate
         TypeId = JobRegistry.Register(Execute);
     }
@@ -46,7 +48,8 @@ public static class JobDataStore<T> where T : struct, IJob
         }
         finally
         {
-            if (lockTaken) _lock.Exit();
+            if (lockTaken)
+                _lock.Exit();
         }
         throw new InvalidOperationException($"JobDataStore<{typeof(T).Name}> full!");
     }
@@ -64,7 +67,8 @@ public static class JobDataStore<T> where T : struct, IJob
         }
         finally
         {
-            if (lockTaken) _lock.Exit();
+            if (lockTaken)
+                _lock.Exit();
         }
     }
 }

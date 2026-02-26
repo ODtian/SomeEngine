@@ -13,20 +13,89 @@ public static class PrimitiveMeshGenerator
 
     private static readonly Vector3[] BaseVertices =
     {
-        new(-X, N, Z), new(X, N, Z), new(-X, N, -Z), new(X, N, -Z),
-        new(N, Z, X), new(N, Z, -X), new(N, -Z, X), new(N, -Z, -X),
-        new(Z, X, N), new(-Z, X, N), new(Z, -X, N), new(-Z, -X, N)
+        new(-X, N, Z),
+        new(X, N, Z),
+        new(-X, N, -Z),
+        new(X, N, -Z),
+        new(N, Z, X),
+        new(N, Z, -X),
+        new(N, -Z, X),
+        new(N, -Z, -X),
+        new(Z, X, N),
+        new(-Z, X, N),
+        new(Z, -X, N),
+        new(-Z, -X, N),
     };
 
     private static readonly uint[] BaseIndices =
-    {
-        0, 4, 1, 0, 9, 4, 9, 5, 4, 4, 5, 8, 4, 8, 1,
-        8, 10, 1, 8, 3, 10, 5, 3, 8, 5, 2, 3, 2, 7, 3,
-        7, 10, 3, 7, 6, 10, 7, 11, 6, 11, 0, 6, 0, 1, 6,
-        6, 1, 10, 9, 0, 11, 9, 11, 2, 9, 2, 5, 7, 2, 11
-    };
+    [
+        0,
+        1,
+        4,
+        0,
+        4,
+        9,
+        9,
+        4,
+        5,
+        4,
+        8,
+        5,
+        4,
+        1,
+        8,
+        8,
+        1,
+        10,
+        8,
+        10,
+        3,
+        5,
+        8,
+        3,
+        5,
+        3,
+        2,
+        2,
+        3,
+        7,
+        7,
+        3,
+        10,
+        7,
+        10,
+        6,
+        7,
+        6,
+        11,
+        11,
+        6,
+        0,
+        0,
+        6,
+        1,
+        6,
+        10,
+        1,
+        9,
+        11,
+        0,
+        9,
+        2,
+        11,
+        9,
+        5,
+        2,
+        7,
+        11,
+        2,
+    ];
 
-    public static (Vector3[] Vertices, uint[] Indices, List<RawAttribute> Attributes) CreateIcoSphere(int subdivision)
+    public static (
+        Vector3[] Vertices,
+        uint[] Indices,
+        List<RawAttribute> Attributes
+    ) CreateIcoSphere(int subdivision)
     {
         var vertices = new List<Vector3>(BaseVertices);
         var indices = new List<uint>(BaseIndices);
@@ -45,10 +114,18 @@ public static class PrimitiveMeshGenerator
                 uint bc = GetMidPoint(b, c, vertices, midPointCache);
                 uint ca = GetMidPoint(c, a, vertices, midPointCache);
 
-                newIndices.Add(a); newIndices.Add(ab); newIndices.Add(ca);
-                newIndices.Add(b); newIndices.Add(bc); newIndices.Add(ab);
-                newIndices.Add(c); newIndices.Add(ca); newIndices.Add(bc);
-                newIndices.Add(ab); newIndices.Add(bc); newIndices.Add(ca);
+                newIndices.Add(a);
+                newIndices.Add(ab);
+                newIndices.Add(ca);
+                newIndices.Add(b);
+                newIndices.Add(bc);
+                newIndices.Add(ab);
+                newIndices.Add(c);
+                newIndices.Add(ca);
+                newIndices.Add(bc);
+                newIndices.Add(ab);
+                newIndices.Add(bc);
+                newIndices.Add(ca);
             }
             indices = newIndices;
         }
@@ -73,14 +150,19 @@ public static class PrimitiveMeshGenerator
 
         var attributes = new List<RawAttribute>
         {
-            new RawAttribute("NORMAL", normals, 3, SomeEngine.Assets.Data.ValueType.Int8, 3, true), // Packed Normals
-            new RawAttribute("TEXCOORD_0", uvs, 2, SomeEngine.Assets.Data.ValueType.Float16, 2, false)
+            new("NORMAL", normals, 3, SomeEngine.Assets.Data.ValueType.Int8, 3, true), // Packed Normals
+            new("TEXCOORD_0", uvs, 2, SomeEngine.Assets.Data.ValueType.Float16, 2, false),
         };
 
         return (vertices.ToArray(), indices.ToArray(), attributes);
     }
 
-    private static uint GetMidPoint(uint p1, uint p2, List<Vector3> vertices, Dictionary<(uint, uint), uint> cache)
+    private static uint GetMidPoint(
+        uint p1,
+        uint p2,
+        List<Vector3> vertices,
+        Dictionary<(uint, uint), uint> cache
+    )
     {
         uint smaller = Math.Min(p1, p2);
         uint larger = Math.Max(p1, p2);

@@ -4,28 +4,29 @@ using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Graph;
 
-public class RenderGraphContext
+public class RenderGraphContext(RenderGraph graph, RenderContext renderContext)
 {
-    private readonly RenderGraph _graph;
-    private readonly RenderContext _renderContext;
-
-    public RenderGraphContext(RenderGraph graph, RenderContext renderContext)
-    {
-        _graph = graph;
-        _renderContext = renderContext;
-    }
-
     public ITexture? GetTexture(RGResourceHandle handle)
     {
-        return _graph.GetPhysicalTexture(handle);
+        return graph.GetPhysicalTexture(handle);
+    }
+
+    public IBuffer? GetBuffer(RGResourceHandle handle)
+    {
+        return graph.GetPhysicalBuffer(handle);
     }
 
     public ITextureView? GetTextureView(RGResourceHandle handle, TextureViewType type)
     {
-        return _graph.GetPhysicalTextureView(handle, type);
+        return graph.GetPhysicalTextureView(handle, type);
     }
-    
+
+    public IBufferView? GetBufferView(RGResourceHandle handle, BufferViewType type)
+    {
+        return graph.GetPhysicalBufferView(handle, type);
+    }
+
     // Helper accessors
-    public RenderContext RenderContext => _renderContext;
-    public IDeviceContext CommandList => _renderContext.ImmediateContext!;
+    public RenderContext RenderContext => renderContext;
+    public IDeviceContext CommandList => renderContext.ImmediateContext!;
 }

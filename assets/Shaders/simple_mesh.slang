@@ -4,15 +4,7 @@ struct Constants
     float4 Color;
 };
 
-// Use register binding compatible with Diligent's default expectation or explicit binding.
-// Diligent usually maps "Constants" to a CB if name matches.
-// In Slang/Vulkan, we need [[vk::binding]].
-// Slang will automatically map this to appropriate registers for other backends.
-
-cbuffer Constants
-{
-    Constants g_Constants;
-};
+ConstantBuffer<Constants> g_Constants;
 
 struct VSInput
 {

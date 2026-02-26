@@ -1,7 +1,7 @@
-using Diligent;
-using SomeEngine.Render.RHI;
 using System.IO;
 using System.Numerics;
+using Diligent;
+using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Pipelines;
 
@@ -19,19 +19,25 @@ public unsafe class HelloTrianglePass : IDisposable
     private void Initialize()
     {
         var device = _context.Device;
-        if (device == null) return;
+        if (device == null)
+            return;
 
         // 1. Create Shaders
         ShaderCreateInfo shaderCI = new ShaderCreateInfo();
         shaderCI.SourceLanguage = ShaderSourceLanguage.Hlsl;
-        shaderCI.ShaderCompiler = ShaderCompiler.Dxc; 
+        shaderCI.ShaderCompiler = ShaderCompiler.Dxc;
         // Assuming we have shader file
-        string shaderPath = Path.Combine(AppContext.BaseDirectory, "../../../../../assets/Shaders/triangle.hlsl");
+        string shaderPath = Path.Combine(
+            AppContext.BaseDirectory,
+            "../../../../../assets/Shaders/triangle.hlsl"
+        );
         if (!File.Exists(shaderPath))
-             shaderPath = "triangle.hlsl"; // Fallback
+            shaderPath = "triangle.hlsl"; // Fallback
 
         // VS
-        using var shaderSourceFactory = _context.Factory?.CreateDefaultShaderSourceStreamFactory("assets/Shaders");
+        using var shaderSourceFactory = _context.Factory?.CreateDefaultShaderSourceStreamFactory(
+            "assets/Shaders"
+        );
         shaderCI.Desc.Name = "Triangle VS";
         shaderCI.Desc.ShaderType = ShaderType.Vertex;
         shaderCI.EntryPoint = "VSMain";
@@ -43,24 +49,29 @@ public unsafe class HelloTrianglePass : IDisposable
         shaderCI.Desc.Name = "Triangle PS";
         shaderCI.Desc.ShaderType = ShaderType.Pixel;
         shaderCI.EntryPoint = "PSMain";
-        
+
         using var ps = device.CreateShader(shaderCI, out _);
 
         // 2. Create PSO
-        GraphicsPipelineStateCreateInfo psoCI = new GraphicsPipelineStateCreateInfo();
-        psoCI.PSODesc.Name = "Hello Triangle PSO";
-        psoCI.PSODesc.PipelineType = PipelineType.Graphics;
-        
-        psoCI.GraphicsPipeline.NumRenderTargets = 1;
-        psoCI.GraphicsPipeline.RTVFormats = [_context.SwapChain!.GetDesc().ColorBufferFormat];
-        psoCI.GraphicsPipeline.DSVFormat = _context.SwapChain!.GetDesc().DepthBufferFormat;
-        
-        psoCI.GraphicsPipeline.PrimitiveTopology = PrimitiveTopology.TriangleList;
-        psoCI.GraphicsPipeline.RasterizerDesc.CullMode = CullMode.None;
-        psoCI.GraphicsPipeline.DepthStencilDesc.DepthEnable = false;
-
-        psoCI.Vs = vs;
-        psoCI.Ps = ps;
+        var psoCI = new GraphicsPipelineStateCreateInfo()
+        {
+            PSODesc = new PipelineStateDesc
+            {
+                Name = "Hello Triangle PSO",
+                PipelineType = PipelineType.Graphics,
+            },
+            GraphicsPipeline = new GraphicsPipelineDesc
+            {
+                NumRenderTargets = 1,
+                RTVFormats = [_context.SwapChain!.GetDesc().ColorBufferFormat],
+                DSVFormat = _context.SwapChain!.GetDesc().DepthBufferFormat,
+                PrimitiveTopology = PrimitiveTopology.TriangleList,
+                RasterizerDesc = new RasterizerStateDesc { CullMode = CullMode.None },
+                DepthStencilDesc = new DepthStencilStateDesc { DepthEnable = false },
+            },
+            Vs = vs,
+            Ps = ps,
+        };
 
         _pso = device.CreateGraphicsPipelineState(psoCI);
     }
@@ -69,22 +80,29 @@ public unsafe class HelloTrianglePass : IDisposable
     {
         var ctx = _context.ImmediateContext;
         var swapChain = _context.SwapChain;
-        if (ctx == null || swapChain == null || _pso == null) return;
+        if (ctx == null || swapChain == null || _pso == null)
+            return;
 
         var rtv = swapChain.GetCurrentBackBufferRTV();
         var dsv = swapChain.GetDepthBufferDSV();
 
         ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Transition);
-        ctx.ClearRenderTarget(rtv, new Vector4(0.1f, 0.1f, 0.15f, 1.0f), ResourceStateTransitionMode.Transition);
-        ctx.ClearDepthStencil(dsv, ClearDepthStencilFlags.Depth, 1.0f, 0, ResourceStateTransitionMode.Transition);
+        ctx.ClearRenderTarget(
+            rtv,
+            new Vector4(0.1f, 0.1f, 0.15f, 1.0f),
+            ResourceStateTransitionMode.Transition
+        );
+        ctx.ClearDepthStencil(
+            dsv,
+            ClearDepthStencilFlags.Depth,
+            1.0f,
+            0,
+            ResourceStateTransitionMode.Transition
+        );
 
         ctx.SetPipelineState(_pso);
-        
-        DrawAttribs drawAttrs = new DrawAttribs
-        {
-            NumVertices = 3,
-            Flags = DrawFlags.VerifyAll
-        };
+
+        var drawAttrs = new DrawAttribs { NumVertices = 3, Flags = DrawFlags.VerifyAll };
         ctx.Draw(drawAttrs);
     }
 

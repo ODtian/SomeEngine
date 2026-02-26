@@ -8,10 +8,10 @@ public struct ClusterInfo
 {
     public Vector3 Center;
     public float Radius;
-    
+
     public Vector3 ConeAxis;
     public float ConeCutoff;
-    
+
     public uint IndexStart;
     public uint IndexCount;
     public uint Padding0;

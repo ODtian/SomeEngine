@@ -1,0 +1,247 @@
+  正在确定要还原的项目…
+  已还原 d:\SomeEngine\src\SomeEngine.Render\SomeEngine.Render.csproj (用时 270 毫秒)。
+  已还原 d:\SomeEngine\tests\SomeEngine.Tests\SomeEngine.Tests.csproj (用时 270 毫秒)。
+  2 个项目(共 4 个)是最新的，无法还原。
+  SomeEngine.Core -> d:\SomeEngine\src\SomeEngine.Core\bin\x64\Debug\net10.0\SomeEngine.Core.dll
+  Microsoft.AspNetCore.App 3.1.32 [C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App]
+  Microsoft.AspNetCore.App 6.0.35 [C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App]
+  Microsoft.AspNetCore.App 7.0.20 [C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App]
+  Microsoft.AspNetCore.App 8.0.10 [C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App]
+  Microsoft.AspNetCore.App 10.0.3 [C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App]
+  Microsoft.NETCore.App 3.1.32 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]
+  Microsoft.NETCore.App 6.0.35 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]
+  Microsoft.NETCore.App 6.0.36 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]
+  Microsoft.NETCore.App 7.0.1 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]
+  Microsoft.NETCore.App 7.0.20 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]
+  Microsoft.NETCore.App 8.0.10 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]
+  Microsoft.NETCore.App 8.0.24 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]
+  Microsoft.NETCore.App 10.0.3 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]
+  Microsoft.WindowsDesktop.App 3.1.32 [C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App]
+  Microsoft.WindowsDesktop.App 6.0.35 [C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App]
+  Microsoft.WindowsDesktop.App 6.0.36 [C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App]
+  Microsoft.WindowsDesktop.App 7.0.1 [C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App]
+  Microsoft.WindowsDesktop.App 7.0.20 [C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App]
+  Microsoft.WindowsDesktop.App 8.0.10 [C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App]
+  Microsoft.WindowsDesktop.App 8.0.24 [C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App]
+  Microsoft.WindowsDesktop.App 10.0.3 [C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App]
+  .NET runtime detection: 6: True, 7: True, 8: True, 9: False. Selected: net8.0
+  dotnet "C:\Users\tianl\.nuget\packages\flatsharp.compiler\7.9.0\tools\net8.0\FlatSharp.Compiler.dll" --input "..\..\assets\Schema\mesh_asset.fbs;..\..\assets\Schema\shader_asset.fbs" --includes "" --output obj\x64\Debug\net10.0\ --nullable-warnings true
+  SomeEngine.Assets -> d:\SomeEngine\src\SomeEngine.Assets\bin\x64\Debug\net10.0\SomeEngine.Assets.dll
+  Copy platform specific dll: C:\Users\tianl\.nuget\packages\diligentgraphics.diligentengine.core\2.5.6-api13-local\build\../lib/net6.0/x64/Diligent-GraphicsEngine.NET.dll
+d:\SomeEngine\src\SomeEngine.Render\RHI\RenderContext.cs(17,13): warning CS8602: 解引用可能出现空引用。 [d:\SomeEngine\src\SomeEngine.Render\SomeEngine.Render.csproj]
+d:\SomeEngine\src\SomeEngine.Render\Graph\RGMemoryHeap.cs(27,14): warning CS8618: 在退出构造函数时，不可为 null 的 属性 "Memory" 必须包含非 null 值。请考虑添加 "required" 修饰符或将该 属性 声明为可为 null。 [d:\SomeEngine\src\SomeEngine.Render\SomeEngine.Render.csproj]
+  SomeEngine.Render -> d:\SomeEngine\src\SomeEngine.Render\bin\x64\Debug\net10.0\SomeEngine.Render.dll
+d:\SomeEngine\tests\SomeEngine.Tests\ClusterSelectionTests.cs(54,62): warning CS9192: 应使用 “ref” 或 “in” 关键字传递参数 1 [d:\SomeEngine\tests\SomeEngine.Tests\SomeEngine.Tests.csproj]
+d:\SomeEngine\tests\SomeEngine.Tests\ClusterSelectionTests.cs(56,63): warning CS9192: 应使用 “ref” 或 “in” 关键字传递参数 1 [d:\SomeEngine\tests\SomeEngine.Tests\SomeEngine.Tests.csproj]
+d:\SomeEngine\tests\SomeEngine.Tests\ClusterSelectionTests.cs(64,57): warning CS9192: 应使用 “ref” 或 “in” 关键字传递参数 1 [d:\SomeEngine\tests\SomeEngine.Tests\SomeEngine.Tests.csproj]
+d:\SomeEngine\tests\SomeEngine.Tests\ClusterSelectionTests.cs(65,58): warning CS9192: 应使用 “ref” 或 “in” 关键字传递参数 1 [d:\SomeEngine\tests\SomeEngine.Tests\SomeEngine.Tests.csproj]
+d:\SomeEngine\tests\SomeEngine.Tests\RenderGraphTests.cs(13,46): warning CS0649: 从未对字段“RenderGraphTests.EmptyData.UserData”赋值，字段将一直保持其默认值 null [d:\SomeEngine\tests\SomeEngine.Tests\SomeEngine.Tests.csproj]
+  SomeEngine.Tests -> d:\SomeEngine\tests\SomeEngine.Tests\bin\x64\Debug\net10.0\SomeEngine.Tests.dll
+d:\SomeEngine\tests\SomeEngine.Tests\bin\x64\Debug\net10.0\SomeEngine.Tests.dll (.NETCoreApp,Version=v10.0)的测试运行
+VSTest 版本 18.0.1 (x64)
+
+正在启动测试执行，请稍候...
+总共 1 个测试文件与指定模式相匹配。
+d:\SomeEngine\tests\SomeEngine.Tests\bin\x64\Debug\net10.0\SomeEngine.Tests.dll
+NUnit Adapter 5.0.0.0: Test execution started
+Running selected tests in d:\SomeEngine\tests\SomeEngine.Tests\bin\x64\Debug\net10.0\SomeEngine.Tests.dll
+   NUnit3TestExecutor discovered 1 of 1 NUnit test cases using Current Discovery mode, Non-Explicit run
+--- HLSL Code for VSMain (NoMangle) ---
+#pragma pack_matrix(row_major)
+#ifdef SLANG_HLSL_ENABLE_NVAPI
+#include "nvHLSLExtns.h"
+#endif
+
+#ifndef __DXC_VERSION_MAJOR
+// warning X3557: loop doesn't seem to do anything, forcing loop to unroll
+#pragma warning(disable : 3557)
+#endif
+
+
+#line 1 "d:/SomeEngine/assets/Shaders/simple_mesh.slang"
+struct Constants_0
+{
+    float4x4 WorldViewProj_0;
+    float4 Color_0;
+};
+
+cbuffer g_Constants_0 : register(b0)
+{
+    Constants_0 g_Constants_0;
+}
+
+
+
+struct PSInput_0
+{
+    float4 Pos_0 : SV_POSITION;
+    float3 Normal_0 : NORMAL0;
+};
+
+
+#line 9
+struct VSInput_0
+{
+    float3 Pos_1 : ATTRIB00;
+};
+
+
+#line 21
+[shader("vertex")]PSInput_0 VSMain(VSInput_0 input_0)
+{
+    PSInput_0 output_0;
+    output_0.Pos_0 = mul(float4(input_0.Pos_1, 1.0f), g_Constants_0.WorldViewProj_0);
+    output_0.Normal_0 = normalize(input_0.Pos_1);
+    return output_0;
+}
+
+
+------------------------------------------
+--- HLSL Code for PSMain (NoMangle) ---
+#pragma pack_matrix(row_major)
+#ifdef SLANG_HLSL_ENABLE_NVAPI
+#include "nvHLSLExtns.h"
+#endif
+
+#ifndef __DXC_VERSION_MAJOR
+// warning X3557: loop doesn't seem to do anything, forcing loop to unroll
+#pragma warning(disable : 3557)
+#endif
+
+
+#line 1 "d:/SomeEngine/assets/Shaders/simple_mesh.slang"
+struct Constants_0
+{
+    float4x4 WorldViewProj_0;
+    float4 Color_0;
+};
+
+cbuffer g_Constants_0 : register(b0)
+{
+    Constants_0 g_Constants_0;
+}
+
+
+
+struct PSInput_0
+{
+    float4 Pos_0 : SV_POSITION;
+    float3 Normal_0 : NORMAL0;
+};
+
+
+#line 30
+[shader("pixel")]float4 PSMain(PSInput_0 input_0) : SV_TARGET
+{
+
+
+    return g_Constants_0.Color_0 * max(dot(input_0.Normal_0, normalize(float3(1.0f, 1.0f, -1.0f))), 0.20000000298023224f);
+}
+
+
+------------------------------------------
+
+NUnit Adapter 5.0.0.0: Test execution complete
+  已通过 TestSlangNoMangleHlslExport [46 ms]
+  标准输出消息:
+ --- HLSL Code for VSMain (NoMangle) ---
+ #pragma pack_matrix(row_major)
+ #ifdef SLANG_HLSL_ENABLE_NVAPI
+ #include "nvHLSLExtns.h"
+ #endif
+ 
+ #ifndef __DXC_VERSION_MAJOR
+ // warning X3557: loop doesn't seem to do anything, forcing loop to unroll
+ #pragma warning(disable : 3557)
+ #endif
+ 
+ 
+ #line 1 "d:/SomeEngine/assets/Shaders/simple_mesh.slang"
+ struct Constants_0
+ {
+     float4x4 WorldViewProj_0;
+     float4 Color_0;
+ };
+ 
+ cbuffer g_Constants_0 : register(b0)
+ {
+     Constants_0 g_Constants_0;
+ }
+ 
+ 
+ 
+ struct PSInput_0
+ {
+     float4 Pos_0 : SV_POSITION;
+     float3 Normal_0 : NORMAL0;
+ };
+ 
+ 
+ #line 9
+ struct VSInput_0
+ {
+     float3 Pos_1 : ATTRIB00;
+ };
+ 
+ 
+ #line 21
+ [shader("vertex")]PSInput_0 VSMain(VSInput_0 input_0)
+ {
+     PSInput_0 output_0;
+     output_0.Pos_0 = mul(float4(input_0.Pos_1, 1.0f), g_Constants_0.WorldViewProj_0);
+     output_0.Normal_0 = normalize(input_0.Pos_1);
+     return output_0;
+ }
+ 
+ 
+ ------------------------------------------
+ --- HLSL Code for PSMain (NoMangle) ---
+ #pragma pack_matrix(row_major)
+ #ifdef SLANG_HLSL_ENABLE_NVAPI
+ #include "nvHLSLExtns.h"
+ #endif
+ 
+ #ifndef __DXC_VERSION_MAJOR
+ // warning X3557: loop doesn't seem to do anything, forcing loop to unroll
+ #pragma warning(disable : 3557)
+ #endif
+ 
+ 
+ #line 1 "d:/SomeEngine/assets/Shaders/simple_mesh.slang"
+ struct Constants_0
+ {
+     float4x4 WorldViewProj_0;
+     float4 Color_0;
+ };
+ 
+ cbuffer g_Constants_0 : register(b0)
+ {
+     Constants_0 g_Constants_0;
+ }
+ 
+ 
+ 
+ struct PSInput_0
+ {
+     float4 Pos_0 : SV_POSITION;
+     float3 Normal_0 : NORMAL0;
+ };
+ 
+ 
+ #line 30
+ [shader("pixel")]float4 PSMain(PSInput_0 input_0) : SV_TARGET
+ {
+ 
+ 
+     return g_Constants_0.Color_0 * max(dot(input_0.Normal_0, normalize(float3(1.0f, 1.0f, -1.0f))), 0.20000000298023224f);
+ }
+ 
+ 
+ ------------------------------------------
+
+
+
+测试运行成功。
+测试总数: 1
+     通过数: 1
+总时间: 0.9670 秒

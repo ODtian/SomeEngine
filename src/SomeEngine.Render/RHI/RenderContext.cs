@@ -14,16 +14,12 @@ public unsafe class RenderContext : IDisposable
 
     public void Initialize(IWindow window)
     {
-        if (window.Native.Win32 == null)
-            throw new NotSupportedException(
-                "Only Win32 windows are supported for now."
-            );
+        if (window?.Native?.Win32 == null)
+            throw new NotSupportedException("Only Win32 windows are supported for now.");
+        var (Hwnd, _, _) = window.Native.Win32.Value;
 
-        var win32 = window.Native.Win32.Value;
-        var windowHandle = win32.Hwnd;
-        var hInstance = win32.HInstance;
-
-        SwapChainDesc scDesc = new SwapChainDesc {
+        var scDesc = new SwapChainDesc
+        {
             ColorBufferFormat = TextureFormat.RGBA8_UNorm,
             DepthBufferFormat = TextureFormat.D32_Float,
             BufferCount = 2,
@@ -34,7 +30,7 @@ public unsafe class RenderContext : IDisposable
         // Try D3D12 first
         try
         {
-            InitializeD3D12(windowHandle, scDesc);
+            InitializeD3D12(Hwnd, scDesc);
         }
         catch
         {
@@ -47,23 +43,20 @@ public unsafe class RenderContext : IDisposable
     {
         var factory = Native.CreateEngineFactory<IEngineFactoryD3D12>();
         Factory = factory;
-        EngineD3D12CreateInfo engineCI = new EngineD3D12CreateInfo {
+        var engineCI = new EngineD3D12CreateInfo
+        {
             EnableValidation = true,
-            D3D12ValidationFlags = D3D12ValidationFlags.BreakOnError |
-                                   D3D12ValidationFlags.BreakOnCorruption
+            D3D12ValidationFlags =
+                D3D12ValidationFlags.BreakOnError | D3D12ValidationFlags.BreakOnCorruption,
         };
-        factory.CreateDeviceAndContextsD3D12(
-            engineCI, out var device, out var contexts
-        );
+        factory.CreateDeviceAndContextsD3D12(engineCI, out var device, out var contexts);
         Device = device;
 
         ImmediateContext = contexts[0];
-        FullScreenModeDesc fsDesc = new FullScreenModeDesc();
-        Win32NativeWindow win32Window = new Win32NativeWindow { Wnd = windowHandle };
+        var fsDesc = new FullScreenModeDesc();
+        var win32Window = new Win32NativeWindow { Wnd = windowHandle };
 
-        SwapChain = factory.CreateSwapChainD3D12(
-            device, contexts[0], scDesc, fsDesc, win32Window
-        );
+        SwapChain = factory.CreateSwapChainD3D12(device, contexts[0], scDesc, fsDesc, win32Window);
     }
 
     public void Resize(uint width, uint height)

@@ -9,34 +9,33 @@ using SomeEngine.Core.Math;
 
 namespace SomeEngine.Core.ECS.Systems;
 
-public class TransformSystem : QuerySystem<LocalTransform, WorldTransform, TransformDepth>
+public class TransformSystem(SystemContext context)
+    : QuerySystem<LocalTransform, WorldTransform, TransformDepth>
 {
-    private readonly SystemContext _context;
     private const int MaxDepthLimit = 50;
-
-    public TransformSystem(SystemContext context)
-    {
-        _context = context;
-    }
 
     protected override void OnUpdate()
     {
-        var dependency = _context.GlobalDependency;
-        
+        var dependency = context.GlobalDependency;
+
         for (int d = 0; d < MaxDepthLimit; d++)
         {
             var job = new UpdateJob { TargetDepth = d };
             dependency = job.ScheduleParallel(Query, 1, dependency);
         }
 
-        _context.GlobalDependency = dependency;
+        context.GlobalDependency = dependency;
     }
 
     struct UpdateJob : IJobChunk<Chunks<LocalTransform, WorldTransform, TransformDepth>>
     {
         public int TargetDepth;
 
-        public void Execute(Chunks<LocalTransform, WorldTransform, TransformDepth> chunks, int chunkIndex, int firstEntityIndex)
+        public readonly void Execute(
+            Chunks<LocalTransform, WorldTransform, TransformDepth> chunks,
+            int chunkIndex,
+            int firstEntityIndex
+        )
         {
             var locals = chunks.Chunk1;
             var worlds = chunks.Chunk2;
@@ -45,7 +44,8 @@ public class TransformSystem : QuerySystem<LocalTransform, WorldTransform, Trans
 
             for (int i = 0; i < count; i++)
             {
-                if (depths[i].Value != TargetDepth) continue;
+                if (depths[i].Value != TargetDepth)
+                    continue;
 
                 var local = locals[i].Value;
 

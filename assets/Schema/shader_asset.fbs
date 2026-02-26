@@ -20,23 +20,20 @@ enum ShaderStage : ubyte {
     Callable
 }
 
-enum ShaderResourceVariableType : ubyte {
-    Static,
-    Mutable,
-    Dynamic
-}
-
 enum ShaderResourceCategory : ubyte {
+    Unknown = 0,
     ConstantBuffer,
-    ShaderResource, // t
-    UnorderedAccess, // u
-    SamplerState,    // s
-    Unknown
+    TextureSRV,
+    BufferSRV,
+    TextureUAV,
+    BufferUAV,
+    Sampler,
+    InputAttachment,
+    AccelStruct
 }
 
 table ShaderResourceReflection {
     name: string;
-    type: ShaderResourceVariableType;
     category: ShaderResourceCategory;
     binding: uint = 4294967295;
     set: uint = 4294967295;

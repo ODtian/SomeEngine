@@ -2,32 +2,56 @@ using Diligent;
 
 namespace SomeEngine.Render.Graph;
 
-public class RenderGraphBuilder
+public class RenderGraphBuilder(RenderGraph graph, RenderPass pass)
 {
-    private readonly RenderGraph _graph;
-    private readonly RenderPass _pass;
-
-    public RenderGraphBuilder(RenderGraph graph, RenderPass pass)
+    public RGResourceHandle ReadTexture(
+        RGResourceHandle handle,
+        ResourceState state = ResourceState.ShaderResource
+    )
     {
-        _graph = graph;
-        _pass = pass;
-    }
-
-    public RGResourceHandle ReadTexture(RGResourceHandle handle, ResourceState state = ResourceState.ShaderResource)
-    {
-        _graph.RegisterResourceRead(handle, _pass, state);
+        graph.RegisterResourceRead(handle, pass, state);
         return handle;
     }
 
-    public RGResourceHandle WriteTexture(RGResourceHandle handle, ResourceState state = ResourceState.RenderTarget)
+    public RGResourceHandle WriteTexture(
+        RGResourceHandle handle,
+        ResourceState state = ResourceState.RenderTarget
+    )
     {
-        return _graph.RegisterResourceWrite(handle, _pass, state);
+        return graph.RegisterResourceWrite(handle, pass, state);
     }
-    
+
+    public RGResourceHandle ReadBuffer(
+        RGResourceHandle handle,
+        ResourceState state = ResourceState.ShaderResource
+    )
+    {
+        graph.RegisterResourceRead(handle, pass, state);
+        return handle;
+    }
+
+    public RGResourceHandle WriteBuffer(
+        RGResourceHandle handle,
+        ResourceState state = ResourceState.UnorderedAccess
+    )
+    {
+        return graph.RegisterResourceWrite(handle, pass, state);
+    }
+
     // Create transient texture for this pass (output)
     public RGResourceHandle CreateTexture(string name, TextureDesc desc)
     {
-        return _graph.CreateTexture(name, desc);
+        return graph.CreateTexture(name, desc);
+    }
+
+    public RGResourceHandle CreateBuffer(string name, BufferDesc desc)
+    {
+        return graph.CreateBuffer(name, desc);
+    }
+
+    public void MarkAsOutput(RGResourceHandle handle)
+    {
+        graph.MarkAsOutput(handle);
     }
 
     // ... Add Buffer methods similarly

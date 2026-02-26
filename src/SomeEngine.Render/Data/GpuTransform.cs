@@ -9,9 +9,9 @@ public struct GpuTransform
 {
     public Vector4 Rotation; // 16 bytes
     public Vector3 Position; // 12 bytes
-    public float Scale;      // 4 bytes
-    public Vector3 Stretch;  // 12 bytes
-    public float Padding;    // 4 bytes
+    public float Scale; // 4 bytes
+    public Vector3 Stretch; // 12 bytes
+    public float Padding; // 4 bytes
 
     public const int SizeInBytes = 48;
 
@@ -19,11 +19,16 @@ public struct GpuTransform
     {
         return new GpuTransform
         {
-            Rotation = new Vector4(qvvs.Rotation.X, qvvs.Rotation.Y, qvvs.Rotation.Z, qvvs.Rotation.W),
+            Rotation = new Vector4(
+                qvvs.Rotation.X,
+                qvvs.Rotation.Y,
+                qvvs.Rotation.Z,
+                qvvs.Rotation.W
+            ),
             Position = qvvs.Position,
             Scale = qvvs.Scale,
             Stretch = qvvs.Stretch,
-            Padding = 0.0f
+            Padding = 0.0f,
         };
     }
 }

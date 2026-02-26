@@ -37,6 +37,7 @@ table MeshAsset (fs_serializer) {
     bounds:Bounds;
     attributes:[VertexAttribute] (fs_vector:"IList");
     payload:[ubyte] (fs_vector:"Memory");
+    bvh_offset:ulong;
 }
 
 root_type MeshAsset;

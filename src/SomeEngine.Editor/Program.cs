@@ -1,14 +1,15 @@
-﻿using Silk.NET.Windowing;
-using Silk.NET.Maths;
-using SomeEngine.Render.RHI;
-using SomeEngine.Render.Pipelines;
-using SomeEngine.Render.Graph;
-using SomeEngine.Render.Systems;
-using SomeEngine.Core.ECS;
-using SomeEngine.Core.Math;
-using System.Numerics;
+﻿using System.Numerics;
 using Diligent;
+using Silk.NET.Maths;
+using Silk.NET.Windowing;
 using SomeEngine.Assets.Schema; // Added
+using SomeEngine.Core.ECS;
+using SomeEngine.Core.ECS.Components;
+using SomeEngine.Core.Math;
+using SomeEngine.Render.Graph;
+using SomeEngine.Render.Pipelines;
+using SomeEngine.Render.RHI;
+using SomeEngine.Render.Systems;
 
 namespace SomeEngine.Editor;
 
@@ -17,11 +18,11 @@ class Program
     private static IWindow? _window;
     private static RenderContext? _renderContext;
     private static TriangleRenderPass? _trianglePass;
-    private static ClusterRenderPass? _clusterPass;
+    private static ClusterPipeline? _clusterPipeline;
     private static ClusterResourceManager? _clusterManager;
     private static RenderGraph? _renderGraph;
     private static GameWorld? _gameWorld;
-    private static TransformSyncSystem? _transformSync;
+    private static InstanceSyncSystem? _transformSync;
 
     static void Main(string[] args)
     {
@@ -54,7 +55,7 @@ class Program
     private static void OnLoad()
     {
         Console.WriteLine("Window Loaded.");
-        
+
         _gameWorld = new GameWorld();
 
         _renderContext = new RenderContext();
@@ -63,7 +64,7 @@ class Program
             _renderContext.Initialize(_window);
         }
 
-        _transformSync = new TransformSyncSystem(_renderContext);
+        _transformSync = new InstanceSyncSystem(_renderContext);
         _gameWorld.SystemRoot.Add(_transformSync);
 
         // Create Clusters
@@ -76,21 +77,28 @@ class Program
         for (int i = 0; i < 100; i++)
         {
             var e = _gameWorld.EntityStore.CreateEntity();
-            e.AddComponent(new TransformQvvs(new Vector3((i % 10 - 4.5f) * 1.5f, (i / 10 - 4.5f) * 1.5f, 0), Quaternion.Identity));
+            e.AddComponent(
+                new TransformQvvs(
+                    new Vector3((i % 10 - 4.5f) * 1.5f, (i / 10 - 4.5f) * 1.5f, 0),
+                    Quaternion.Identity
+                )
+            );
+            e.AddComponent(new MeshInstance { BVHRootIndex = 0 }); // Placeholder root
         }
 
         _renderGraph = new RenderGraph();
         _trianglePass = new TriangleRenderPass(_renderContext);
         _trianglePass.TransformSystem = _transformSync;
         _trianglePass.InitPSO();
-        
-        _clusterPass = new ClusterRenderPass(_renderContext, _transformSync, _clusterManager);
+
+        _clusterPipeline = new ClusterPipeline(_renderContext, _transformSync, _clusterManager);
+        _clusterPipeline.Init();
     }
 
     /*
     private static MeshAsset CreateCube()
     {
-        return new MeshAsset(); 
+        return new MeshAsset();
     }
     */
 
@@ -101,51 +109,51 @@ class Program
 
     private static void OnRender(double deltaTime)
     {
-        if (_renderContext == null || _renderGraph == null || _transformSync == null) return;
-        
-        if (_clusterPass == null) return;
+        if (_renderContext == null || _renderGraph == null || _transformSync == null)
+            return;
 
-        _renderGraph.Reset();
-        
+        if (_clusterPipeline == null)
+            return;
+
         var bbView = _renderContext.SwapChain?.GetCurrentBackBufferRTV();
-        if (bbView == null) return;
-        
-        var bbHandle = _renderGraph.ImportTexture("BackBuffer", bbView.GetTexture(), ResourceState.Common, bbView);
-        
-        // Use Cluster Pass instead of Triangle Pass
-        // Or both? Cluster pass assumes it draws to a generic RT for now since I didn't verify its Output setup.
-        // Wait, ClusterRenderPass SetOutput? 
-        // I didn't implement SetOutput on ClusterRenderPass. It inherits RenderPass...
-        
-        // I need to manually set the output in ClusterRenderPass definition or externally.
-        // TrianglePass has `SetOutput(bbHandle)`. 
-        // I'll update ClusterRenderPass to allow setting output, or use `_trianglePass` and wire it up.
-        // For now, I'll hack `ClusterRenderPass` to use ImmediateContext to Clear and SetTargets inside Execute?
-        // No, RenderGraph should handle it.
-        // I'll add `SetOutput` to `ClusterRenderPass`.
-        
-        // Actually RenderPass base doesn't have SetOutput? TriangleRenderPass defined it.
-        // I'll skip RenderGraph for `ClusterPass` for a quick test?
-        // No, `_renderGraph.Execute` runs passes.
-        
-        _renderGraph.AddPass(_clusterPass); 
-        // But `ClusterRenderPass` needs to know WHERE to draw.
-        // I'll modify `ClusterRenderPass` to accept an Output Handle.
-        
-        _renderGraph.Compile(); 
-        // Compile resolves dependencies. If ClusterPass doesn't declare outputs, RenderGraph might prune it?
-        // Or if it has no inputs/outputs...
-        
-        // Let's manually invoke for test:
+        if (bbView == null)
+            return;
+
+        var clearColor = new Vector4(0.1f, 0.2f, 0.4f, 1.0f);
         var ctx = _renderContext!.ImmediateContext!;
         ITextureView[] rtv = { bbView };
-        ctx.SetRenderTargets(rtv, _renderContext.SwapChain!.GetDepthBufferDSV(), ResourceStateTransitionMode.Transition);
-        var clearColor = new Vector4(0.1f, 0.2f, 0.4f, 1.0f);
+        ctx.SetRenderTargets(
+            rtv,
+            _renderContext.SwapChain!.GetDepthBufferDSV(),
+            ResourceStateTransitionMode.Transition
+        );
         ctx.ClearRenderTarget(bbView, clearColor, ResourceStateTransitionMode.Transition);
-        ctx.ClearDepthStencil(_renderContext.SwapChain.GetDepthBufferDSV(), ClearDepthStencilFlags.Depth, 1.0f, 0, ResourceStateTransitionMode.Transition);
-        
-        _clusterPass!.Execute(_renderContext, null!); 
-        // graphContext null might crash if I used it. I didn't use it in Execute implementation.
+        ctx.ClearDepthStencil(
+            _renderContext.SwapChain.GetDepthBufferDSV(),
+            ClearDepthStencilFlags.Depth,
+            1.0f,
+            0,
+            ResourceStateTransitionMode.Transition
+        );
+
+        _renderGraph!.Reset();
+        var bbHandle = _renderGraph.ImportTexture(
+            "BackBuffer",
+            bbView.GetTexture(),
+            ResourceState.RenderTarget,
+            bbView
+        );
+        var dsvTex = _renderContext.SwapChain.GetDepthBufferDSV().GetTexture();
+        var depthHandle = _renderGraph.ImportTexture(
+            "DepthBuffer",
+            dsvTex,
+            ResourceState.DepthWrite,
+            _renderContext.SwapChain.GetDepthBufferDSV()
+        );
+
+        _clusterPipeline!.AddToRenderGraph(_renderGraph, bbHandle, depthHandle);
+        _renderGraph.Compile(_renderContext.Device);
+        _renderGraph.Execute(_renderContext);
 
         _renderContext.Present();
     }

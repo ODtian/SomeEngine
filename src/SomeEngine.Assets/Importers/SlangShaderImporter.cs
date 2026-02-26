@@ -1,12 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
-using System.Linq;
-using SomeEngine.Assets.Schema;
+using System.Text;
 using SlangShaderSharp;
+using SomeEngine.Assets.Schema;
 
 namespace SomeEngine.Assets.Importers;
 
@@ -16,7 +16,8 @@ public static class SlangShaderImporter
 
     public static IGlobalSession GlobalSession
     {
-        get {
+        get
+        {
             if (_globalSession == null)
             {
                 Slang.CreateGlobalSession(Slang.ApiVersion, out _globalSession);
@@ -39,57 +40,55 @@ public static class SlangShaderImporter
         var spirvProfile = GlobalSession.FindProfile("glsl_460");
 
         // Define targets
-        var targets = new TargetDesc[] {
-            new TargetDesc {
-                Format = SlangCompileTarget.Dxil, Profile = dxilProfile
-            },
-            new TargetDesc {
-                Format = SlangCompileTarget.Spirv, Profile = spirvProfile
-            }
+        var targets = new TargetDesc[]
+        {
+            new() { Format = SlangCompileTarget.Dxil, Profile = dxilProfile },
+            new() { Format = SlangCompileTarget.Spirv, Profile = spirvProfile },
         };
 
-        var sessionDesc = new SessionDesc {
+        var sessionDesc = new SessionDesc
+        {
             Targets = targets,
             DefaultMatrixLayoutMode = SlangMatrixLayoutMode.ColumnMajor,
-            SearchPaths = new[] { Path.GetDirectoryName(filePath) ?? "" }
+            SearchPaths = [Path.GetDirectoryName(filePath) ?? ""],
         };
 
         GlobalSession.CreateSession(sessionDesc, out var session);
 
         // Load Module
         var blob = Slang.CreateBlob(Encoding.UTF8.GetBytes(source));
-        var module =
-            session.LoadModuleFromSource(name, filePath, blob, out var diagnostics);
+        var module = session.LoadModuleFromSource(name, filePath, blob, out var diagnostics);
 
         if (module == null)
         {
-            throw new Exception(
-                $"Failed to load module {name}: {GetString(diagnostics)}"
-            );
+            throw new Exception($"Failed to load module {name}: {GetString(diagnostics)}");
         }
 
         int entryPointCount = module.GetDefinedEntryPointCount();
 
-        var asset = new ShaderAsset {
+        var asset = new ShaderAsset
+        {
             Name = name,
-            Variants = new List<ShaderBytecode>(),
-            Reflections = new List<BackendReflection>()
+            Variants = [],
+            Reflections = [],
         };
 
-        var backendResourceMaps = new Dictionary<
-            string,
-            Dictionary<
-                (string Name, uint Set, uint Binding),
-                (HashSet<ShaderStage> Stages,
-                 ShaderResourceCategory Category)>>();
+        var backendResourceMaps =
+            new Dictionary<
+                string,
+                Dictionary<
+                    (string Name, uint Set, uint Binding),
+                    (HashSet<ShaderStage> Stages, ShaderResourceCategory Category)
+                >
+            >();
         for (int t = 0; t < targets.Length; t++)
         {
-            string backendName =
-                targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv";
-            backendResourceMaps[backendName] = new Dictionary<
-                (string Name, uint Set, uint Binding),
-                (HashSet<ShaderStage> Stages,
-                 ShaderResourceCategory Category)>();
+            string backendName = targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv";
+            backendResourceMaps[backendName] =
+                new Dictionary<
+                    (string Name, uint Set, uint Binding),
+                    (HashSet<ShaderStage> Stages, ShaderResourceCategory Category)
+                >();
         }
 
         for (int i = 0; i < entryPointCount; i++)
@@ -97,11 +96,11 @@ public static class SlangShaderImporter
             module.GetDefinedEntryPoint(i, out var entryPoint);
 
             // Compose (Module + EntryPoint)
-            IComponentType composedProgram;
-            ISlangBlob ? diagnostics2;
 
             session.CreateCompositeComponentType(
-                [module, entryPoint], out composedProgram, out diagnostics2
+                [module, entryPoint],
+                out var composedProgram,
+                out var diagnostics2
             );
 
             if (composedProgram == null)
@@ -113,9 +112,7 @@ public static class SlangShaderImporter
             }
 
             // Link
-            IComponentType linkedProgram;
-            ISlangBlob ? linkDiagnostics;
-            composedProgram.Link(out linkedProgram, out linkDiagnostics);
+            composedProgram.Link(out var linkedProgram, out var linkDiagnostics);
 
             if (linkedProgram == null)
             {
@@ -134,9 +131,10 @@ public static class SlangShaderImporter
                 if (reflection != ShaderReflection.Null)
                 {
                     var epReflection = reflection.GetEntryPointByIndex(0);
-                    ShaderStage epStage = epReflection.Stage != SlangStage.None
-                                              ? MapStage(epReflection.Stage)
-                                              : ShaderStage.Vertex;
+                    ShaderStage epStage =
+                        epReflection.Stage != SlangStage.None
+                            ? MapStage(epReflection.Stage)
+                            : ShaderStage.Vertex;
 
                     // Global parameters (cbuffer, StructuredBuffer, etc.)
                     uint globalParamCount = reflection.ParameterCount;
@@ -146,9 +144,7 @@ public static class SlangShaderImporter
                     for (uint pi = 0; pi < globalParamCount; pi++)
                     {
                         var param = reflection.GetParameterByIndex(pi);
-                        CollectResourceFromVar(
-                            param, epStage, backendResourceMaps[backendName]
-                        );
+                        CollectResourceFromVar(param, epStage, backendResourceMaps[backendName]);
                     }
                 }
             }
@@ -164,20 +160,20 @@ public static class SlangShaderImporter
             // Get compiled code for each target
             for (int t = 0; t < targets.Length; t++)
             {
-                linkedProgram.GetEntryPointCode(
-                    0, t, out var codeBlob, out var diag
-                );
+                linkedProgram.GetEntryPointCode(0, t, out var codeBlob, out var diag);
 
                 if (codeBlob != null)
                 {
-                    asset.Variants.Add(new ShaderBytecode {
-                        Backend = targets[t].Format == SlangCompileTarget.Dxil
-                                      ? "dxil"
-                                      : "spirv",
-                        Stage = finalStage,
-                        EntryPoint = epName,
-                        Data = GetBytes(codeBlob)
-                    });
+                    asset.Variants.Add(
+                        new ShaderBytecode
+                        {
+                            Backend =
+                                targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv",
+                            Stage = finalStage,
+                            EntryPoint = epName,
+                            Data = GetBytes(codeBlob),
+                        }
+                    );
                 }
                 else
                 {
@@ -191,11 +187,10 @@ public static class SlangShaderImporter
         // Finalize Reflection Data
         foreach (var kvp in backendResourceMaps)
         {
-            var backendRef = new BackendReflection {
+            var backendRef = new BackendReflection
+            {
                 Backend = kvp.Key,
-                Reflection = new ShaderReflectionData {
-                    Resources = new List<ShaderResourceReflection>()
-                }
+                Reflection = new ShaderReflectionData { Resources = [] },
             };
             FinalizeReflection(kvp.Value, backendRef.Reflection);
             asset.Reflections.Add(backendRef);
@@ -207,8 +202,8 @@ public static class SlangShaderImporter
     private static void FinalizeReflection(
         Dictionary<
             (string Name, uint Set, uint Binding),
-            (HashSet<ShaderStage> Stages,
-             ShaderResourceCategory Category)> resourceMap,
+            (HashSet<ShaderStage> Stages, ShaderResourceCategory Category)
+        > resourceMap,
         ShaderReflectionData dest
     )
     {
@@ -221,13 +216,16 @@ public static class SlangShaderImporter
                 stageMask |= GetDiligentStageFlags(s);
             }
 
-            dest.Resources.Add(new ShaderResourceReflection {
-                Name = kvp.Key.Name,
-                Set = kvp.Key.Set,
-                Binding = kvp.Key.Binding,
-                Category = kvp.Value.Category,
-                Stages = stageMask
-            });
+            dest.Resources.Add(
+                new ShaderResourceReflection
+                {
+                    Name = kvp.Key.Name,
+                    Set = kvp.Key.Set,
+                    Binding = kvp.Key.Binding,
+                    Category = kvp.Value.Category,
+                    Stages = stageMask,
+                }
+            );
         }
     }
 
@@ -236,16 +234,18 @@ public static class SlangShaderImporter
         ShaderStage stage,
         Dictionary<
             (string Name, uint Set, uint Binding),
-            (HashSet<ShaderStage> Stages,
-             ShaderResourceCategory Category)> resources
+            (HashSet<ShaderStage> Stages, ShaderResourceCategory Category)
+        > resources
     )
     {
         // Only collect top-level resources
         var category = varLayout.Category;
-        if (category != SlangParameterCategory.ConstantBuffer &&
-            category != SlangParameterCategory.ShaderResource &&
-            category != SlangParameterCategory.UnorderedAccess &&
-            category != SlangParameterCategory.SamplerState)
+        if (
+            category != SlangParameterCategory.ConstantBuffer
+            && category != SlangParameterCategory.ShaderResource
+            && category != SlangParameterCategory.UnorderedAccess
+            && category != SlangParameterCategory.SamplerState
+        )
         {
             return;
         }
@@ -267,17 +267,13 @@ public static class SlangShaderImporter
         {
             var mappedCategory = MapCategory(varLayout);
 
-            entry =
-                (new HashSet<ShaderStage>(),
-                 mappedCategory);
+            entry = (new HashSet<ShaderStage>(), mappedCategory);
             resources[(name, set, binding)] = entry;
         }
         entry.Stages.Add(stage);
     }
 
-    private static ShaderResourceCategory MapCategory(
-        VariableLayoutReflection varLayout
-    )
+    private static ShaderResourceCategory MapCategory(VariableLayoutReflection varLayout)
     {
         var category = varLayout.Category;
         var typeLayout = varLayout.TypeLayout;
@@ -296,9 +292,11 @@ public static class SlangShaderImporter
             if (baseShape == SlangResourceShape.AccelerationStructure)
                 return ShaderResourceCategory.AccelStruct;
 
-            if (baseShape == SlangResourceShape.StructuredBuffer ||
-                baseShape == SlangResourceShape.ByteAddressBuffer ||
-                baseShape == SlangResourceShape.TextureBuffer)
+            if (
+                baseShape == SlangResourceShape.StructuredBuffer
+                || baseShape == SlangResourceShape.ByteAddressBuffer
+                || baseShape == SlangResourceShape.TextureBuffer
+            )
                 return ShaderResourceCategory.BufferSRV;
 
             if (baseShape == SlangResourceShape.TextureSubpass)
@@ -309,9 +307,11 @@ public static class SlangShaderImporter
 
         if (category == SlangParameterCategory.UnorderedAccess)
         {
-            if (baseShape == SlangResourceShape.StructuredBuffer ||
-                baseShape == SlangResourceShape.ByteAddressBuffer ||
-                baseShape == SlangResourceShape.TextureBuffer)
+            if (
+                baseShape == SlangResourceShape.StructuredBuffer
+                || baseShape == SlangResourceShape.ByteAddressBuffer
+                || baseShape == SlangResourceShape.TextureBuffer
+            )
                 return ShaderResourceCategory.BufferUAV;
 
             return ShaderResourceCategory.TextureUAV;
@@ -322,62 +322,65 @@ public static class SlangShaderImporter
 
     private static uint GetDiligentStageFlags(ShaderStage stage)
     {
-        return stage switch { ShaderStage.Vertex => 0x01,
-                              ShaderStage.Pixel => 0x02,
-                              ShaderStage.Geometry => 0x04,
-                              ShaderStage.Hull => 0x08,
-                              ShaderStage.Domain => 0x10,
-                              ShaderStage.Compute => 0x20,
-                              ShaderStage.Amplification => 0x40,
-                              ShaderStage.Mesh => 0x80,
-                              ShaderStage.RayGen => 0x100,
-                              ShaderStage.RayMiss => 0x200,
-                              ShaderStage.RayClosestHit => 0x400,
-                              ShaderStage.RayAnyHit => 0x800,
-                              ShaderStage.RayIntersection => 0x1000,
-                              ShaderStage.Callable => 0x2000,
-                              _ => 0 };
+        return stage switch
+        {
+            ShaderStage.Vertex => 0x01,
+            ShaderStage.Pixel => 0x02,
+            ShaderStage.Geometry => 0x04,
+            ShaderStage.Hull => 0x08,
+            ShaderStage.Domain => 0x10,
+            ShaderStage.Compute => 0x20,
+            ShaderStage.Amplification => 0x40,
+            ShaderStage.Mesh => 0x80,
+            ShaderStage.RayGen => 0x100,
+            ShaderStage.RayMiss => 0x200,
+            ShaderStage.RayClosestHit => 0x400,
+            ShaderStage.RayAnyHit => 0x800,
+            ShaderStage.RayIntersection => 0x1000,
+            ShaderStage.Callable => 0x2000,
+            _ => 0,
+        };
     }
 
     private static SomeEngine.Assets.Schema.ShaderStage MapStage(SlangStage stage)
     {
         switch (stage)
         {
-        case SlangStage.None:
-            Console.WriteLine(
-                "Warning: Slang reported ShaderStage.None. Falling back to Vertex."
-            );
-            return SomeEngine.Assets.Schema.ShaderStage.Vertex;
-        case SlangStage.Vertex:
-            return SomeEngine.Assets.Schema.ShaderStage.Vertex;
-        case SlangStage.Fragment:
-            return SomeEngine.Assets.Schema.ShaderStage.Pixel;
-        case SlangStage.Compute:
-            return SomeEngine.Assets.Schema.ShaderStage.Compute;
-        case SlangStage.Hull:
-            return SomeEngine.Assets.Schema.ShaderStage.Hull;
-        case SlangStage.Domain:
-            return SomeEngine.Assets.Schema.ShaderStage.Domain;
-        case SlangStage.Geometry:
-            return SomeEngine.Assets.Schema.ShaderStage.Geometry;
-        case SlangStage.Amplification:
-            return SomeEngine.Assets.Schema.ShaderStage.Amplification;
-        case SlangStage.Mesh:
-            return SomeEngine.Assets.Schema.ShaderStage.Mesh;
-        case SlangStage.RayGeneration:
-            return SomeEngine.Assets.Schema.ShaderStage.RayGen;
-        case SlangStage.Miss:
-            return SomeEngine.Assets.Schema.ShaderStage.RayMiss;
-        case SlangStage.ClosestHit:
-            return SomeEngine.Assets.Schema.ShaderStage.RayClosestHit;
-        case SlangStage.AnyHit:
-            return SomeEngine.Assets.Schema.ShaderStage.RayAnyHit;
-        case SlangStage.Intersection:
-            return SomeEngine.Assets.Schema.ShaderStage.RayIntersection;
-        case SlangStage.Callable:
-            return SomeEngine.Assets.Schema.ShaderStage.Callable;
-        default:
-            throw new NotImplementedException($"Stage {stage} not supported");
+            case SlangStage.None:
+                Console.WriteLine(
+                    "Warning: Slang reported ShaderStage.None. Falling back to Vertex."
+                );
+                return SomeEngine.Assets.Schema.ShaderStage.Vertex;
+            case SlangStage.Vertex:
+                return SomeEngine.Assets.Schema.ShaderStage.Vertex;
+            case SlangStage.Fragment:
+                return SomeEngine.Assets.Schema.ShaderStage.Pixel;
+            case SlangStage.Compute:
+                return SomeEngine.Assets.Schema.ShaderStage.Compute;
+            case SlangStage.Hull:
+                return SomeEngine.Assets.Schema.ShaderStage.Hull;
+            case SlangStage.Domain:
+                return SomeEngine.Assets.Schema.ShaderStage.Domain;
+            case SlangStage.Geometry:
+                return SomeEngine.Assets.Schema.ShaderStage.Geometry;
+            case SlangStage.Amplification:
+                return SomeEngine.Assets.Schema.ShaderStage.Amplification;
+            case SlangStage.Mesh:
+                return SomeEngine.Assets.Schema.ShaderStage.Mesh;
+            case SlangStage.RayGeneration:
+                return SomeEngine.Assets.Schema.ShaderStage.RayGen;
+            case SlangStage.Miss:
+                return SomeEngine.Assets.Schema.ShaderStage.RayMiss;
+            case SlangStage.ClosestHit:
+                return SomeEngine.Assets.Schema.ShaderStage.RayClosestHit;
+            case SlangStage.AnyHit:
+                return SomeEngine.Assets.Schema.ShaderStage.RayAnyHit;
+            case SlangStage.Intersection:
+                return SomeEngine.Assets.Schema.ShaderStage.RayIntersection;
+            case SlangStage.Callable:
+                return SomeEngine.Assets.Schema.ShaderStage.Callable;
+            default:
+                throw new NotImplementedException($"Stage {stage} not supported");
         }
     }
 
@@ -388,7 +391,8 @@ public static class SlangShaderImporter
         unsafe
         {
             return Encoding.UTF8.GetString(
-                (byte *)blob.GetBufferPointer(), (int)blob.GetBufferSize()
+                (byte*)blob.GetBufferPointer(),
+                (int)blob.GetBufferSize()
             );
         }
     }
@@ -397,9 +401,7 @@ public static class SlangShaderImporter
     {
         unsafe
         {
-            var span = new ReadOnlySpan<byte>(
-                blob.GetBufferPointer(), (int)blob.GetBufferSize()
-            );
+            var span = new ReadOnlySpan<byte>(blob.GetBufferPointer(), (int)blob.GetBufferSize());
             return span.ToArray();
         }
     }

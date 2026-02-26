@@ -12,7 +12,7 @@ namespace SomeEngine.Render.Data
         public uint TotalVertexCount;
         public uint TotalTriangleCount;
         public uint PageSize;
-        
+
         public uint ClustersOffset;
         public uint PositionsOffset;
         public uint AttributesOffset;

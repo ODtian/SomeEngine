@@ -7,140 +7,101 @@
 ## 2. 数据结构设计 (Data Structures)
 
 ### 2.1 BVH 节点定义 (ClusterBVHNode)
-所有节点（内部节点和叶子节点）大小一致，存储在持久化的 `StructuredBuffer` 中。
+所有节点大小一致，存储在持久化的 `StructuredBuffer` 中。
 
 ```cpp
 struct ClusterBVHNode
 {
-    // 空间包围盒 (AABB) - 用于视锥体剔除
     float3 BoundMin;
     float3 BoundMax;
-
-    // LOD 包围球 (Sphere) - 用于 LOD 误差评估
-    // 对于叶子节点：存储 ParentLODBound (Parent Center, Parent Radius)
-    // 对于内部节点：存储所有子节点 LOD Sphere 的包围球
     float4 LODSphere; // xyz: Center, w: Radius
-
-    // LOD 误差 (Error)
-    // 对于叶子节点：存储 ParentError
-    // 对于内部节点：存储所有子节点的最大 Error
     float  LODError; 
 
     // 子节点指针 / Cluster 引用 (Union)
-    // 内部节点：指向 BVH Buffer 中的子节点偏移和数量
-    // 叶子节点：指向 PageIndex + ClusterStart + ClusterCount
+    // 内部节点：指向 BVH Buffer 中的子节点绝对索引
+    // 叶子节点：编码 Page 偏移与驻留状态
     uint   ChildPointer; 
     uint   ChildCount;   
     
-    // Padding to 64 bytes if needed, or kept compact (44 bytes currently)
-    // 建议对齐到 16 字节倍数，例如 48 字节或 64 字节
+    uint   NodeType; // 0 = Internal, 1 = Leaf
     float  _Pad0; 
 };
 ```
 
-#### 字段编码详解
-*   **ChildPointer & ChildCount**:
-    *   **内部节点 (Internal Node)**:
-        *   `ChildPointer`: 子节点在全局 BVH Buffer 中的起始索引 (Index)。
-        *   `ChildCount`: 子节点数量 (Fanout)。
-    *   **叶子节点 (Leaf Node)**:
-        *   `ChildPointer`: 编码 `PageIndex` 和 `ClusterStart`。
-            *   例如：`PageIndex` (高 20 位) | `ClusterStart` (低 12 位)。
-            *   注：假定每个 Page 的 Cluster 数量不超过 4096。
-        *   `ChildCount`: 该 Leaf 包含的 Cluster 数量。
+#### 字段编码详解 (Dynamic Patching 方案)
+*   **内部节点 (Internal Node)**:
+    *   `ChildPointer`: 子节点在全局 `GlobalBVHBuffer` 中的起始索引。在 Mesh 加载时由 CPU 完成重定位 (Relocation)。
+    *   `ChildCount`: 子节点数量。
+*   **叶子节点 (Leaf Node)**:
+    *   `ChildPointer`: 
+        *   `0xFFFFFFFF` (~0): **Page Fault** (缺页)。
+        *   其他值: `PageByteOffset` (Page 在 `PageHeap` 中的直接字节偏移)。由运行时动态修补。
+    *   `ChildCount`:
+        *   **Bits 12-31**: `ClusterCount` (该 Leaf 包含的 Cluster 数量)。
+        *   **Bits 0-11**: `ClusterStart` (该组 Cluster 在其所属 Page 内的起始偏移)。
 
 ### 2.2 运行时资源 (Runtime Resources)
 
-1.  **Global BVH Buffer**: `StructuredBuffer<ClusterBVHNode>` (Persistent)
+1.  **Global BVH Buffer**: `RWStructuredBuffer<ClusterBVHNode>`
     *   存储场景中所有静态物体的 Cluster BVH 节点。
-    *   动态物体可能需要单独的结构或每帧重建/更新（暂时聚焦静态）。
-2.  **Page Buffer**: `ByteAddressBuffer` (Bindless Heap)
-    *   存储所有 Cluster Pages。
-    *   每个 Page 大小固定（例如 128KB），因此 `ByteOffset` = `GlobalPageID` * `PageSize`。
-    *   **无需**额外的 `PageOffsetTable`。
+    *   **支持运行时修补**：当 Page 状态变化时，通过 Compute Shader 修改叶子节点的 `ChildPointer`。
+2.  **Page Heap**: `ByteAddressBuffer`
+    *   存储所有已加载的 Cluster Pages。
 3.  **Work Queues**: `RWStructuredBuffer<uint>` (Ping-Pong)
-    *   用于存储待处理的节点索引。
-    *   `Queue_Current`: 当前层级待处理节点。
-    *   `Queue_Next`: 下一层级产生的子节点。
+    *   层级遍历时存储待处理节点。
 
-## 3. 资产管线 (Asset Pipeline)
+## 3. 动态修补逻辑 (Dynamic Patching)
+
+为了消除 `PageTable` 的间接寻址开销，我们采用动态修补方案：
+
+1.  **加载阶段 (Load-time)**:
+    *   CPU 将 Mesh 局部 BVH 拷贝到全局 Buffer。
+    *   **重定位**：修正内部节点的 `ChildPointer`。
+    *   **注册**：建立 `PageID -> List<BVHNodeIndex>` 的映射追踪表。
+    *   **预上传**：如果包含永远驻留的粗粒度 LOD，直接填充其 `ChildPointer` 并设 `IsResident=1`。
+2.  **运行阶段 (Runtime)**:
+    *   **Page 流入**：Streamer 分配 `PageHeap` 空间后，通知 `ClusterResourceManager`。
+    *   **异步修补**：调度 `BVH_Patch` Compute Shader，根据该 PageID 对应的节点列表，批量更新 `ChildPointer` 为 `Resident | HeapOffset`。
+    *   **Page 流出**：同理，将对应节点的 `IsResident` 位清零。
+
+## 4. GPU 遍历算法 (Traversal Algorithm)
+
+### Pass 2: BVH 遍历 (Traversal Loop)
+1.  **剔除评估**：视锥体检测与 LOD 误差评估。
+2.  **分类处理**:
+    *   **Internal Node**: 如果未被剔除，将子节点推入下一层队列。
+    *   **Leaf Node**: 
+        *   如果 `ChildPointer == 0xFFFFFFFF`: 标记 Page Fault 并请求流式加载。
+        *   否则: 使用其存储的 `PageByteOffset` 访问数据并 Append 任务。
+
+## 5. 资产管线 (Asset Pipeline)
 
 在 `ClusterBuilder` 中增加 BVH 构建步骤：
 
 1.  **Cluster 生成**: 使用 `meshopt` 生成 Clusters。
 2.  **BVH 构建**:
     *   **输入**: 一组 Clusters (每个 Cluster 有 Bounds, LODError, ParentLODError)。
-    *   **策略**: Bottom-up 或 Top-down 构建。
-        *   将 Clusters 分组为 Leaf Nodes (例如 8-16 个 Clusters 一组)。
-        *   Leaf Node 的 `LODSphere` = 这一组 Cluster 的 ParentLODSphere (即产生这些 Cluster 的上一级 DAG 节点的 Sphere)。
-        *   Leaf Node 的 `LODError` = ParentError。
-        *   Internal Node 递归聚合子节点的 Bounds 和 Max Error。
+    *   **策略**: Bottom-up 构建。
+        *   将 Clusters 分组为 Leaf Nodes。
+        *    Leaf Node 继承父级 DAG 节点的 LOD Sphere 与 Error。
+        *   Internal Node 递归聚合子节点的 Bounds。
     *   **序列化**: 将构建好的 BVH 线性化并保存。
 
-## 4. GPU 遍历算法 (Traversal Algorithm)
+## 6. 层级调度 (Level Scheduling)
+采用层级调度的方式进行遍历，通过 Indirect Dispatch 避免 CS 中的深度递归。
 
-采用层级调度 (Level Scheduling) 的方式进行遍历，避免单个 Shader 里的深度递归栈溢出，并提高并行度。
+## 7. 目前进度现状 (Current Status)
 
-### Pass 1: 实例剔除 (Instance Culling) & Root 初始化
-*   **输入**: 所有 Instances。
-*   **逻辑**:
-    *   对每个 Instance 进行视锥体剔除。
-    *   如果可见，将其对应的 BVH Root Node Index 加入 `Queue_Next` (作为第 0 层)。
-    *   或者直接加入 `Queue_Level_0`。
+### 已完成 (Done)
+- [x] **数据结构定义**：C# 端的 `ClusterBVHNode` 已支持 16 字节对齐及字段打包。
+- [x] **资产管线构建**：`ClusterBuilder` 已实现自底向上的 BVH 构建逻辑，并支持基于 Morton Code 的叶子节点聚类。
+- [x] **单实例渲染管线**：`ClusterBVHTraversePass` 已实现层级调度渲染与 Ping-Pong 队列管理。
+- [x] **渲染反馈回读**：实现了异步读取 GPU 每一层遍历的节点数量用于调试。
 
-### Pass 2: BVH 遍历 (Traversal Loop)
-在 CPU 端循环调度 Compute Shader，直到队列为空或达到最大深度。
-
-*   **输入**: `Queue_Current` (Node Indices), `BVHBuffer`, `PageOffsetTable`。
-*   **输出**: `Queue_Next` (Node Indices), `VisibleClusterList` (Draw Args)。
-*   **逻辑**:
-    1.  获取当前线程要处理的 Node Index。
-    2.  加载 Node 数据。
-    3.  **剔除检查 (Culling)**:
-        *   **Frustum Culling**: 使用 `BoundMin/Max` 检查是否在视锥体内。
-        *   **LOD Culling**:
-            *   计算 `Dist = distance(Camera, Node.LODSphere.Center) - Node.LODSphere.Radius`.
-            *   如果是 Leaf Node:
-                *   如果满足 (Parent 误差够大，需要细分)，则说明该 Leaf 下的 Clusters **可能** 需要被渲染（进入 Cluster 级判断）。
-                *   如果 `ParentError / Dist <= Threshold`，说明 Parent 已经足够精细，不需要展开到这一层
-        
-    4.  **分类处理**:
-        *   **Internal Node**:
-            *   如果通过剔除（Frustum 可见 && LOD 需要细分），将所有子节点索引写入 `Queue_Next`。
-        *   **Leaf Node**:
-            *   如果通过剔除（Frustum 可见 && Parent 误差大），则说明需要处理内部 Clusters。
-            *   计算 Page 偏移: `PageOffset = PageOffsetTable[Node.PageIndex]`.
-            *   遍历该 Leaf 的所有 Clusters (Loop `ChildCount`):
-                *   Cluster 自身 Frustum Culling。
-                *   Cluster 自身 LOD Check (`Error / Dist <= Threshold`)。
-                *   如果是，Append 到 `VisibleClusterList`。
-
-### Pass 3: 队列交换与循环
-*   `Queue_Current` 清空 (Reset Count)。
-*   Swap(`Queue_Current`, `Queue_Next`)。
-*   **Indirect Dispatch**: 使用 `DispatchIndirect` 发起下一轮遍历。
-    *   Dispatch 参数 (ThreadGroupCount) 由上一轮 Shader 在填充 `Queue_Next` 时原子计数计算得出，并写入 `IndirectArgsBuffer`。
-    *   **无需 CPU 回读计数**，从而避免流水线停顿。
-    *   CPU 端仅需循环固定次数（最大深度）。如果某一层队列为空，Indirect Dispatch 的 ThreadGroupCount 为 0，GPU 将自动跳过执行，开销极小。
-
-## 5. 关键实现细节 (Implementation Details)
-
-### 5.1 动态 Page Offset 计算
-*   叶子节点中 `ChildPointer` 存储的是逻辑索引。
-*   `uint packed = node.ChildPointer;`
-*   `uint localPageIndex = packed >> 12;`
-*   `uint clusterStart = packed & 0xFFF;`
-*   `uint globalPageID = InstanceData[instanceID].BasePageID + localPageIndex;`
-*   `uint pageByteOffset = globalPageID * PAGE_SIZE; // Fixed size pages (e.g. 128KB)`
-*   `uint clusterByteOffset = pageByteOffset + PageHeaderSize + clusterStart * ClusterStride;`
-
-### 5.2 队列管理
-*   使用 `InterlockedAdd` 在 GPU 上分配队列槽位。
-*   需要一个 `IndirectArgs` Buffer 来存储下一轮 Dispatch 的 ThreadGroup 数量。
-
-## 6. 总结 (Summary)
-该方案通过构建持久化 BVH 加速了 Cluster 的查找过程，避免了全量扫描。同时利用 Page Table 解决了流式加载带来的地址变化问题。
-下一步任务：
-1.  修改 `ClusterBuilder` 生成 BVH 数据。
-2.  实现 GPU 端的 BVH 遍历 Shader。
-3.  集成到 Render Graph。
+### 进行中/待办 (WIP & TODO)
+- [ ] **移除页表依赖**：正在重构着色器与 C# 端逻辑，将 `PageTable` 彻底删除，改用 `Leaf Node` 直接寻址。
+- [ ] **实现动态修补系统**：
+    - [ ] `ClusterResourceManager` 建立 `Page -> BVH Node` 追踪映射。
+    - [ ] 编写 `bvh_patch.slang` 处理逻辑。
+- [ ] **多实例并发支持**：目前 `_queueA` 注入逻辑仍为单实例硬编码，需扩展为批量注入所有可见实例的根节点任务。
+- [ ] **鲁棒性优化**：处理 `GlobalBVHBuffer` 的溢出保护与碎片整理。

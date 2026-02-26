@@ -10,6 +10,6 @@ public readonly struct JobHandle
         CounterId = counterId;
         Version = version;
     }
-    
+
     public bool IsCompleted => JobSystem.IsJobCompleted(this);
 }

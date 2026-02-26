@@ -25,7 +25,7 @@ public static class JobSystem
             {
                 IsBackground = true,
                 Name = $"JobWorker_{i}",
-                Priority = ThreadPriority.AboveNormal
+                Priority = ThreadPriority.AboveNormal,
             };
             _workers[i].Start();
         }
@@ -36,14 +36,14 @@ public static class JobSystem
         // Allocate Counter
         int counterId = JobPools.AllocCounter();
         ref var counter = ref JobPools.Counters[counterId];
-        
+
         counter.Version++;
-        counter.Value = 2; 
+        counter.Value = 2;
         counter.FirstDependent = 0;
 
         // Use the dummy combine job type with index 0
         var jobId = new JobId(_combineJobTypeId, 0, counterId);
-        
+
         ScheduleInternal(jobId, h1);
         ScheduleInternal(jobId, h2);
 
@@ -52,17 +52,18 @@ public static class JobSystem
 
     public static JobHandle CombineDependencies(ReadOnlySpan<JobHandle> handles)
     {
-        if (handles.Length == 0) return default;
+        if (handles.Length == 0)
+            return default;
 
         int counterId = JobPools.AllocCounter();
         ref var counter = ref JobPools.Counters[counterId];
-        
+
         counter.Version++;
         counter.Value = handles.Length;
         counter.FirstDependent = 0;
 
         var jobId = new JobId(_combineJobTypeId, 0, counterId);
-        
+
         foreach (var h in handles)
         {
             ScheduleInternal(jobId, h);
@@ -71,14 +72,15 @@ public static class JobSystem
         return new JobHandle(counterId, counter.Version);
     }
 
-    public static JobHandle Schedule<T>(T job, JobHandle dependency = default) where T : struct, IJob
+    public static JobHandle Schedule<T>(T job, JobHandle dependency = default)
+        where T : struct, IJob
     {
         // 1. Allocate and Init Counter
         int counterId = JobPools.AllocCounter();
         ref var counter = ref JobPools.Counters[counterId];
-        
-        counter.Version++; 
-        counter.Value = 1; 
+
+        counter.Version++;
+        counter.Value = 1;
         counter.FirstDependent = 0; // null
 
         // 2. Store Job Data
@@ -86,14 +88,15 @@ public static class JobSystem
 
         // 3. Create JobId
         var myJobId = new JobId(JobDataStore<T>.TypeId, jobIndex, counterId);
-        
+
         // 4. Handle Dependency
         ScheduleInternal(myJobId, dependency);
 
         return new JobHandle(counterId, counter.Version);
     }
 
-    struct ParallelJobWrapper<T> : IJob where T : struct, IJobParallelFor
+    struct ParallelJobWrapper<T> : IJob
+        where T : struct, IJobParallelFor
     {
         public T JobData;
         public int Start;
@@ -108,17 +111,25 @@ public static class JobSystem
         }
     }
 
-    public static JobHandle Dispatch<T>(T jobData, int length, int batchSize, JobHandle dependency = default) where T : struct, IJobParallelFor
+    public static JobHandle Dispatch<T>(
+        T jobData,
+        int length,
+        int batchSize,
+        JobHandle dependency = default
+    )
+        where T : struct, IJobParallelFor
     {
-        if (length <= 0) return dependency;
-        if (batchSize <= 0) batchSize = 1;
+        if (length <= 0)
+            return dependency;
+        if (batchSize <= 0)
+            batchSize = 1;
 
         int batchCount = (length + batchSize - 1) / batchSize;
 
         // 1. Allocate Counter
         int counterId = JobPools.AllocCounter();
         ref var counter = ref JobPools.Counters[counterId];
-        
+
         counter.Version++;
         counter.Value = batchCount; // Wait for ALL batches
         counter.FirstDependent = 0;
@@ -133,7 +144,7 @@ public static class JobSystem
             {
                 JobData = jobData,
                 Start = start,
-                End = end
+                End = end,
             };
 
             int jobIndex = JobDataStore<ParallelJobWrapper<T>>.Add(wrapper);
@@ -147,7 +158,7 @@ public static class JobSystem
 
     private static void ScheduleInternal(JobId jobId, JobHandle dependency)
     {
-        if (dependency.Version == 0) 
+        if (dependency.Version == 0)
         {
             GlobalJobQueue.Enqueue(jobId);
         }
@@ -167,14 +178,15 @@ public static class JobSystem
         }
     }
 
-    
     internal static bool IsJobCompleted(JobHandle handle)
     {
-        if (handle.Version == 0) return true;
-        
+        if (handle.Version == 0)
+            return true;
+
         ref var counter = ref JobPools.Counters[handle.CounterId];
-        if (counter.Version != handle.Version) return true;
-        
+        if (counter.Version != handle.Version)
+            return true;
+
         return counter.Value == 0;
     }
 
@@ -185,27 +197,32 @@ public static class JobSystem
         SpinWait spin = new SpinWait();
         while (true)
         {
-            if (counter.Version != expectedVersion) return false; 
-            if (counter.Value == 0) return false; 
+            if (counter.Version != expectedVersion)
+                return false;
+            if (counter.Value == 0)
+                return false;
 
             int nodeId = JobPools.AllocNode();
             ref var node = ref JobPools.Nodes[nodeId];
             node.Job = dependentJob;
-            
+
             int currentHead = counter.FirstDependent;
-            if (currentHead == -1) 
+            if (currentHead == -1)
             {
                 JobPools.FreeNode(nodeId);
-                return false; 
+                return false;
             }
-            
+
             node.Next = currentHead;
 
-            if (Interlocked.CompareExchange(ref counter.FirstDependent, nodeId, currentHead) == currentHead)
+            if (
+                Interlocked.CompareExchange(ref counter.FirstDependent, nodeId, currentHead)
+                == currentHead
+            )
             {
                 return true;
             }
-            
+
             JobPools.FreeNode(nodeId);
             spin.SpinOnce();
         }
@@ -217,8 +234,7 @@ public static class JobSystem
         {
             GlobalJobQueue.WaitForJob();
 
-            JobId job;
-            while (GlobalJobQueue.TryDequeue(out job))
+            while (GlobalJobQueue.TryDequeue(out var job))
             {
                 ExecuteJob(job);
             }
@@ -230,9 +246,12 @@ public static class JobSystem
         var executor = JobRegistry.GetExecutor(job.TypeId);
         if (executor != null)
         {
-            try {
+            try
+            {
                 executor(job.Index);
-            } catch (Exception ex) {
+            }
+            catch (Exception ex)
+            {
                 Console.WriteLine($"Job Execution Error: {ex}");
             }
         }
@@ -243,28 +262,29 @@ public static class JobSystem
     private static void CompleteJob(int counterId)
     {
         ref var counter = ref JobPools.Counters[counterId];
-        
+
         if (Interlocked.Decrement(ref counter.Value) == 0)
         {
             int head = Interlocked.Exchange(ref counter.FirstDependent, -1);
-            
+
             while (head > 0)
             {
                 ref var node = ref JobPools.Nodes[head];
                 int next = node.Next;
-                
+
                 GlobalJobQueue.Enqueue(node.Job);
-                
+
                 JobPools.FreeNode(head);
                 head = next;
             }
         }
     }
-    
+
     public static void Wait(JobHandle handle)
     {
-        if (handle.IsCompleted) return;
-        
+        if (handle.IsCompleted)
+            return;
+
         SpinWait spin = new SpinWait();
         while (!handle.IsCompleted)
         {
@@ -280,7 +300,7 @@ public static class JobSystem
             }
         }
     }
-    
+
     public static void Return(JobHandle handle)
     {
         Wait(handle);
@@ -288,8 +308,7 @@ public static class JobSystem
         ref var counter = ref JobPools.Counters[handle.CounterId];
         if (counter.Version == handle.Version)
         {
-             JobPools.FreeCounter(handle.CounterId);
+            JobPools.FreeCounter(handle.CounterId);
         }
     }
 }
-

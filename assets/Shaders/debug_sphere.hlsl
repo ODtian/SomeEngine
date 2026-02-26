@@ -2,14 +2,13 @@
 
 struct DrawRequest
 {
-    uint PageID;
+    uint PageOffset;
     uint ClusterID;
     uint InstanceID;
     uint Pad;
 };
 
 StructuredBuffer<DrawRequest> RequestBuffer;
-StructuredBuffer<uint> PageTable;
 ByteAddressBuffer PageHeap;
 
 cbuffer DrawUniforms
@@ -83,16 +82,19 @@ PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     
     // Load Request
     DrawRequest req = RequestBuffer[instanceID];
-    uint pageID = req.PageID;
+    uint pageOffset = req.PageOffset;
     uint clusterID = req.ClusterID;
     
-    uint pageOffset = PageTable[pageID];
-    
     // Load Cluster Center/Radius
-    // Header is 32 bytes. Cluster stride is 60 bytes.
-    // Center (12) + Radius (4) = 16 bytes.
-    uint clusterOffset = pageOffset + 32 + clusterID * 60; 
-    float4 v0 = asfloat(PageHeap.Load4(clusterOffset));
+    // Header: 16 bytes offset to ClustersOffset
+    uint clustersStartOffset = PageHeap.Load(pageOffset + 16);
+    
+    // GPUCluster stride is 52 bytes
+    uint clusterStride = 52;
+    uint clusterOffset = pageOffset + clustersStartOffset + clusterID * clusterStride; 
+
+    // Load LOD Center/Radius (Offset 16)
+    float4 v0 = asfloat(PageHeap.Load4(clusterOffset + 16));
     float3 center = v0.xyz;
     float radius = v0.w;
     

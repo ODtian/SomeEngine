@@ -1,6 +1,6 @@
+using System.Numerics;
 using Friflo.Engine.ECS;
 using SomeEngine.Core.Math;
-using System.Numerics;
 
 namespace SomeEngine.Core.ECS.Components;
 

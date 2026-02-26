@@ -5,24 +5,18 @@ using SomeEngine.Core.ECS.Components;
 
 namespace SomeEngine.Core.ECS.Systems;
 
-public class HierarchySystem : QuerySystem<LocalTransform>
+public class HierarchySystem(EntityStore store) : QuerySystem<LocalTransform>
 {
-    private readonly EntityStore _store;
-    private readonly ArchetypeQuery<LocalTransform> _missingDepthQuery;
-    private readonly ArchetypeQuery<TreeNode, LocalTransform> _treeQuery;
-    private readonly ArchetypeQuery<LocalTransform> _isolatedQuery;
-
-    public HierarchySystem(EntityStore store)
-    {
-        _store = store;
-        _missingDepthQuery = store.Query<LocalTransform>().WithoutAllComponents(
-            ComponentTypes.Get<TransformDepth>()
-        );
-        _treeQuery = store.Query<TreeNode, LocalTransform>();
-        _isolatedQuery = store.Query<LocalTransform>().WithoutAllComponents(
-            ComponentTypes.Get<TreeNode>()
-        );
-    }
+    private readonly ArchetypeQuery<LocalTransform> _missingDepthQuery = store
+        .Query<LocalTransform>()
+        .WithoutAllComponents(ComponentTypes.Get<TransformDepth>());
+    private readonly ArchetypeQuery<TreeNode, LocalTransform> _treeQuery = store.Query<
+        TreeNode,
+        LocalTransform
+    >();
+    private readonly ArchetypeQuery<LocalTransform> _isolatedQuery = store
+        .Query<LocalTransform>()
+        .WithoutAllComponents(ComponentTypes.Get<TreeNode>());
 
     protected override void OnUpdate()
     {
@@ -41,9 +35,8 @@ public class HierarchySystem : QuerySystem<LocalTransform>
             for (int i = 0; i < chunk.Length; i++)
             {
                 var id = entities[i];
-                var entity = _store.GetEntityById(id);
-                if (entity.TryGetComponent<TransformDepth>(out var d) &&
-                    d.Value != 0)
+                var entity = store.GetEntityById(id);
+                if (entity.TryGetComponent<TransformDepth>(out var d) && d.Value != 0)
                 {
                     ref var depthRef = ref entity.GetComponent<TransformDepth>();
                     depthRef.Value = 0;
@@ -61,7 +54,7 @@ public class HierarchySystem : QuerySystem<LocalTransform>
             for (int i = 0; i < chunk.Length; i++)
             {
                 var id = entities[i];
-                var entity = _store.GetEntityById(id);
+                var entity = store.GetEntityById(id);
                 if (entity.Parent.IsNull)
                 {
                     SetDepthRecursive(entity, 0);
@@ -70,7 +63,7 @@ public class HierarchySystem : QuerySystem<LocalTransform>
         }
     }
 
-    private void SetDepthRecursive(Entity entity, int depth)
+    private static void SetDepthRecursive(Entity entity, int depth)
     {
         ref var d = ref entity.GetComponent<TransformDepth>();
         if (d.Value != depth)

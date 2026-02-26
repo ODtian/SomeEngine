@@ -37,6 +37,14 @@ struct ClusterBVHNode
     uint NodeType; // 0=Internal, 1=Leaf
 };
 
+struct GpuInstanceHeader
+{
+    uint BVHRootIndex;
+    uint MaterialID;
+    uint MetadataOffset;
+    uint MetadataCount;
+};
+
 struct AABB
 {
     float3 Min;

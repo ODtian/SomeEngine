@@ -3,18 +3,10 @@ using SomeEngine.Render.Systems;
 
 namespace SomeEngine.Render.Data;
 
-public class MeshPageManager
+public class MeshPageManager(ClusterResourceManager resourceManager)
 {
-    private readonly ClusterResourceManager _resourceManager;
-
-    public MeshPageManager(ClusterResourceManager resourceManager)
-    {
-        _resourceManager = resourceManager;
-    }
-
     public void RegisterAsset(MeshAsset asset)
     {
-        _resourceManager.AddMesh(asset);
-        _resourceManager.CommitPageTable();
+        resourceManager.AddMesh(asset);
     }
 }

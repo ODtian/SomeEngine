@@ -2,34 +2,24 @@ using System.Numerics;
 
 namespace SomeEngine.Core.Math;
 
-public sealed class FreeCamera
+public sealed class FreeCamera(
+    Vector3 position,
+    float yaw,
+    float pitch,
+    float fovY,
+    float nearPlane,
+    float farPlane
+)
 {
     private const float MaxPitch = 1.553343f;
 
-    public Vector3 Position { get; set; }
-    public float Yaw { get; private set; }
-    public float Pitch { get; private set; }
-    public float FovY { get; set; }
-    public float NearPlane { get; set; }
-    public float FarPlane { get; set; }
+    public Vector3 Position { get; set; } = position;
+    public float Yaw { get; private set; } = yaw;
+    public float Pitch { get; private set; } = ClampPitch(pitch);
+    public float FovY { get; set; } = fovY;
+    public float NearPlane { get; set; } = nearPlane;
+    public float FarPlane { get; set; } = farPlane;
     public Vector3 WorldUp { get; set; } = Vector3.UnitY;
-
-    public FreeCamera(
-        Vector3 position,
-        float yaw,
-        float pitch,
-        float fovY,
-        float nearPlane,
-        float farPlane
-    )
-    {
-        Position = position;
-        Yaw = yaw;
-        Pitch = ClampPitch(pitch);
-        FovY = fovY;
-        NearPlane = nearPlane;
-        FarPlane = farPlane;
-    }
 
     public Vector3 Forward
     {
@@ -77,8 +67,10 @@ public sealed class FreeCamera
 
     private static float ClampPitch(float pitch)
     {
-        if (pitch > MaxPitch) return MaxPitch;
-        if (pitch < -MaxPitch) return -MaxPitch;
+        if (pitch > MaxPitch)
+            return MaxPitch;
+        if (pitch < -MaxPitch)
+            return -MaxPitch;
         return pitch;
     }
 }
