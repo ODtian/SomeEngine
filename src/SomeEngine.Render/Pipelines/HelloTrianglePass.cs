@@ -86,18 +86,18 @@ public unsafe class HelloTrianglePass : IDisposable
         var rtv = swapChain.GetCurrentBackBufferRTV();
         var dsv = swapChain.GetDepthBufferDSV();
 
-        ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Transition);
+        ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Verify);
         ctx.ClearRenderTarget(
             rtv,
-            new Vector4(0.1f, 0.1f, 0.15f, 1.0f),
-            ResourceStateTransitionMode.Transition
+            new System.Numerics.Vector4(0.2f, 0.2f, 0.2f, 1.0f),
+            ResourceStateTransitionMode.Verify
         );
         ctx.ClearDepthStencil(
             dsv,
             ClearDepthStencilFlags.Depth,
             1.0f,
             0,
-            ResourceStateTransitionMode.Transition
+            ResourceStateTransitionMode.Verify
         );
 
         ctx.SetPipelineState(_pso);

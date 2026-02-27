@@ -20,23 +20,8 @@ enum ShaderStage : ubyte {
     Callable
 }
 
-enum ShaderResourceCategory : ubyte {
-    Unknown = 0,
-    ConstantBuffer,
-    TextureSRV,
-    BufferSRV,
-    TextureUAV,
-    BufferUAV,
-    Sampler,
-    InputAttachment,
-    AccelStruct
-}
-
 table ShaderResourceReflection {
     name: string;
-    category: ShaderResourceCategory;
-    binding: uint = 4294967295;
-    set: uint = 4294967295;
     stages: uint; // Diligent SHADER_TYPE bitmask
 }
 

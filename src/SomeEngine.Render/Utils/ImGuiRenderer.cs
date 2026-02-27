@@ -68,6 +68,15 @@ public unsafe class ImGuiRenderer : IDisposable
         };
 
         _fontTexture = device.CreateTexture(texDesc, data);
+        _context.ImmediateContext!.TransitionResourceStates([
+            new StateTransitionDesc {
+                Resource = _fontTexture,
+                OldState = ResourceState.Unknown,
+                NewState = ResourceState.ShaderResource,
+                Flags = StateTransitionFlags.UpdateState
+            }
+        ]);
+
         TextureViewDesc viewDesc = new TextureViewDesc {
             ViewType = TextureViewType.ShaderResource,
             Name = "ImGui Font Texture SRV",
@@ -314,7 +323,7 @@ public unsafe class ImGuiRenderer : IDisposable
 
         // Draw
         context.SetPipelineState(_pso);
-        context.CommitShaderResources(_srb, ResourceStateTransitionMode.Transition);
+        context.CommitShaderResources(_srb, ResourceStateTransitionMode.Verify);
 
         ulong[] offsets = [0];
         IBuffer[] vbs = [_vertexBuffer!];
@@ -322,11 +331,11 @@ public unsafe class ImGuiRenderer : IDisposable
             0,
             vbs,
             offsets,
-            ResourceStateTransitionMode.Transition,
+            ResourceStateTransitionMode.Verify,
             SetVertexBuffersFlags.None
         );
         context.SetIndexBuffer(
-            _indexBuffer!, 0, ResourceStateTransitionMode.Transition
+            _indexBuffer!, 0, ResourceStateTransitionMode.Verify
         );
 
         vtxOffset = 0;

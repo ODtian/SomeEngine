@@ -21,8 +21,7 @@ public static class ShaderExtensions
     public static ShaderResourceVariableDesc[] GetResourceVariables(
         this ShaderAsset asset,
         RenderContext context,
-        Func<string, ShaderResourceCategory, Diligent.ShaderResourceVariableType?>? typePolicy =
-            null
+        Func<string, Diligent.ShaderResourceVariableType?>? typePolicy = null
     )
     {
         var reflection = asset.GetReflection(context);
@@ -36,18 +35,15 @@ public static class ShaderExtensions
             $"--- Shader Asset Layout: {asset.Name} ({context.Device.GetDeviceInfo().Type}) ---"
         );
 
-        // Use a map to merge variables that share the same slot and registration class within overlapping stages.
-        // Key: (Set, Binding, RegisterClass)
-        var mergedVariables =
-            new Dictionary<(uint Set, uint Binding, int Class), ShaderResourceVariableDesc>();
+        // Use a map to merge variables that share the same name within overlapping stages.
+        var mergedVariables = new Dictionary<string, ShaderResourceVariableDesc>();
 
         foreach (var r in reflection.Resources)
         {
-            var type = MapResourceType(r.Category);
-            var regClass = (int)GetShaderResourceRegisterClass(type);
-            var key = (r.Set, r.Binding, regClass);
+            var resourceName = r.Name ?? string.Empty;
+            var key = resourceName;
 
-            var varType = typePolicy?.Invoke(r.Name ?? "", r.Category);
+            var varType = typePolicy?.Invoke(r.Name ?? "");
             if (varType == null)
             {
                 // Log skipped variable
@@ -59,24 +55,12 @@ public static class ShaderExtensions
                 Name = r.Name,
                 Type = varType.Value,
                 ShaderStages = (Diligent.ShaderType)r.Stages,
-                Binding = r.Binding,
-                Set = r.Set,
-                ResourceType = type,
             };
 
             if (mergedVariables.TryGetValue(key, out var existing))
             {
-                // If the same slot is used, we must merge the stages and potentially names.
-                // Diligent will handle the binding as long as the Stage mask is correct.
+                // If the same resource name is used, merge stage masks.
                 existing.ShaderStages |= desc.ShaderStages;
-                // Keep the first name found or combine them? Diligent prefers the name in the shader.
-                // If they have different names, we just print a warning but merge them since they are physically the same slot.
-                if (existing.Name != desc.Name)
-                {
-                    Console.WriteLine(
-                        $"  [INFO] Merging resources '{existing.Name}' and '{desc.Name}' sharing slot Set={r.Set} Bind={r.Binding} Class={regClass}"
-                    );
-                }
                 mergedVariables[key] = existing;
             }
             else
@@ -84,97 +68,10 @@ public static class ShaderExtensions
                 mergedVariables[key] = desc;
             }
 
-            string categoryChar = r.Category switch
-            {
-                ShaderResourceCategory.ConstantBuffer => "b",
-                ShaderResourceCategory.TextureSRV => "t",
-                ShaderResourceCategory.BufferSRV => "t",
-                ShaderResourceCategory.TextureUAV => "u",
-                ShaderResourceCategory.BufferUAV => "u",
-                ShaderResourceCategory.Sampler => "s",
-                ShaderResourceCategory.InputAttachment => "t",
-                ShaderResourceCategory.AccelStruct => "t",
-                _ => "?",
-            };
-            Console.WriteLine(
-                $"  [{categoryChar}] Set={r.Set}, Binding={r.Binding}, Name={r.Name}, Stages={(Diligent.ShaderType)r.Stages}"
-            );
+            Console.WriteLine($"  Name={r.Name}, Stages={(Diligent.ShaderType)r.Stages}");
         }
         Console.WriteLine($"------------------------------------------");
         return [.. mergedVariables.Values];
-    }
-
-    private enum ShaderResourceRegisterClass
-    {
-        Srv,
-        Uav,
-        Cbv,
-        Sampler,
-        Unknown,
-    }
-
-    private static ShaderResourceRegisterClass GetShaderResourceRegisterClass(
-        Diligent.ShaderResourceType type
-    )
-    {
-        return type switch
-        {
-            Diligent.ShaderResourceType.ConstantBuffer => ShaderResourceRegisterClass.Cbv,
-            Diligent.ShaderResourceType.TextureSrv => ShaderResourceRegisterClass.Srv,
-            Diligent.ShaderResourceType.BufferSrv => ShaderResourceRegisterClass.Srv,
-            Diligent.ShaderResourceType.InputAttachment => ShaderResourceRegisterClass.Srv,
-            Diligent.ShaderResourceType.AccelStruct => ShaderResourceRegisterClass.Srv,
-            Diligent.ShaderResourceType.TextureUav => ShaderResourceRegisterClass.Uav,
-            Diligent.ShaderResourceType.BufferUav => ShaderResourceRegisterClass.Uav,
-            Diligent.ShaderResourceType.Sampler => ShaderResourceRegisterClass.Sampler,
-            _ => ShaderResourceRegisterClass.Unknown,
-        };
-    }
-
-    private static Diligent.ShaderResourceType MapResourceType(ShaderResourceCategory category)
-    {
-        return category switch
-        {
-            SomeEngine.Assets.Schema.ShaderResourceCategory.ConstantBuffer => Diligent
-                .ShaderResourceType
-                .ConstantBuffer,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.TextureSRV => Diligent
-                .ShaderResourceType
-                .TextureSrv,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.BufferSRV => Diligent
-                .ShaderResourceType
-                .BufferSrv,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.TextureUAV => Diligent
-                .ShaderResourceType
-                .TextureUav,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.BufferUAV => Diligent
-                .ShaderResourceType
-                .BufferUav,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.Sampler => Diligent
-                .ShaderResourceType
-                .Sampler,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.InputAttachment => Diligent
-                .ShaderResourceType
-                .InputAttachment,
-            SomeEngine.Assets.Schema.ShaderResourceCategory.AccelStruct => Diligent
-                .ShaderResourceType
-                .AccelStruct,
-            _ => Diligent.ShaderResourceType.Unknown,
-        };
-    }
-
-    public static (uint Binding, uint Set, Diligent.ShaderResourceType Type) GetResourceBinding(
-        this ShaderAsset asset,
-        RenderContext context,
-        string name
-    )
-    {
-        var reflection = asset.GetReflection(context);
-        var res = reflection?.Resources?.FirstOrDefault(r => r.Name == name);
-        if (res == null)
-            return (uint.MaxValue, uint.MaxValue, Diligent.ShaderResourceType.Unknown);
-
-        return (res.Binding, res.Set, MapResourceType(res.Category));
     }
 
     public static IShaderResourceVariable? GetStaticVariable(
@@ -187,10 +84,7 @@ public static class ShaderExtensions
     {
         if (asset == null)
             return null;
-        var (binding, set, type) = asset.GetResourceBinding(context, name);
-        if (binding == uint.MaxValue)
-            return null;
-        return pso.GetStaticVariableByBinding(stage, binding, set, type);
+        return pso.GetStaticVariableByName(stage, name);
     }
 
     public static IShaderResourceVariable? GetVariable(
@@ -203,10 +97,7 @@ public static class ShaderExtensions
     {
         if (asset == null)
             return null;
-        var (binding, set, type) = asset.GetResourceBinding(context, name);
-        if (binding == uint.MaxValue)
-            return null;
-        return srb.GetVariableByBinding(stage, binding, set, type);
+        return srb.GetVariableByName(stage, name);
     }
 
     public static IShader CreateShader(

@@ -125,15 +125,15 @@ class Program
         ctx.SetRenderTargets(
             rtv,
             _renderContext.SwapChain!.GetDepthBufferDSV(),
-            ResourceStateTransitionMode.Transition
+            ResourceStateTransitionMode.Verify
         );
-        ctx.ClearRenderTarget(bbView, clearColor, ResourceStateTransitionMode.Transition);
+        ctx.ClearRenderTarget(bbView, clearColor, ResourceStateTransitionMode.Verify);
         ctx.ClearDepthStencil(
             _renderContext.SwapChain.GetDepthBufferDSV(),
             ClearDepthStencilFlags.Depth,
             1.0f,
             0,
-            ResourceStateTransitionMode.Transition
+            ResourceStateTransitionMode.Verify
         );
 
         _renderGraph!.Reset();

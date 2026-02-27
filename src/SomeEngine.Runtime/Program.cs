@@ -796,38 +796,35 @@ class Program
             var pRTV = context.SwapChain!.GetCurrentBackBufferRTV();
             var pDSV = context.SwapChain!.GetDepthBufferDSV();
 
-            context.ImmediateContext!.SetRenderTargets(
-                [pRTV],
-                pDSV,
-                ResourceStateTransitionMode.Transition
-            );
-            context.ImmediateContext.ClearRenderTarget(
-                pRTV,
-                new System.Numerics.Vector4(0.1f, 0.1f, 0.15f, 1.0f),
-                ResourceStateTransitionMode.Transition
-            );
-            context.ImmediateContext.ClearDepthStencil(
-                pDSV,
-                ClearDepthStencilFlags.Depth | ClearDepthStencilFlags.Stencil,
-                1.0f,
-                0,
-                ResourceStateTransitionMode.Transition
-            );
-
             renderGraph.Reset();
             var bbTex = pRTV.GetTexture();
             var colorHandle = renderGraph.ImportTexture(
                 "BackBuffer",
                 bbTex,
-                ResourceState.RenderTarget,
+                ResourceState.Unknown,
                 pRTV
             );
             var depthTex = pDSV.GetTexture();
             var depthHandle = renderGraph.ImportTexture(
                 "DepthBuffer",
                 depthTex,
-                ResourceState.DepthWrite,
+                ResourceState.Unknown,
                 pDSV
+            );
+
+            renderGraph.AddPass<object>(
+                "Clear Main RT",
+                (builder, _) =>
+                {
+                    builder.WriteTexture(colorHandle, ResourceState.RenderTarget);
+                    builder.WriteTexture(depthHandle, ResourceState.DepthWrite);
+                },
+                (ctx, _) =>
+                {
+                    ctx.CommandList.SetRenderTargets([pRTV], pDSV, ResourceStateTransitionMode.Verify);
+                    ctx.CommandList.ClearRenderTarget(pRTV, new System.Numerics.Vector4(0.1f, 0.1f, 0.15f, 1.0f), ResourceStateTransitionMode.Verify);
+                    ctx.CommandList.ClearDepthStencil(pDSV, ClearDepthStencilFlags.Depth | ClearDepthStencilFlags.Stencil, 1.0f, 0, ResourceStateTransitionMode.Verify);
+                }
             );
 
             clusterPipeline.AddToRenderGraph(renderGraph, colorHandle, depthHandle);
@@ -836,7 +833,7 @@ class Program
             // simplePass?.Execute(context, null);
 
             // Render ImGui
-            imguiRenderer?.Render(context.ImmediateContext, ImGui.GetDrawData());
+            imguiRenderer?.Render(context.ImmediateContext!, ImGui.GetDrawData());
 
             // Present handled by RenderContext helper or manually
             context.Present();

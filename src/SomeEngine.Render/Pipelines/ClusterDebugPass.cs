@@ -8,7 +8,7 @@ using SomeEngine.Render.Systems;
 
 namespace SomeEngine.Render.Pipelines;
 
-public class ClusterDebugPass(RenderContext context, ClusterResourceManager clusterManager) : RenderPass("ClusterDebug"), IDisposable
+public class ClusterDebugPass(RenderContext context, ClusterResourceManager clusterManager) : IDisposable
 {
     private readonly RenderContext _context = context;
     private ShaderAsset? _bvhDebugAsset;
@@ -23,30 +23,7 @@ public class ClusterDebugPass(RenderContext context, ClusterResourceManager clus
     private IPipelineState? _debugSpherePSO;
     private IShaderResourceBinding? _debugSphereSRB;
 
-    private IBuffer? _debugIndirectArgsBuffer;
     private bool _initialized;
-
-    public RGResourceHandle HBvhDebugBuffer,
-        HBvhDebugCountBuffer;
-    public RGResourceHandle HVisibleClusters,
-        HIndirectDrawArgs;
-    public RGResourceHandle HColorTarget,
-        HDepthTarget;
-    public RGResourceHandle HDrawUniforms,
-        HCopyUniforms;
-
-    private bool _visualiseBVH,
-        _debugSpheres;
-    private IBuffer? _drawUniformBuffer,
-        _copyUniformBuffer;
-
-    public void SetFrameData(IBuffer drawUB, IBuffer copyUB, bool visBVH, bool debugSpheres)
-    {
-        _drawUniformBuffer = drawUB;
-        _copyUniformBuffer = copyUB;
-        _visualiseBVH = visBVH;
-        _debugSpheres = debugSpheres;
-    }
 
     public void Init()
     {
@@ -55,17 +32,6 @@ public class ClusterDebugPass(RenderContext context, ClusterResourceManager clus
         var device = _context.Device;
         if (device == null)
             return;
-
-        _debugIndirectArgsBuffer = device.CreateBuffer(
-            new BufferDesc
-            {
-                Name = "Debug Indirect Args",
-                Size = 256,
-                Usage = Usage.Default,
-                BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
-                Mode = BufferMode.Raw,
-            }
-        );
 
         InitBVHDebugPSO(device);
         InitCopyPSO(device);
@@ -96,7 +62,7 @@ public class ClusterDebugPass(RenderContext context, ClusterResourceManager clus
                     DefaultVariableType = ShaderResourceVariableType.Mutable,
                     Variables = _bvhDebugAsset.GetResourceVariables(
                         _context,
-                        (name, cat) =>
+                        name =>
                             (name == "DebugAABBs")
                                 ? ShaderResourceVariableType.Dynamic
                                 : null
@@ -155,7 +121,7 @@ public class ClusterDebugPass(RenderContext context, ClusterResourceManager clus
         ci.PSODesc.ResourceLayout.DefaultVariableType = ShaderResourceVariableType.Mutable;
         ci.PSODesc.ResourceLayout.Variables = _copyAsset.GetResourceVariables(
             _context,
-            (name, cat) =>
+            name =>
                 (name == "IndirectArgs")
                     ? ShaderResourceVariableType.Dynamic
                     : null
@@ -197,7 +163,7 @@ public class ClusterDebugPass(RenderContext context, ClusterResourceManager clus
         ci.PSODesc.ResourceLayout.DefaultVariableType = ShaderResourceVariableType.Mutable;
         ci.PSODesc.ResourceLayout.Variables = _sphereAsset.GetResourceVariables(
             _context,
-            (name, cat) =>
+            name =>
                 (name == "RequestBuffer")
                     ? ShaderResourceVariableType.Dynamic
                     : null
@@ -207,158 +173,155 @@ public class ClusterDebugPass(RenderContext context, ClusterResourceManager clus
             _debugSphereSRB = _debugSpherePSO.CreateShaderResourceBinding(false);
     }
 
-    public override void Setup(RenderGraphBuilder builder)
+    public void SetupBVH(RenderGraphBuilder builder, RGResourceHandle hBvhDebug, RGResourceHandle hBvhDebugCount, RGResourceHandle hDrawUB, RGResourceHandle hColor, RGResourceHandle hDepth)
     {
-        builder.ReadBuffer(HBvhDebugBuffer, ResourceState.ShaderResource);
-        builder.ReadBuffer(HBvhDebugCountBuffer, ResourceState.IndirectArgument);
-        builder.ReadBuffer(HVisibleClusters, ResourceState.ShaderResource);
-        builder.ReadBuffer(HIndirectDrawArgs, ResourceState.UnorderedAccess);
-        builder.ReadBuffer(HDrawUniforms, ResourceState.ConstantBuffer);
-        builder.ReadBuffer(HCopyUniforms, ResourceState.ConstantBuffer);
-        builder.WriteTexture(HColorTarget, ResourceState.RenderTarget);
-        builder.WriteTexture(HDepthTarget, ResourceState.DepthWrite);
+        builder.ReadBuffer(hBvhDebug, ResourceState.ShaderResource);
+        builder.ReadBuffer(hBvhDebugCount, ResourceState.IndirectArgument);
+        builder.ReadBuffer(hDrawUB, ResourceState.ConstantBuffer);
+        builder.WriteTexture(hColor, ResourceState.RenderTarget);
+        builder.WriteTexture(hDepth, ResourceState.DepthWrite);
     }
 
-    public override void Execute(RenderContext context, RenderGraphContext rgCtx)
+    public void ExecuteBVH(RenderContext context, RenderGraphContext rgCtx, RGResourceHandle hBvhDebug, RGResourceHandle hBvhDebugCount, IBuffer drawUniformBuffer)
     {
         var ctx = context.ImmediateContext;
-        if (ctx == null)
+        if (ctx == null || _bvhDebugPSO == null || _bvhDebugSRB == null)
             return;
 
-        var bvhDebug = rgCtx.GetBuffer(HBvhDebugBuffer);
-        var bvhDebugCount = rgCtx.GetBuffer(HBvhDebugCountBuffer);
-        var visible = rgCtx.GetBuffer(HVisibleClusters);
-        var drawArgs = rgCtx.GetBuffer(HIndirectDrawArgs);
+        var bvhDebug = rgCtx.GetBuffer(hBvhDebug);
+        var bvhDebugCount = rgCtx.GetBuffer(hBvhDebugCount);
 
-        if (
-            _visualiseBVH
-            && _bvhDebugPSO != null
-            && _bvhDebugSRB != null
-            && bvhDebug != null
-            && bvhDebugCount != null
-        )
-        {
-            _bvhDebugSRB
-                .GetVariable(_context, _bvhDebugAsset, ShaderType.Vertex, "Uniforms")
-                ?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
-            _bvhDebugSRB
-                .GetVariable(_context, _bvhDebugAsset, ShaderType.Vertex, "DebugAABBs")
-                ?.Set(
-                    bvhDebug.GetDefaultView(BufferViewType.ShaderResource),
-                    SetShaderResourceFlags.None
-                );
+        if (bvhDebug == null || bvhDebugCount == null)
+            return;
 
-            ctx.TransitionResourceStates([
-                new StateTransitionDesc
-                {
-                    Resource = bvhDebugCount,
-                    NewState = ResourceState.IndirectArgument,
-                    Flags = StateTransitionFlags.UpdateState,
-                },
-                new StateTransitionDesc
-                {
-                    Resource = bvhDebug,
-                    NewState = ResourceState.ShaderResource,
-                    Flags = StateTransitionFlags.UpdateState,
-                },
-            ]);
-
-            ctx.SetPipelineState(_bvhDebugPSO);
-            ctx.CommitShaderResources(_bvhDebugSRB, ResourceStateTransitionMode.Transition);
-            ctx.DrawIndirect(
-                new DrawIndirectAttribs
-                {
-                    AttribsBuffer = bvhDebugCount,
-                    DrawArgsOffset = 0,
-                    Flags = DrawFlags.VerifyAll,
-                    AttribsBufferStateTransitionMode = ResourceStateTransitionMode.None,
-                }
-            );
-        }
-
-        if (
-            _debugSpheres
-            && _debugCopyPSO != null
-            && _debugCopySRB != null
-            && _debugSpherePSO != null
-            && _debugSphereSRB != null
-            && visible != null
-            && drawArgs != null
-        )
-        {
-            var copyMap = ctx.MapBuffer<CopyUniforms>(
-                _copyUniformBuffer,
-                MapType.Write,
-                MapFlags.Discard
-            );
-            copyMap[0] = new CopyUniforms { SphereVertexCount = 1536 };
-            ctx.UnmapBuffer(_copyUniformBuffer, MapType.Write);
-
-            ctx.TransitionResourceStates([
-                new StateTransitionDesc
-                {
-                    Resource = drawArgs,
-                    NewState = ResourceState.UnorderedAccess,
-                    Flags = StateTransitionFlags.UpdateState,
-                },
-            ]);
-
-            _debugCopySRB
-                .GetVariable(_context, _copyAsset, ShaderType.Compute, "CopyUniforms")
-                ?.Set(_copyUniformBuffer, SetShaderResourceFlags.None);
-            _debugCopySRB
-                .GetVariable(_context, _copyAsset, ShaderType.Compute, "IndirectArgs")
-                ?.Set(
-                    drawArgs.GetDefaultView(BufferViewType.UnorderedAccess),
-                    SetShaderResourceFlags.None
-                );
-            _debugCopySRB
-                .GetVariable(_context, _copyAsset, ShaderType.Compute, "DebugArgs")
-                ?.Set(
-                    _debugIndirectArgsBuffer?.GetDefaultView(BufferViewType.UnorderedAccess),
-                    SetShaderResourceFlags.None
-                );
-
-            ctx.SetPipelineState(_debugCopyPSO);
-            ctx.CommitShaderResources(_debugCopySRB, ResourceStateTransitionMode.Transition);
-            ctx.DispatchCompute(
-                new DispatchComputeAttribs
-                {
-                    ThreadGroupCountX = 1,
-                    ThreadGroupCountY = 1,
-                    ThreadGroupCountZ = 1,
-                }
+        _bvhDebugSRB
+            .GetVariableByName(ShaderType.Vertex, "Uniforms")
+            ?.Set(drawUniformBuffer, SetShaderResourceFlags.None);
+        _bvhDebugSRB
+            .GetVariableByName(ShaderType.Vertex, "DebugAABBs")
+            ?.Set(
+                bvhDebug.GetDefaultView(BufferViewType.ShaderResource),
+                SetShaderResourceFlags.None
             );
 
-            _debugSphereSRB
-                .GetVariable(_context, _sphereAsset, ShaderType.Vertex, "DrawUniforms")
-                ?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
-            _debugSphereSRB
-                .GetVariable(_context, _sphereAsset, ShaderType.Vertex, "RequestBuffer")
-                ?.Set(
-                    visible.GetDefaultView(BufferViewType.ShaderResource),
-                    SetShaderResourceFlags.None
-                );
-            _debugSphereSRB
-                .GetVariable(_context, _sphereAsset, ShaderType.Vertex, "PageHeap")
-                ?.Set(
-                    clusterManager.PageHeap?.GetDefaultView(BufferViewType.ShaderResource),
-                    SetShaderResourceFlags.None
-                );
+        ctx.SetPipelineState(_bvhDebugPSO);
+        ctx.CommitShaderResources(_bvhDebugSRB, ResourceStateTransitionMode.Verify);
+        ctx.DrawIndirect(
+            new DrawIndirectAttribs
+            {
+                AttribsBuffer = bvhDebugCount,
+                DrawArgsOffset = 0,
+                Flags = DrawFlags.VerifyAll,
+                AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+            }
+        );
+    }
 
-            ctx.SetPipelineState(_debugSpherePSO);
-            ctx.CommitShaderResources(_debugSphereSRB, ResourceStateTransitionMode.Transition);
-            ctx.DrawIndirect(
-                new DrawIndirectAttribs
-                {
-                    AttribsBuffer = _debugIndirectArgsBuffer,
-                    AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Transition,
-                    DrawArgsOffset = 0,
-                    DrawCount = 1,
-                    Flags = DrawFlags.None,
-                }
+    public void SetupSphereCopy(RenderGraphBuilder builder, RGResourceHandle hIndirectDrawArgs, RGResourceHandle hDebugIndirectArgs, RGResourceHandle hCopyUB)
+    {
+        builder.ReadBuffer(hIndirectDrawArgs, ResourceState.UnorderedAccess); // Still read/write? Actually it's written in this pass logic but setup says Read. Let's use Write if we modify it.
+        builder.WriteBuffer(hDebugIndirectArgs, ResourceState.UnorderedAccess);
+        builder.ReadBuffer(hCopyUB, ResourceState.ConstantBuffer);
+    }
+
+    public void ExecuteSphereCopy(RenderContext context, RenderGraphContext rgCtx, RGResourceHandle hIndirectDrawArgs, RGResourceHandle hDebugIndirectArgs, IBuffer copyUniformBuffer)
+    {
+        var ctx = context.ImmediateContext;
+        if (ctx == null || _debugCopyPSO == null || _debugCopySRB == null)
+            return;
+
+        var drawArgs = rgCtx.GetBuffer(hIndirectDrawArgs);
+        var debugIndirectArgs = rgCtx.GetBuffer(hDebugIndirectArgs);
+        if (drawArgs == null || debugIndirectArgs == null)
+            return;
+
+        var copyMap = ctx.MapBuffer<CopyUniforms>(
+            copyUniformBuffer,
+            MapType.Write,
+            MapFlags.Discard
+        );
+        copyMap[0] = new CopyUniforms { SphereVertexCount = 1536 };
+        ctx.UnmapBuffer(copyUniformBuffer, MapType.Write);
+
+        _debugCopySRB
+            .GetVariableByName(ShaderType.Compute, "CopyUniforms")
+            ?.Set(copyUniformBuffer, SetShaderResourceFlags.None);
+        _debugCopySRB
+            .GetVariableByName(ShaderType.Compute, "IndirectArgs")
+            ?.Set(
+                drawArgs.GetDefaultView(BufferViewType.UnorderedAccess),
+                SetShaderResourceFlags.None
             );
-        }
+        _debugCopySRB
+            .GetVariableByName(ShaderType.Compute, "DebugArgs")
+            ?.Set(
+                debugIndirectArgs.GetDefaultView(BufferViewType.UnorderedAccess),
+                SetShaderResourceFlags.None
+            );
+
+        ctx.SetPipelineState(_debugCopyPSO);
+        ctx.CommitShaderResources(_debugCopySRB, ResourceStateTransitionMode.Verify);
+        ctx.DispatchCompute(
+            new DispatchComputeAttribs
+            {
+                ThreadGroupCountX = 1,
+                ThreadGroupCountY = 1,
+                ThreadGroupCountZ = 1,
+            }
+        );
+    }
+
+    public void SetupSphereDraw(RenderGraphBuilder builder, RGResourceHandle hVisibleClusters, RGResourceHandle hDebugIndirectArgs, RGResourceHandle hDrawUB, RGResourceHandle hPageHeap, RGResourceHandle hColor, RGResourceHandle hDepth)
+    {
+        builder.ReadBuffer(hVisibleClusters, ResourceState.ShaderResource);
+        builder.ReadBuffer(hDebugIndirectArgs, ResourceState.IndirectArgument);
+        builder.ReadBuffer(hDrawUB, ResourceState.ConstantBuffer);
+        builder.ReadBuffer(hPageHeap, ResourceState.ShaderResource);
+        builder.WriteTexture(hColor, ResourceState.RenderTarget);
+        builder.WriteTexture(hDepth, ResourceState.DepthWrite);
+    }
+
+    public void ExecuteSphereDraw(RenderContext context, RenderGraphContext rgCtx, RGResourceHandle hVisibleClusters, RGResourceHandle hDebugIndirectArgs, RGResourceHandle hPageHeap, IBuffer drawUniformBuffer)
+    {
+        var ctx = context.ImmediateContext;
+        if (ctx == null || _debugSpherePSO == null || _debugSphereSRB == null)
+            return;
+
+        var visible = rgCtx.GetBuffer(hVisibleClusters);
+        var debugIndirectArgs = rgCtx.GetBuffer(hDebugIndirectArgs);
+        var pageHeap = rgCtx.GetBuffer(hPageHeap);
+
+        if (visible == null || debugIndirectArgs == null || pageHeap == null)
+            return;
+
+        _debugSphereSRB
+            .GetVariableByName(ShaderType.Vertex, "DrawUniforms")
+            ?.Set(drawUniformBuffer, SetShaderResourceFlags.None);
+        _debugSphereSRB
+            .GetVariableByName(ShaderType.Vertex, "RequestBuffer")
+            ?.Set(
+                visible.GetDefaultView(BufferViewType.ShaderResource),
+                SetShaderResourceFlags.None
+            );
+        _debugSphereSRB
+            .GetVariableByName(ShaderType.Vertex, "PageHeap")
+            ?.Set(
+                pageHeap.GetDefaultView(BufferViewType.ShaderResource),
+                SetShaderResourceFlags.None
+            );
+
+        ctx.SetPipelineState(_debugSpherePSO);
+        ctx.CommitShaderResources(_debugSphereSRB, ResourceStateTransitionMode.Verify);
+        ctx.DrawIndirect(
+            new DrawIndirectAttribs
+            {
+                AttribsBuffer = debugIndirectArgs,
+                AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+                DrawArgsOffset = 0,
+                DrawCount = 1,
+                Flags = DrawFlags.None,
+            }
+        );
     }
 
     public void Dispose()
@@ -369,6 +332,5 @@ public class ClusterDebugPass(RenderContext context, ClusterResourceManager clus
         _debugCopyPSO?.Dispose();
         _debugSphereSRB?.Dispose();
         _debugSpherePSO?.Dispose();
-        _debugIndirectArgsBuffer?.Dispose();
     }
 }

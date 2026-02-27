@@ -17,6 +17,7 @@ public abstract class RGResource(string name)
     public string Name { get; private set; } = name;
     public RGResourceHandle Handle { get; internal set; }
     public bool IsImported { get; internal set; } // Imported external resource (e.g. BackBuffer)
+    public bool IsExternal { get; internal set; } // Lifetime owned by caller (registered or extracted)
 
     // State tracking
     public ResourceState InitialState { get; internal set; } = ResourceState.Undefined;

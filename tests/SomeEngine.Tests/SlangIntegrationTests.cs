@@ -97,21 +97,18 @@ public class SlangIntegrationTests
             // Check gParams
             var gParams = reflection.Resources!.FirstOrDefault(r => r.Name == "gParams");
             Assert.That(gParams, Is.Not.Null);
-            Assert.That(gParams!.Binding, Is.GreaterThanOrEqualTo(0));
-            Assert.That(gParams.Set, Is.GreaterThanOrEqualTo(0));
             Assert.That((gParams.Stages & 0x02) != 0, Is.True, "Should be visible in Pixel stage (0x02)");
 
             // Check gTexture
             var gTexture = reflection.Resources.FirstOrDefault(r => r.Name == "gTexture");
             Assert.That(gTexture, Is.Not.Null);
-            Assert.That(gTexture!.Binding, Is.GreaterThanOrEqualTo(0));
-            Assert.That(gTexture.Set, Is.GreaterThanOrEqualTo(0));
+            Assert.That((gTexture!.Stages & 0x02) != 0, Is.True, "Should be visible in Pixel stage (0x02)");
 
             // Print all resources for manual verification
             TestContext.Out.WriteLine($"--- Layout for {asset.Name} ---");
             foreach (var r in reflection.Resources)
             {
-                TestContext.Out.WriteLine($"  Name: {r.Name}, Category: {r.Category}, Set: {r.Set}, Binding: {r.Binding}");
+                TestContext.Out.WriteLine($"  Name: {r.Name}, Stages: 0x{r.Stages:X}");
             }
         }
         finally

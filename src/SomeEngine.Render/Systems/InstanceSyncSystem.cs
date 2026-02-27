@@ -23,6 +23,9 @@ public class InstanceSyncSystem : QuerySystem<TransformQvvs, MeshInstance>
     public IBuffer? GlobalInstanceHeaderBuffer => _headerBuffer;
     public int Count { get; private set; }
 
+    public Span<GpuTransform> CpuTransforms => _cpuTransforms.AsSpan(0, Count);
+    public Span<GpuInstanceHeader> CpuHeaders => _cpuHeaders.AsSpan(0, Count);
+
     public InstanceSyncSystem(RenderContext renderContext)
     {
         _renderContext = renderContext;
@@ -55,9 +58,6 @@ public class InstanceSyncSystem : QuerySystem<TransformQvvs, MeshInstance>
         }
 
         Count = count;
-
-        if (Count > 0)
-            UploadBuffers();
     }
 
     private void EnsureCapacity(int needed)
@@ -104,40 +104,6 @@ public class InstanceSyncSystem : QuerySystem<TransformQvvs, MeshInstance>
                 ElementByteStride = GpuInstanceHeader.SizeInBytes,
             }
         );
-    }
-
-    private unsafe void UploadBuffers()
-    {
-        if (
-            _transformBuffer == null
-            || _headerBuffer == null
-            || _renderContext.ImmediateContext == null
-        )
-            return;
-
-        uint transformSize = (uint)(Count * GpuTransform.SizeInBytes);
-        fixed (GpuTransform* pT = _cpuTransforms)
-        {
-            _renderContext.ImmediateContext.UpdateBuffer(
-                _transformBuffer,
-                0,
-                transformSize,
-                (IntPtr)pT,
-                ResourceStateTransitionMode.Transition
-            );
-        }
-
-        uint headerSize = (uint)(Count * GpuInstanceHeader.SizeInBytes);
-        fixed (GpuInstanceHeader* pH = _cpuHeaders)
-        {
-            _renderContext.ImmediateContext.UpdateBuffer(
-                _headerBuffer,
-                0,
-                headerSize,
-                (IntPtr)pH,
-                ResourceStateTransitionMode.Transition
-            );
-        }
     }
 
     public void Dispose()

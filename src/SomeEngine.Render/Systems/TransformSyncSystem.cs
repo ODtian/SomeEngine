@@ -15,18 +15,20 @@ public class TransformSyncSystem : QuerySystem<TransformQvvs>
     private IBuffer? _gpuBuffer; // The StructuredBuffer on GPU
     private GpuTransform[] _cpuBuffer; // Shadow copy for updates
     private int _capacity = 1024;
-    
+
     // Mapping from Entity ID to Index in buffer
     // For now, we might just compact it every frame or use a component to store index
     // Using a component 'GpuIndex' is better for stability.
     // However, if we want to "upload only changes", we need a persistent mapping.
-    
+
     // Let's use a simple strategy: Growable list.
     // Entities need to know their index.
     // We can add a component 'GpuTransformIndex'.
 
     public IBuffer? GlobalTransformBuffer => _gpuBuffer;
     public int Count { get; private set; } = 0;
+
+    public Span<GpuTransform> CpuTransforms => _cpuBuffer.AsSpan(0, Count);
 
     public TransformSyncSystem(RenderContext renderContext)
     {
@@ -38,14 +40,14 @@ public class TransformSyncSystem : QuerySystem<TransformQvvs>
     {
         // Simple full sync for phase 1.
         // In phase 2 we will optimize this.
-        
+
         // 1. Collect all transforms
         // We can access the chunks directly for speed?
         // Query.Chunks...
-        
+
         int count = Query.Count;
         EnsureCapacity(count);
-        
+
         int index = 0;
         foreach (var (components, _) in Query.Chunks)
         {
@@ -55,24 +57,18 @@ public class TransformSyncSystem : QuerySystem<TransformQvvs>
                 _cpuBuffer[index++] = GpuTransform.FromQvvs(transforms[i]);
             }
         }
-        
+
         Count = count;
-        
-        // 2. Upload to GPU
-        // If count > 0
-        if (Count > 0)
-        {
-            UploadBuffer();
-        }
     }
 
     private void EnsureCapacity(int needed)
     {
         if (needed > _capacity)
         {
-            while (_capacity < needed) _capacity *= 2;
+            while (_capacity < needed)
+                _capacity *= 2;
             Array.Resize(ref _cpuBuffer, _capacity);
-            
+
             // Re-create GPU buffer
             CreateBuffer(_capacity);
         }
@@ -85,7 +81,7 @@ public class TransformSyncSystem : QuerySystem<TransformQvvs>
     private void CreateBuffer(int size)
     {
         _gpuBuffer?.Dispose();
-        
+
         BufferDesc desc = new BufferDesc
         {
             Name = "Global Transform Buffer",
@@ -93,26 +89,10 @@ public class TransformSyncSystem : QuerySystem<TransformQvvs>
             Usage = Usage.Default,
             BindFlags = BindFlags.ShaderResource,
             Mode = BufferMode.Structured,
-            ElementByteStride = GpuTransform.SizeInBytes
+            ElementByteStride = GpuTransform.SizeInBytes,
         };
-        
+
         _gpuBuffer = _renderContext.Device?.CreateBuffer(desc);
-    }
-
-    private unsafe void UploadBuffer()
-    {
-        if (_gpuBuffer == null || _renderContext.ImmediateContext == null) return;
-
-        // Using UpdateBuffer for now. 
-        // For large buffers, Map/Unmap (Dynamic) or Staging Buffer is better.
-        // Start with UpdateBuffer for simplicity.
-        
-        uint dataSize = (uint)(Count * GpuTransform.SizeInBytes);
-        
-        fixed (GpuTransform* pData = _cpuBuffer)
-        {
-            _renderContext.ImmediateContext.UpdateBuffer(_gpuBuffer, 0, dataSize, (IntPtr)pData, ResourceStateTransitionMode.Transition);
-        }
     }
 
     public void Dispose()

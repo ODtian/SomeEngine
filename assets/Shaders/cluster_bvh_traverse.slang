@@ -18,6 +18,13 @@ struct CullingUniforms
     uint VisualiseBVH;  // 108
     int DebugBVHDepth;  // 112
     uint CurrentDepth;  // 116
+    uint Pad4;
+    uint Pad5;
+
+    float4x4 PrevViewProj;
+    uint HasPrevHistory;
+    uint HiZMipCount;
+    float2 HiZInvSize;
 };
 
 ConstantBuffer<CullingUniforms> Uniforms;
@@ -216,6 +223,15 @@ void UpdateArgs(uint3 id: SV_DispatchThreadID)
     NextDispatchArgs.Store(0, groups);
     NextDispatchArgs.Store(4, 1);
     NextDispatchArgs.Store(8, 1);
+}
+
+[numthreads(1, 1, 1)]
+void ClearArgs(uint3 id: SV_DispatchThreadID)
+{
+    NextDispatchArgs.Store(0, 0);
+    NextDispatchArgs.Store(4, 1);
+    NextDispatchArgs.Store(8, 1);
+    NextDispatchArgs.Store(12, 0);
 }
 
 [numthreads(64, 1, 1)]

@@ -61,12 +61,21 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
             Size = (ulong)(vertData.Length * sizeof(float)),
         };
         _vb = device!.CreateBuffer(vbDesc);
+        _context.ImmediateContext!.TransitionResourceStates([
+            new StateTransitionDesc {
+                Resource = _vb,
+                OldState = ResourceState.Unknown,
+                NewState = ResourceState.CopyDest,
+                Flags = StateTransitionFlags.UpdateState
+            }
+        ]);
         _context.ImmediateContext!.UpdateBuffer(
             _vb,
             0,
             vertData,
-            ResourceStateTransitionMode.Transition
+            ResourceStateTransitionMode.Verify
         );
+
         var ibDesc = new BufferDesc
         {
             Name = "SimpleMesh IB",
@@ -75,12 +84,35 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
             Size = (ulong)(indices.Length * sizeof(uint)),
         };
         _ib = device!.CreateBuffer(ibDesc);
+        _context.ImmediateContext!.TransitionResourceStates([
+            new StateTransitionDesc {
+                Resource = _ib,
+                OldState = ResourceState.Unknown,
+                NewState = ResourceState.CopyDest,
+                Flags = StateTransitionFlags.UpdateState
+            }
+        ]);
         _context.ImmediateContext!.UpdateBuffer(
             _ib,
             0,
             indices,
-            ResourceStateTransitionMode.Transition
+            ResourceStateTransitionMode.Verify
         );
+
+        _context.ImmediateContext!.TransitionResourceStates([
+            new StateTransitionDesc {
+                Resource = _vb,
+                OldState = ResourceState.CopyDest,
+                NewState = ResourceState.VertexBuffer,
+                Flags = StateTransitionFlags.UpdateState
+            },
+            new StateTransitionDesc {
+                Resource = _ib,
+                OldState = ResourceState.CopyDest,
+                NewState = ResourceState.IndexBuffer,
+                Flags = StateTransitionFlags.UpdateState
+            }
+        ]);
 
         var cbDesc = new BufferDesc
         {
@@ -144,14 +176,13 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
                     DefaultVariableType = Diligent.ShaderResourceVariableType.Mutable,
                     Variables = shaderAsset.GetResourceVariables(
                         _context,
-                        (name, cat) =>
+                        name =>
                         {
                             if (
                                 name.Contains("Uniforms")
                                 || name == "Uniforms"
                                 || name == "Constants"
                                 || name == "g_Constants"
-                                || cat == ShaderResourceCategory.ConstantBuffer
                             )
                                 return Diligent.ShaderResourceVariableType.Static;
                             return null;
@@ -186,8 +217,7 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
         if (_pso == null)
             throw new Exception("Failed to create SimpleMesh PSO");
 
-        _pso!
-            .GetStaticVariable(_context, shaderAsset, ShaderType.Vertex, "g_Constants")
+        _pso!.GetStaticVariableByName(ShaderType.Vertex, "g_Constants")
             ?.Set(_cb!, SetShaderResourceFlags.None);
         _srb = _pso!.CreateShaderResourceBinding(true);
     }
@@ -209,9 +239,9 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
         if (rtv == null || dsv == null)
             return;
 
-        ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Transition);
+        ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Verify);
         ctx.SetPipelineState(_pso);
-        ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Transition);
+        ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Verify);
 
         {
             float time = (float)(DateTime.Now.Ticks / 10000000.0);
@@ -239,10 +269,10 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
             0,
             [_vb],
             offsets,
-            ResourceStateTransitionMode.Transition,
+            ResourceStateTransitionMode.Verify,
             SetVertexBuffersFlags.None
         );
-        ctx.SetIndexBuffer(_ib, 0, ResourceStateTransitionMode.Transition);
+        ctx.SetIndexBuffer(_ib, 0, ResourceStateTransitionMode.Verify);
 
         var drawAttrs = new DrawIndexedAttribs
         {

@@ -23,11 +23,13 @@ public class ClusterDrawPass(
     private IShaderResourceBinding? _drawOverdrawSRB;
     private bool _initialized;
 
-    public RGResourceHandle HVisibleClusters,
-        HIndirectDrawArgs;
-    public RGResourceHandle HColorTarget,
-        HDepthTarget;
-    public RGResourceHandle HDrawUniforms;
+    public RGResourceHandle HVisibleClusters = RGResourceHandle.Invalid,
+        HIndirectDrawArgs = RGResourceHandle.Invalid;
+    public RGResourceHandle HColorTarget = RGResourceHandle.Invalid,
+        HDepthTarget = RGResourceHandle.Invalid;
+    public RGResourceHandle HDrawUniforms = RGResourceHandle.Invalid;
+    public RGResourceHandle HGlobalTransformBuffer = RGResourceHandle.Invalid;
+    public RGResourceHandle HPageHeap = RGResourceHandle.Invalid;
 
     private ClusterDebugMode _debugMode;
     private bool _wireframe,
@@ -76,7 +78,7 @@ public class ClusterDrawPass(
                     DefaultVariableType = ShaderResourceVariableType.Mutable,
                     Variables = _drawAsset.GetResourceVariables(
                         context,
-                        (name, cat) =>
+                        name =>
                             (name == "RequestBuffer" || name == "Instances")
                                 ? ShaderResourceVariableType.Dynamic
                                 : null
@@ -138,6 +140,8 @@ public class ClusterDrawPass(
         builder.ReadBuffer(HVisibleClusters, ResourceState.ShaderResource);
         builder.ReadBuffer(HIndirectDrawArgs, ResourceState.IndirectArgument);
         builder.ReadBuffer(HDrawUniforms, ResourceState.ConstantBuffer);
+        builder.ReadBuffer(HGlobalTransformBuffer, ResourceState.ShaderResource);
+        builder.ReadBuffer(HPageHeap, ResourceState.ShaderResource);
         builder.WriteTexture(HColorTarget, ResourceState.RenderTarget);
         builder.WriteTexture(HDepthTarget, ResourceState.DepthWrite);
     }
@@ -173,23 +177,23 @@ public class ClusterDrawPass(
         if (pso == null || srb == null)
             return;
 
-        srb.GetVariable(context, _drawAsset, ShaderType.Vertex, "Uniforms")
+        srb.GetVariableByName(ShaderType.Vertex, "Uniforms")
             ?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
-        srb.GetVariable(context, _drawAsset, ShaderType.Pixel, "Uniforms")
+        srb.GetVariableByName(ShaderType.Pixel, "Uniforms")
             ?.Set(_drawUniformBuffer, SetShaderResourceFlags.None);
-        srb.GetVariable(context, _drawAsset, ShaderType.Vertex, "RequestBuffer")
+        srb.GetVariableByName(ShaderType.Vertex, "RequestBuffer")
             ?.Set(
                 visible.GetDefaultView(BufferViewType.ShaderResource),
                 SetShaderResourceFlags.None
             );
-        srb.GetVariable(context, _drawAsset, ShaderType.Vertex, "PageHeap")
+        srb.GetVariableByName(ShaderType.Vertex, "PageHeap")
             ?.Set(
                 clusterManager.PageHeap?.GetDefaultView(BufferViewType.ShaderResource),
                 SetShaderResourceFlags.None
             );
 
         if (transformSystem.GlobalTransformBuffer != null)
-            srb.GetVariable(context, _drawAsset, ShaderType.Vertex, "Instances")
+            srb.GetVariableByName(ShaderType.Vertex, "Instances")
                 ?.Set(
                     transformSystem.GlobalTransformBuffer.GetDefaultView(
                         BufferViewType.ShaderResource
@@ -198,14 +202,14 @@ public class ClusterDrawPass(
                 );
 
         ctx.SetPipelineState(pso);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Transition);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
         ctx.DrawIndirect(
             new DrawIndirectAttribs
             {
                 AttribsBuffer = drawArgs,
                 DrawArgsOffset = 0,
                 Flags = DrawFlags.VerifyAll,
-                AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Transition,
+                AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
             }
         );
     }

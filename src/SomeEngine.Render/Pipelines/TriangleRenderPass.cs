@@ -21,21 +21,17 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
         if (_psoInitialized)
             return;
 
-        // ... Same PSO creation logic as HelloTrianglePass ...
-        // Re-using logic to avoid duplication would be good, but for now specific.
-        // Actually, let's copy the logic.
-
         var device = context.Device;
         if (device == null)
             return;
 
         // Shaders
-        var shaderPath = Path.Combine(
-            AppContext.BaseDirectory,
-            "../../../../../assets/Shaders/triangle.hlsl"
+        var shaderPath = Path.GetFullPath(
+            Path.Combine(
+                AppContext.BaseDirectory,
+                "../../../../../../assets/Shaders/triangle.hlsl"
+            )
         );
-        if (!File.Exists(shaderPath))
-            shaderPath = "triangle.hlsl";
 
         using var shaderSourceFactory = context.Factory?.CreateDefaultShaderSourceStreamFactory(
             "assets/Shaders"
@@ -65,7 +61,7 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
         {
             PSODesc = new PipelineStateDesc
             {
-                Name = "Hello Triangle PSO",
+                Name = "Triangle Render PSO",
                 PipelineType = PipelineType.Graphics,
                 ResourceLayout = new PipelineResourceLayoutDesc
                 {
@@ -98,7 +94,8 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
         };
 
         _pso = device.CreateGraphicsPipelineState(psoCI);
-        _srb = _pso.CreateShaderResourceBinding(true);
+        if (_pso != null)
+            _srb = _pso.CreateShaderResourceBinding(true);
         _psoInitialized = true;
     }
 
@@ -138,18 +135,18 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
 
         var dsv = context.SwapChain!.GetDepthBufferDSV(); // Using swapchain depth for now
 
-        ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Transition);
+        ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Verify);
         ctx.ClearRenderTarget(
             rtv,
             new System.Numerics.Vector4(0.2f, 0.2f, 0.2f, 1.0f),
-            ResourceStateTransitionMode.Transition
+            ResourceStateTransitionMode.Verify
         );
         ctx.ClearDepthStencil(
             dsv,
             ClearDepthStencilFlags.Depth,
             1.0f,
             0,
-            ResourceStateTransitionMode.Transition
+            ResourceStateTransitionMode.Verify
         );
 
         ctx.SetPipelineState(_pso);
@@ -160,13 +157,7 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
             && TransformSystem.Count > 0
         )
         {
-            // Update Binding by slot
-            var varTransforms = _srb?.GetVariableByBinding(
-                ShaderType.Vertex,
-                0,
-                0,
-                ShaderResourceType.BufferSrv
-            );
+            var varTransforms = _srb?.GetVariableByName(ShaderType.Vertex, "Transforms");
             if (varTransforms != null && TransformSystem.GlobalTransformBuffer != null)
             {
                 varTransforms.Set(
@@ -177,7 +168,7 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
                 );
             }
             if (_srb != null)
-                ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Transition);
+                ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Verify);
 
             // Draw instances
             ctx.Draw(

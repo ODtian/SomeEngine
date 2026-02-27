@@ -20,7 +20,7 @@ public class SlangNoMangleTests
     [Test]
     public unsafe void TestSlangNoMangleHlslExport()
     {
-        string slangFilePath = @"d:\SomeEngine\assets\Shaders\cluster_draw.slang";
+        string slangFilePath = @"d:\SomeEngine\assets\Shaders\simple_mesh.slang";
 
         Assert.That(
             File.Exists(slangFilePath),
@@ -34,16 +34,16 @@ public class SlangNoMangleTests
 
         var options = new[]
         {
-            new CompilerOptionEntry(CompilerOptionName.NoMangle, CompilerOptionValue.FromInt(1)),
+            new CompilerOptionEntry(CompilerOptionName.NoMangle, CompilerOptionValue.FromInt(1, 0)),
             new CompilerOptionEntry(
                 CompilerOptionName.VulkanEmitReflection,
-                CompilerOptionValue.FromInt(1)
+                CompilerOptionValue.FromInt(1, 0)
             ),
         };
 
         var target = new TargetDesc
         {
-            Format = SlangCompileTarget.DxilAsm,
+            Format = SlangCompileTarget.Hlsl,
             Profile = profile,
             CompilerOptionEntries = options,
         };
@@ -51,12 +51,12 @@ public class SlangNoMangleTests
         // 2. Create Session
         var sessionDesc = new SessionDesc
         {
-            Targets = new[] { target },
-            SearchPaths = new[] { Path.GetDirectoryName(slangFilePath)! },
+            Targets = [target],
+            SearchPaths = [Path.GetDirectoryName(slangFilePath)!],
+            CompilerOptionEntries = options,
         };
 
         var res = _globalSession.CreateSession(sessionDesc, out var session);
-
         Assert.That(session, Is.Not.Null);
 
         // 3. Load Module
@@ -76,14 +76,14 @@ public class SlangNoMangleTests
         }
 
         // 4. Link for VSMain and PSMain
-        string[] entryPoints = { "VSMain", "PSMain" };
+        string[] entryPoints = ["VSMain", "PSMain"];
         foreach (var epName in entryPoints)
         {
             module!.FindEntryPointByName(epName, out var entryPoint);
             Assert.That(entryPoint, Is.Not.Null, $"Entry point {epName} not found");
 
             session.CreateCompositeComponentType(
-                new[] { (IComponentType)module, entryPoint },
+                [module, entryPoint],
                 out var composedLine,
                 out var diag1
             );
@@ -101,10 +101,10 @@ public class SlangNoMangleTests
             Assert.That(
                 codeBlob,
                 Is.Not.Null,
-                $"Failed to get code for {epName}: {GetString(diag3)}"
+                $"Failed to get code for {epName}: {diag3?.AsString}"
             );
 
-            string hlslCode = GetString(codeBlob)!;
+            var hlslCode = codeBlob.AsString;
 
             TestContext.Out.WriteLine($"--- Decompiled ASM Code for {epName} ---");
             TestContext.Out.WriteLine(hlslCode);

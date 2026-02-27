@@ -177,15 +177,15 @@ public class ClusterResourceManager : IDisposable
         using var cs = _patchShaderAsset.CreateShader(_context, "main");
         ci.Cs = cs;
         ci.PSODesc.ResourceLayout.DefaultVariableType = ShaderResourceVariableType.Mutable;
-        ci.PSODesc.ResourceLayout.Variables = _patchShaderAsset.GetResourceVariables(_context, static (name, cat) => null);
+        ci.PSODesc.ResourceLayout.Variables = _patchShaderAsset.GetResourceVariables(_context, static name => null);
 
         _patchPSO = _context.Device.CreateComputePipelineState(ci);
         if (_patchPSO != null)
         {
             _patchSRB = _patchPSO.CreateShaderResourceBinding(false);
-            _patchSRB.GetVariable(_context, _patchShaderAsset, ShaderType.Compute, "GlobalBVH")?.Set(GlobalBVHBuffer?.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-            _patchSRB.GetVariable(_context, _patchShaderAsset, ShaderType.Compute, "Uniforms")?.Set(_patchUniformsBuffer, SetShaderResourceFlags.None);
-            _patchSRB.GetVariable(_context, _patchShaderAsset, ShaderType.Compute, "NodeIndices")?.Set(_patchNodeIndicesBuffer?.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+            _patchSRB.GetVariableByName(ShaderType.Compute, "GlobalBVH")?.Set(GlobalBVHBuffer?.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+            _patchSRB.GetVariableByName(ShaderType.Compute, "Uniforms")?.Set(_patchUniformsBuffer, SetShaderResourceFlags.None);
+            _patchSRB.GetVariableByName(ShaderType.Compute, "NodeIndices")?.Set(_patchNodeIndicesBuffer?.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
         }
 
 
@@ -212,7 +212,13 @@ public class ClusterResourceManager : IDisposable
         // 1. Update Uniforms
         uint offsetVal = resident ? byteOffset : ClusterBVHNode.PageFaultMarker;
         var uniforms = new PatchUniforms { NodeCount = (uint)nodes.Count, NewPagePointer = offsetVal, Pad0 = 0, Pad1 = 0 };
-        _context.ImmediateContext.UpdateBuffer(_patchUniformsBuffer, 0, new PatchUniforms[] { uniforms }.AsSpan(), ResourceStateTransitionMode.Transition);
+        _context.ImmediateContext.TransitionResourceStates([
+            new StateTransitionDesc { Resource = _patchUniformsBuffer, OldState = ResourceState.Unknown, NewState = ResourceState.CopyDest, Flags = StateTransitionFlags.UpdateState }
+        ]);
+        _context.ImmediateContext.UpdateBuffer(_patchUniformsBuffer, 0, new PatchUniforms[] { uniforms }.AsSpan(), ResourceStateTransitionMode.Verify);
+        _context.ImmediateContext.TransitionResourceStates([
+            new StateTransitionDesc { Resource = _patchUniformsBuffer, OldState = ResourceState.Unknown, NewState = ResourceState.ConstantBuffer, Flags = StateTransitionFlags.UpdateState }
+        ]);
 
         // 2. Map & Write Node Indices
         unsafe
@@ -232,7 +238,7 @@ public class ClusterResourceManager : IDisposable
                     Mode = BufferMode.Structured,
                     ElementByteStride = 4
                 });
-                _patchSRB.GetVariable(_context, _patchShaderAsset, ShaderType.Compute, "NodeIndices")?.Set(_patchNodeIndicesBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+                _patchSRB.GetVariableByName(ShaderType.Compute, "NodeIndices")?.Set(_patchNodeIndicesBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
             }
 
             var map = _context.ImmediateContext.MapBuffer<uint>(_patchNodeIndicesBuffer, MapType.Write, MapFlags.Discard);
@@ -242,7 +248,7 @@ public class ClusterResourceManager : IDisposable
 
         // 3. Dispatch
         _context.ImmediateContext.SetPipelineState(_patchPSO);
-        _context.ImmediateContext.CommitShaderResources(_patchSRB, ResourceStateTransitionMode.Transition);
+        _context.ImmediateContext.CommitShaderResources(_patchSRB, ResourceStateTransitionMode.Verify);
         uint groups = ((uint)nodes.Count + 63) / 64;
         _context.ImmediateContext.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = groups, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
 
@@ -474,7 +480,13 @@ public class ClusterResourceManager : IDisposable
         {
             fixed (ClusterBVHNode* ptr = data)
             {
-                _context.ImmediateContext.UpdateBuffer(GlobalBVHBuffer, offset, (uint)(data.Length * 64), (IntPtr)ptr, ResourceStateTransitionMode.Transition);
+                _context.ImmediateContext.TransitionResourceStates([
+                    new StateTransitionDesc { Resource = GlobalBVHBuffer, OldState = ResourceState.Unknown, NewState = ResourceState.CopyDest, Flags = StateTransitionFlags.UpdateState }
+                ]);
+                _context.ImmediateContext.UpdateBuffer(GlobalBVHBuffer, offset, (uint)(data.Length * 64), (IntPtr)ptr, ResourceStateTransitionMode.Verify);
+                _context.ImmediateContext.TransitionResourceStates([
+                    new StateTransitionDesc { Resource = GlobalBVHBuffer, OldState = ResourceState.Unknown, NewState = ResourceState.ShaderResource, Flags = StateTransitionFlags.UpdateState }
+                ]);
             }
         }
     }
@@ -648,7 +660,13 @@ public class ClusterResourceManager : IDisposable
         {
             fixed (byte* ptr = data)
             {
-                _context.ImmediateContext.UpdateBuffer(PageHeap, offset, (uint)data.Length, (IntPtr)ptr, ResourceStateTransitionMode.Transition);
+                _context.ImmediateContext.TransitionResourceStates([
+                    new StateTransitionDesc { Resource = PageHeap, OldState = ResourceState.Unknown, NewState = ResourceState.CopyDest, Flags = StateTransitionFlags.UpdateState }
+                ]);
+                _context.ImmediateContext.UpdateBuffer(PageHeap, offset, (uint)data.Length, (IntPtr)ptr, ResourceStateTransitionMode.Verify);
+                _context.ImmediateContext.TransitionResourceStates([
+                    new StateTransitionDesc { Resource = PageHeap, OldState = ResourceState.Unknown, NewState = ResourceState.ShaderResource, Flags = StateTransitionFlags.UpdateState }
+                ]);
             }
         }
     }

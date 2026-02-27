@@ -69,17 +69,13 @@ internal class RGMemoryHeap : IDisposable
     {
         offset = 0;
 
-        // Find all existing allocations that overlap in lifetime
+        // Conservative mode: treat all existing allocations as overlapping.
+        // This avoids placed-resource aliasing hazards and keeps each resource
+        // at a unique heap address.
         var overlappingAllocs = new List<AllocationEntry>();
         foreach (var alloc in _allocations)
         {
-            // Two lifetimes overlap if the start of one is before or at the end of the other,
-            // AND the end of one is after or at the start of the other.
-            // (Assuming pass indices are inclusive)
-            if (firstPassIndex <= alloc.LastPassIndex && lastPassIndex >= alloc.FirstPassIndex)
-            {
-                overlappingAllocs.Add(alloc);
-            }
+            overlappingAllocs.Add(alloc);
         }
 
         // Sort overlapping allocations by offset to find gaps
