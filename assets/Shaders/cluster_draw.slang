@@ -79,7 +79,8 @@ struct GPUCluster
 // Helper to load partial cluster info needed for draw
 void LoadClusterInfo(uint pageOffset, uint clusterId, out float3 center, out float radius, out uint vStart, out uint tStart, out uint packedCounts)
 {
-    uint clusterOffset = pageOffset + 32 + clusterId * 52; // Header is 32 bytes, Stride 52
+    uint clustersOffset = PageHeap.Load(pageOffset + 16);
+    uint clusterOffset = pageOffset + clustersOffset + clusterId * 52;
 
     // 1. Center (0), Radius (12)
     float4 v0 = asfloat(PageHeap.Load4(clusterOffset));
@@ -126,15 +127,8 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
     uint packedCounts;
     LoadClusterInfo(pageOffset, clusterID, center, radius, vStart, tStart, packedCounts);
 
-    // 5. Get Triangle Count from Cluster (We need to discard if vertexID out of range)
-    // Optimization: Read PackedCounts at correct offset (56)
-    // uint clusterOffset = pageOffset + 32 + clusterID * 60;
-    // uint packedCounts = PageHeap.Load(clusterOffset + 56);
+    // 5. Get triangle count from packed cluster counts.
     // [VertexCount:8][TriangleCount:8][LODLevel:8][Pad:8]
-    // packedCounts is uint at offset 56.
-    // Wait, struct says offset 48 + 8 = 56.
-    // In LoadClusterInfo above, we loaded offset 48+8 -> offset 56. Correct.
-
     uint triCount = (packedCounts >> 8) & 0xFF;
 
     output.ClusterID = clusterID; // Pass to PS for debug

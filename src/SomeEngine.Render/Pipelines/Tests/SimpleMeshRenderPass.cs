@@ -194,7 +194,7 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
             {
                 NumRenderTargets = 1,
                 RTVFormats = [_context.SwapChain!.GetDesc().ColorBufferFormat],
-                DSVFormat = _context.SwapChain!.GetDesc().DepthBufferFormat,
+                DSVFormat = TextureFormat.D32_Float,
                 PrimitiveTopology = PrimitiveTopology.TriangleList,
                 RasterizerDesc = new RasterizerStateDesc
                 {
@@ -235,7 +235,7 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
         if (swapChain == null)
             return;
         var rtv = swapChain.GetCurrentBackBufferRTV();
-        var dsv = swapChain.GetDepthBufferDSV();
+        var dsv = _context.DepthBufferDSV!;
         if (rtv == null || dsv == null)
             return;
 

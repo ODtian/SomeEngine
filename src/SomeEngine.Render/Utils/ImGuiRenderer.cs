@@ -20,6 +20,7 @@ public unsafe class ImGuiRenderer : IDisposable
     private IPipelineState? _pso;
     private IShaderResourceBinding? _srb;
     private ITexture? _fontTexture;
+    public ITexture? FontTexture => _fontTexture;
     private ITextureView? _fontTextureView;
     private ISampler? _sampler;
 
@@ -68,14 +69,6 @@ public unsafe class ImGuiRenderer : IDisposable
         };
 
         _fontTexture = device.CreateTexture(texDesc, data);
-        _context.ImmediateContext!.TransitionResourceStates([
-            new StateTransitionDesc {
-                Resource = _fontTexture,
-                OldState = ResourceState.Unknown,
-                NewState = ResourceState.ShaderResource,
-                Flags = StateTransitionFlags.UpdateState
-            }
-        ]);
 
         TextureViewDesc viewDesc = new TextureViewDesc {
             ViewType = TextureViewType.ShaderResource,
@@ -169,8 +162,7 @@ public unsafe class ImGuiRenderer : IDisposable
         psoCI.GraphicsPipeline.NumRenderTargets = 1;
         psoCI.GraphicsPipeline.RTVFormats =
             [_context.SwapChain!.GetDesc().ColorBufferFormat];
-        psoCI.GraphicsPipeline.DSVFormat =
-            _context.SwapChain!.GetDesc().DepthBufferFormat;
+        psoCI.GraphicsPipeline.DSVFormat = TextureFormat.Unknown;
         psoCI.GraphicsPipeline.PrimitiveTopology = PrimitiveTopology.TriangleList;
 
         psoCI.GraphicsPipeline.RasterizerDesc.CullMode = CullMode.None;

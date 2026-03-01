@@ -25,6 +25,9 @@ public class HiZBuildPass(RenderContext context) : IDisposable
     private ITexture? _cachedHiZTexture;
     private uint _cachedMipCount;
 
+    private readonly List<List<IDisposable>> _disposeQueue = [new(), new(), new(), new()];
+    private int _frameIndex = 0;
+
     public void Init()
     {
         if (_initialized)
@@ -106,7 +109,13 @@ public class HiZBuildPass(RenderContext context) : IDisposable
     }
 
     public void ExecuteMip0(RenderContext context, RenderGraphContext rgCtx, RGResourceHandle hDepth, RGResourceHandle hHiZ)
-    {
+    {        _frameIndex++;
+        int oldFrame = _frameIndex % _disposeQueue.Count;
+        foreach (var obj in _disposeQueue[oldFrame])
+        {
+            obj.Dispose();
+        }
+        _disposeQueue[oldFrame].Clear();
         if (_buildMip0PSO == null || _buildMip0SRB == null)
             return;
 
@@ -142,7 +151,6 @@ public class HiZBuildPass(RenderContext context) : IDisposable
 
     public void SetupDownsample(RenderGraphBuilder builder, RGResourceHandle hHiZ, uint mip)
     {
-        builder.ReadTexture(hHiZ, ResourceState.ShaderResource);
         builder.WriteTexture(hHiZ, ResourceState.UnorderedAccess);
     }
 
@@ -167,7 +175,7 @@ public class HiZBuildPass(RenderContext context) : IDisposable
         uint mipWidth = Math.Max(1u, desc.Width >> (int)mip);
         uint mipHeight = Math.Max(1u, desc.Height >> (int)mip);
 
-        _downsampleSRB.GetVariableByName(ShaderType.Compute, "SrcMip")?.Set(_srvMipViews[(int)mip - 1], SetShaderResourceFlags.None);
+        _downsampleSRB.GetVariableByName(ShaderType.Compute, "SrcMip")?.Set(_uavMipViews[(int)mip - 1], SetShaderResourceFlags.None);
         _downsampleSRB.GetVariableByName(ShaderType.Compute, "DstMip")?.Set(_uavMipViews[(int)mip], SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(_downsamplePSO);
@@ -239,10 +247,11 @@ public class HiZBuildPass(RenderContext context) : IDisposable
 
     private void ClearMipViews()
     {
+        int queueIdx = _frameIndex % _disposeQueue.Count;
         foreach (var view in _srvMipViews)
-            view.Dispose();
+            _disposeQueue[queueIdx].Add(view);
         foreach (var view in _uavMipViews)
-            view.Dispose();
+            _disposeQueue[queueIdx].Add(view);
 
         _srvMipViews.Clear();
         _uavMipViews.Clear();
@@ -253,7 +262,17 @@ public class HiZBuildPass(RenderContext context) : IDisposable
 
     public void Dispose()
     {
+        foreach (var queue in _disposeQueue)
+        {
+            foreach (var obj in queue)
+            {
+                obj.Dispose();
+            }
+            queue.Clear();
+        }
+
         ClearMipViews();
+        _disposeQueue[0].Clear(); // Just to avoid leaking if called after ClearMipViews
 
         _buildMip0SRB?.Dispose();
         _buildMip0PSO?.Dispose();

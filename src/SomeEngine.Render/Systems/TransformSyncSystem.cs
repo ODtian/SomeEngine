@@ -12,7 +12,6 @@ namespace SomeEngine.Render.Systems;
 public class TransformSyncSystem : QuerySystem<TransformQvvs>
 {
     private readonly RenderContext _renderContext;
-    private IBuffer? _gpuBuffer; // The StructuredBuffer on GPU
     private GpuTransform[] _cpuBuffer; // Shadow copy for updates
     private int _capacity = 1024;
 
@@ -25,7 +24,6 @@ public class TransformSyncSystem : QuerySystem<TransformQvvs>
     // Entities need to know their index.
     // We can add a component 'GpuTransformIndex'.
 
-    public IBuffer? GlobalTransformBuffer => _gpuBuffer;
     public int Count { get; private set; } = 0;
 
     public Span<GpuTransform> CpuTransforms => _cpuBuffer.AsSpan(0, Count);
@@ -68,35 +66,6 @@ public class TransformSyncSystem : QuerySystem<TransformQvvs>
             while (_capacity < needed)
                 _capacity *= 2;
             Array.Resize(ref _cpuBuffer, _capacity);
-
-            // Re-create GPU buffer
-            CreateBuffer(_capacity);
         }
-        else if (_gpuBuffer == null)
-        {
-            CreateBuffer(_capacity);
-        }
-    }
-
-    private void CreateBuffer(int size)
-    {
-        _gpuBuffer?.Dispose();
-
-        BufferDesc desc = new BufferDesc
-        {
-            Name = "Global Transform Buffer",
-            Size = (ulong)(size * GpuTransform.SizeInBytes),
-            Usage = Usage.Default,
-            BindFlags = BindFlags.ShaderResource,
-            Mode = BufferMode.Structured,
-            ElementByteStride = GpuTransform.SizeInBytes,
-        };
-
-        _gpuBuffer = _renderContext.Device?.CreateBuffer(desc);
-    }
-
-    public void Dispose()
-    {
-        _gpuBuffer?.Dispose();
     }
 }

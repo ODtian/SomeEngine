@@ -227,15 +227,16 @@ public class ClusterCullPass(
                 );
         }
 
-        if (transformSystem.GlobalTransformBuffer != null)
+        var globalTransformView = rgCtx.GetBufferView(HGlobalTransformBuffer, BufferViewType.ShaderResource);
+        if (globalTransformView != null)
+        {
             _cullSRB
                 .GetVariableByName(ShaderType.Compute, "Instances")
                 ?.Set(
-                    transformSystem.GlobalTransformBuffer.GetDefaultView(
-                        BufferViewType.ShaderResource
-                    ),
+                    globalTransformView,
                     SetShaderResourceFlags.None
                 );
+        }
 
         ctx.SetPipelineState(_cullPSO);
         ctx.CommitShaderResources(_cullSRB, ResourceStateTransitionMode.Verify);

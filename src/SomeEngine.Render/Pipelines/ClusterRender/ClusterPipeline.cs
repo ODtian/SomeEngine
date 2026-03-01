@@ -72,8 +72,13 @@ public class ClusterPipeline(
 
     private ClusterBVHTraversePass? _bvhTraversePass;
     private ClusterCullUpdateArgsPass? _cullUpdateArgsPass;
-    private ClusterCullPass? _cullPass;
-    private ClusterDrawPass? _drawPass;
+    private ClusterCullUpdateArgsPass? _cullUpdateArgsPassPhase2;
+    private ClusterCullPass? _cullPassLegacy;
+    private ClusterCullPass? _cullPassPhase1;
+    private ClusterCullPass? _cullPassPhase2;
+    private ClusterDrawPass? _drawPassLegacy;
+    private ClusterDrawPass? _drawPassPhase1;
+    private ClusterDrawPass? _drawPassPhase2;
     private HiZBuildPass? _hizBuildPass;
     private ClusterDebugPass? _debugPass;
     private readonly ClusterStreamer _clusterStreamer = new(clusterManager);
@@ -88,6 +93,7 @@ public class ClusterPipeline(
     public bool DebugSpheresEnabled { get; set; }
     public bool VisualiseBVH { get; set; }
     public int DebugBVHDepth { get; set; } = -1;
+    public bool UseHiZ { get; set; } = true;
     public bool BypassCulling { get; set; }
 
     public bool DebugClusterID
@@ -203,10 +209,23 @@ public class ClusterPipeline(
         _bvhTraversePass.Init();
         _cullUpdateArgsPass = new ClusterCullUpdateArgsPass(context);
         _cullUpdateArgsPass.Init();
-        _cullPass = new ClusterCullPass(context, clusterManager, transformSystem);
-        _cullPass.Init();
-        _drawPass = new ClusterDrawPass(context, clusterManager, transformSystem);
-        _drawPass.Init();
+        _cullUpdateArgsPassPhase2 = new ClusterCullUpdateArgsPass(context, "Cull Update Args Phase2");
+        _cullUpdateArgsPassPhase2.Init();
+        
+        _cullPassLegacy = new ClusterCullPass(context, clusterManager, transformSystem, ClusterCullPhase.Legacy, "ClusterCull Legacy");
+        _cullPassLegacy.Init();
+        _cullPassPhase1 = new ClusterCullPass(context, clusterManager, transformSystem, ClusterCullPhase.Phase1, "ClusterCull Phase1");
+        _cullPassPhase1.Init();
+        _cullPassPhase2 = new ClusterCullPass(context, clusterManager, transformSystem, ClusterCullPhase.Phase2, "ClusterCull Phase2");
+        _cullPassPhase2.Init();
+
+        _drawPassLegacy = new ClusterDrawPass(context, clusterManager, transformSystem, "ClusterDraw Legacy");
+        _drawPassLegacy.Init();
+        _drawPassPhase1 = new ClusterDrawPass(context, clusterManager, transformSystem, "ClusterDraw Phase1");
+        _drawPassPhase1.Init();
+        _drawPassPhase2 = new ClusterDrawPass(context, clusterManager, transformSystem, "ClusterDraw Phase2");
+        _drawPassPhase2.Init();
+
         _hizBuildPass = new HiZBuildPass(context);
         _hizBuildPass.Init();
         _debugPass = new ClusterDebugPass(context, clusterManager);
@@ -284,6 +303,65 @@ public class ClusterPipeline(
                 ElementByteStride = 16,
             }
         );
+
+        RGResourceHandle hPhase2CandidateClusters = RGResourceHandle.Invalid;
+        RGResourceHandle hPhase2CandidateCount = RGResourceHandle.Invalid;
+        RGResourceHandle hPhase2CandidateArgs = RGResourceHandle.Invalid;
+        RGResourceHandle hPhase2VisibleClusters = RGResourceHandle.Invalid;
+        RGResourceHandle hPhase2IndirectDrawArgs = RGResourceHandle.Invalid;
+
+        if (UseHiZ)
+        {
+            hPhase2CandidateClusters = graph.CreateBuffer(
+                "Phase2CandidateClusters",
+                new BufferDesc
+                {
+                    Size = (ulong)(_maxDraws * 12),
+                    BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                    Mode = BufferMode.Structured,
+                    ElementByteStride = 12,
+                }
+            );
+            hPhase2CandidateCount = graph.CreateBuffer(
+                "Phase2CandidateCount",
+                new BufferDesc
+                {
+                    Size = 4,
+                    BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                    Mode = BufferMode.Raw,
+                    ElementByteStride = 4,
+                }
+            );
+            hPhase2CandidateArgs = graph.CreateBuffer(
+                "Phase2CandidateArgs",
+                new BufferDesc
+                {
+                    Size = 16,
+                    BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
+                    Mode = BufferMode.Raw,
+                    ElementByteStride = 4,
+                }
+            );
+            hPhase2VisibleClusters = graph.CreateBuffer(
+                "Phase2VisibleClusters",
+                new BufferDesc
+                {
+                    Size = (ulong)(_maxDraws * 16),
+                    BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                    Mode = BufferMode.Structured,
+                    ElementByteStride = 16,
+                }
+            );
+            hPhase2IndirectDrawArgs = graph.CreateBuffer(
+                "Phase2IndirectDrawArgs",
+                new BufferDesc
+                {
+                    Size = 256,
+                    BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
+                    Mode = BufferMode.Raw,
+                }
+            );
+        }
         var hBvhQueueA = graph.CreateBuffer(
             "BVHQueueA",
             new BufferDesc
@@ -343,7 +421,7 @@ public class ClusterPipeline(
         RGResourceHandle hCurrHiZ = RGResourceHandle.Invalid;
         RGResourceHandle hPrevHiZ = RGResourceHandle.Invalid;
         bool hasPrevHistory = false;
-        bool useHiZ = false; // _cullPass?.UsesHiZ == true;
+        bool useHiZ = UseHiZ;
 
         if (useHiZ)
         {
@@ -427,16 +505,27 @@ public class ClusterPipeline(
             );
         }
 
-        // Import external buffers for InstanceSyncSystem
-        var hGlobalTransform = graph.ImportBuffer(
+        // Create managed buffers for InstanceSyncSystem
+        int maxInstances = Math.Max(transformSystem.Count, 1);
+        var hGlobalTransform = graph.CreateBuffer(
             "GlobalTransform",
-            transformSystem.GlobalTransformBuffer!,
-            ResourceState.Unknown
+            new BufferDesc
+            {
+                Size = (ulong)(maxInstances * GpuTransform.SizeInBytes),
+                BindFlags = BindFlags.ShaderResource,
+                Mode = BufferMode.Structured,
+                ElementByteStride = GpuTransform.SizeInBytes
+            }
         );
-        var hGlobalInstanceHeader = graph.ImportBuffer(
+        var hGlobalInstanceHeader = graph.CreateBuffer(
             "GlobalInstanceHeader",
-            transformSystem.GlobalInstanceHeaderBuffer!,
-            ResourceState.Unknown
+            new BufferDesc
+            {
+                Size = (ulong)(maxInstances * GpuInstanceHeader.SizeInBytes),
+                BindFlags = BindFlags.ShaderResource,
+                Mode = BufferMode.Structured,
+                ElementByteStride = GpuInstanceHeader.SizeInBytes
+            }
         );
         var hGlobalBVH = graph.ImportBuffer(
             "GlobalBVH",
@@ -447,6 +536,21 @@ public class ClusterPipeline(
             "PageHeap",
             clusterManager.PageHeap!,
             ResourceState.Unknown
+        );
+
+        graph.AddPass(
+            new ClusterResourceUploadPass(
+                clusterManager,
+                hGlobalBVH,
+                hPageHeap
+            )
+        );
+
+        graph.AddPass(
+            new ClusterBVHPatchPass(
+                clusterManager,
+                hGlobalBVH
+            )
         );
 
         if (transformSystem.Count > 0)
@@ -467,7 +571,7 @@ public class ClusterPipeline(
                 hCandidateCount,
                 hPageFaultBuffer,
                 hBvhDebugCount,
-                _cullPass?.HPhase2CandidateCount ?? RGResourceHandle.Invalid
+                useHiZ ? hPhase2CandidateCount : RGResourceHandle.Invalid
             )
         );
 
@@ -566,43 +670,74 @@ public class ClusterPipeline(
 
         graph.AddPass(new ClusterBVHPageFaultCopyPass(_bvhTraversePass, hPageFaultReadback));
 
-        // Wire Cull pass
-        _cullPass!.HCandidateClusters = hCandidateClusters;
-        _cullPass.HCandidateArgs = hCandidateArgs;
-        _cullPass.HCandidateCount = hCandidateCount;
-        _cullPass.HVisibleClusters = hVisibleClusters;
-        _cullPass.HIndirectDrawArgs = hIndirectDrawArgs;
-        _cullPass.HHiZTexture = hPrevHiZ;
-        _cullPass.HCullingUniforms = hCullingUB;
-        _cullPass.HGlobalTransformBuffer = hGlobalTransform;
-        _cullPass.HPageHeap = hPageHeap;
-        _cullPass.SetFrameData(_cullingUniformBuffer!);
-
+        // Update Args for Cull Pass
         _cullUpdateArgsPass!.HCandidateCount = hCandidateCount;
         _cullUpdateArgsPass.HCandidateArgs = hCandidateArgs;
         graph.AddPass(_cullUpdateArgsPass);
 
-        graph.AddPass(_cullPass);
-
-        // Wire Draw pass
-        _drawPass!.HVisibleClusters = hVisibleClusters;
-        _drawPass.HIndirectDrawArgs = hIndirectDrawArgs;
-        _drawPass.HColorTarget = colorTarget;
-        _drawPass.HDepthTarget = depthTarget;
-        _drawPass.HDrawUniforms = hDrawUB;
-        _drawPass.HGlobalTransformBuffer = hGlobalTransform;
-        _drawPass.HPageHeap = hPageHeap;
-        _drawPass.SetFrameData(_drawUniformBuffer!, DebugMode, WireframeEnabled, OverdrawEnabled);
-        graph.AddPass(_drawPass);
-
         if (useHiZ)
         {
-            graph.AddPass(new HiZMip0Pass(_hizBuildPass!, depthTarget, hCurrHiZ));
+            // Phase 1 Cull
+            _cullPassPhase1!.HCandidateClusters = hCandidateClusters;
+            _cullPassPhase1.HCandidateArgs = hCandidateArgs;
+            _cullPassPhase1.HCandidateCount = hCandidateCount;
+            _cullPassPhase1.HVisibleClusters = hVisibleClusters;
+            _cullPassPhase1.HIndirectDrawArgs = hIndirectDrawArgs;
+            _cullPassPhase1.HHiZTexture = hPrevHiZ;
+            _cullPassPhase1.HCullingUniforms = hCullingUB;
+            _cullPassPhase1.HGlobalTransformBuffer = hGlobalTransform;
+            _cullPassPhase1.HPageHeap = hPageHeap;
+            _cullPassPhase1.HPhase2CandidateClusters = hPhase2CandidateClusters;
+            _cullPassPhase1.HPhase2CandidateCount = hPhase2CandidateCount;
+            _cullPassPhase1.SetFrameData(_cullingUniformBuffer!);
+            graph.AddPass(_cullPassPhase1);
 
+            // Phase 1 Draw
+            _drawPassPhase1!.HVisibleClusters = hVisibleClusters;
+            _drawPassPhase1.HIndirectDrawArgs = hIndirectDrawArgs;
+            _drawPassPhase1.HColorTarget = colorTarget;
+            _drawPassPhase1.HDepthTarget = depthTarget;
+            _drawPassPhase1.HDrawUniforms = hDrawUB;
+            _drawPassPhase1.HGlobalTransformBuffer = hGlobalTransform;
+            _drawPassPhase1.HPageHeap = hPageHeap;
+            _drawPassPhase1.SetFrameData(_drawUniformBuffer!, DebugMode, WireframeEnabled, OverdrawEnabled);
+            graph.AddPass(_drawPassPhase1);
+
+            // HiZ Build
+            graph.AddPass(new HiZMip0Pass(_hizBuildPass!, depthTarget, hCurrHiZ));
             for (uint mip = 1; mip < _hizMipCount; mip++)
             {
                 graph.AddPass(new HiZDownsamplePass(_hizBuildPass!, hCurrHiZ, mip));
             }
+
+            // Phase 2 Update Args
+            _cullUpdateArgsPassPhase2!.HCandidateCount = hPhase2CandidateCount;
+            _cullUpdateArgsPassPhase2.HCandidateArgs = hPhase2CandidateArgs;
+            graph.AddPass(_cullUpdateArgsPassPhase2);
+
+            // Phase 2 Cull
+            _cullPassPhase2!.HCandidateClusters = hPhase2CandidateClusters;
+            _cullPassPhase2.HCandidateArgs = hPhase2CandidateArgs;
+            _cullPassPhase2.HCandidateCount = hPhase2CandidateCount;
+            _cullPassPhase2.HVisibleClusters = hPhase2VisibleClusters;
+            _cullPassPhase2.HIndirectDrawArgs = hPhase2IndirectDrawArgs;
+            _cullPassPhase2.HHiZTexture = hCurrHiZ; // Use current frame HiZ for Phase 2!
+            _cullPassPhase2.HCullingUniforms = hCullingUB;
+            _cullPassPhase2.HGlobalTransformBuffer = hGlobalTransform;
+            _cullPassPhase2.HPageHeap = hPageHeap;
+            _cullPassPhase2.SetFrameData(_cullingUniformBuffer!);
+            graph.AddPass(_cullPassPhase2);
+
+            // Phase 2 Draw
+            _drawPassPhase2!.HVisibleClusters = hPhase2VisibleClusters;
+            _drawPassPhase2.HIndirectDrawArgs = hPhase2IndirectDrawArgs;
+            _drawPassPhase2.HColorTarget = colorTarget;
+            _drawPassPhase2.HDepthTarget = depthTarget; // Depth is readonly in Phase 2 ? Keep as target for now
+            _drawPassPhase2.HDrawUniforms = hDrawUB;
+            _drawPassPhase2.HGlobalTransformBuffer = hGlobalTransform;
+            _drawPassPhase2.HPageHeap = hPageHeap;
+            _drawPassPhase2.SetFrameData(_drawUniformBuffer!, DebugMode, WireframeEnabled, OverdrawEnabled);
+            graph.AddPass(_drawPassPhase2);
 
             Matrix4x4 currentViewProjT = Matrix4x4.Transpose(_view * _proj);
             graph.QueueTextureExtraction(
@@ -620,6 +755,29 @@ public class ClusterPipeline(
         }
         else
         {
+            // Legacy Cull
+            _cullPassLegacy!.HCandidateClusters = hCandidateClusters;
+            _cullPassLegacy.HCandidateArgs = hCandidateArgs;
+            _cullPassLegacy.HCandidateCount = hCandidateCount;
+            _cullPassLegacy.HVisibleClusters = hVisibleClusters;
+            _cullPassLegacy.HIndirectDrawArgs = hIndirectDrawArgs;
+            _cullPassLegacy.HCullingUniforms = hCullingUB;
+            _cullPassLegacy.HGlobalTransformBuffer = hGlobalTransform;
+            _cullPassLegacy.HPageHeap = hPageHeap;
+            _cullPassLegacy.SetFrameData(_cullingUniformBuffer!);
+            graph.AddPass(_cullPassLegacy);
+
+            // Legacy Draw
+            _drawPassLegacy!.HVisibleClusters = hVisibleClusters;
+            _drawPassLegacy.HIndirectDrawArgs = hIndirectDrawArgs;
+            _drawPassLegacy.HColorTarget = colorTarget;
+            _drawPassLegacy.HDepthTarget = depthTarget;
+            _drawPassLegacy.HDrawUniforms = hDrawUB;
+            _drawPassLegacy.HGlobalTransformBuffer = hGlobalTransform;
+            _drawPassLegacy.HPageHeap = hPageHeap;
+            _drawPassLegacy.SetFrameData(_drawUniformBuffer!, DebugMode, WireframeEnabled, OverdrawEnabled);
+            graph.AddPass(_drawPassLegacy);
+
             _hasPrevHistory = false;
         }
 
@@ -819,8 +977,13 @@ public class ClusterPipeline(
 
         _bvhTraversePass?.Dispose();
         _cullUpdateArgsPass?.Dispose();
-        _cullPass?.Dispose();
-        _drawPass?.Dispose();
+        _cullUpdateArgsPassPhase2?.Dispose();
+        _cullPassLegacy?.Dispose();
+        _cullPassPhase1?.Dispose();
+        _cullPassPhase2?.Dispose();
+        _drawPassLegacy?.Dispose();
+        _drawPassPhase1?.Dispose();
+        _drawPassPhase2?.Dispose();
         _hizBuildPass?.Dispose();
         _debugPass?.Dispose();
         _cullingUniformBuffer?.Dispose();

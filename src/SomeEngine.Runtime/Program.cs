@@ -313,7 +313,7 @@ class Program
 
             // 1. Init ECS & Systems
             world = new GameWorld();
-            transformSystem = new InstanceSyncSystem(context);
+            transformSystem = new InstanceSyncSystem();
             world.SystemRoot.Add(transformSystem);
 
             // 2. Init Cluster Manager
@@ -357,8 +357,8 @@ class Program
             clusterPipeline.Init();
             renderGraph = new RenderGraph();
 
-            simplePass = new SimpleMeshRenderPass(context);
-            simplePass.Init();
+            // simplePass = new SimpleMeshRenderPass(context);
+            // simplePass.Init();
 
             Console.WriteLine("Controls:");
             Console.WriteLine("  WASD + Space/Ctrl: Move");
@@ -794,7 +794,7 @@ class Program
             clusterPipeline.SetCamera(view, proj, camera.Position, 1.0f, lodScale, debugLOD);
 
             var pRTV = context.SwapChain!.GetCurrentBackBufferRTV();
-            var pDSV = context.SwapChain!.GetDepthBufferDSV();
+            var pDSV = context.DepthBufferDSV!;
 
             renderGraph.Reset();
             var bbTex = pRTV.GetTexture();
@@ -828,12 +828,30 @@ class Program
             );
 
             clusterPipeline.AddToRenderGraph(renderGraph, colorHandle, depthHandle);
+            renderGraph.MarkAsOutput(colorHandle);
+
+            if (imguiRenderer != null && imguiRenderer.FontTexture != null)
+            {
+                var fontHandle = renderGraph.ImportTexture("ImGui Font", imguiRenderer.FontTexture, ResourceState.Unknown);
+                
+                renderGraph.AddPass<object>(
+                    "ImGui Pass",
+                    (builder, _) =>
+                    {
+                        builder.ReadTexture(fontHandle, ResourceState.ShaderResource);
+                        builder.WriteTexture(colorHandle, ResourceState.RenderTarget);
+                    },
+                    (ctx, _) =>
+                    {
+                        ctx.CommandList.SetRenderTargets([pRTV], null, ResourceStateTransitionMode.Verify);
+                        imguiRenderer.Render(ctx.CommandList, ImGui.GetDrawData());
+                    }
+                );
+            }
+
             renderGraph.Compile(context.Device);
             renderGraph.Execute(context);
             // simplePass?.Execute(context, null);
-
-            // Render ImGui
-            imguiRenderer?.Render(context.ImmediateContext!, ImGui.GetDrawData());
 
             // Present handled by RenderContext helper or manually
             context.Present();

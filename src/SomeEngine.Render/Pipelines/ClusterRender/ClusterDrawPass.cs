@@ -11,8 +11,9 @@ namespace SomeEngine.Render.Pipelines;
 public class ClusterDrawPass(
     RenderContext context,
     ClusterResourceManager clusterManager,
-    InstanceSyncSystem transformSystem
-) : RenderPass("ClusterDraw"), IDisposable
+    InstanceSyncSystem transformSystem,
+    string passName = "ClusterDraw"
+) : RenderPass(passName), IDisposable
 {
     private ShaderAsset? _drawAsset;
     private IPipelineState? _drawPSO;
@@ -192,14 +193,15 @@ public class ClusterDrawPass(
                 SetShaderResourceFlags.None
             );
 
-        if (transformSystem.GlobalTransformBuffer != null)
+        var globalTransformView = rgCtx.GetBufferView(HGlobalTransformBuffer, BufferViewType.ShaderResource);
+        if (globalTransformView != null)
+        {
             srb.GetVariableByName(ShaderType.Vertex, "Instances")
                 ?.Set(
-                    transformSystem.GlobalTransformBuffer.GetDefaultView(
-                        BufferViewType.ShaderResource
-                    ),
+                    globalTransformView,
                     SetShaderResourceFlags.None
                 );
+        }
 
         ctx.SetPipelineState(pso);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);

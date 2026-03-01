@@ -11,24 +11,17 @@ namespace SomeEngine.Render.Systems;
 
 public class InstanceSyncSystem : QuerySystem<TransformQvvs, MeshInstance>
 {
-    private readonly RenderContext _renderContext;
-
-    private IBuffer? _transformBuffer;
-    private IBuffer? _headerBuffer;
     private GpuTransform[] _cpuTransforms;
     private GpuInstanceHeader[] _cpuHeaders;
     private int _capacity = 1024;
 
-    public IBuffer? GlobalTransformBuffer => _transformBuffer;
-    public IBuffer? GlobalInstanceHeaderBuffer => _headerBuffer;
     public int Count { get; private set; }
 
     public Span<GpuTransform> CpuTransforms => _cpuTransforms.AsSpan(0, Count);
     public Span<GpuInstanceHeader> CpuHeaders => _cpuHeaders.AsSpan(0, Count);
 
-    public InstanceSyncSystem(RenderContext renderContext)
+    public InstanceSyncSystem()
     {
-        _renderContext = renderContext;
         _cpuTransforms = new GpuTransform[_capacity];
         _cpuHeaders = new GpuInstanceHeader[_capacity];
     }
@@ -68,47 +61,6 @@ public class InstanceSyncSystem : QuerySystem<TransformQvvs, MeshInstance>
                 _capacity *= 2;
             Array.Resize(ref _cpuTransforms, _capacity);
             Array.Resize(ref _cpuHeaders, _capacity);
-            CreateBuffers(_capacity);
         }
-        else if (_transformBuffer == null)
-        {
-            CreateBuffers(_capacity);
-        }
-    }
-
-    private void CreateBuffers(int size)
-    {
-        _transformBuffer?.Dispose();
-        _headerBuffer?.Dispose();
-
-        _transformBuffer = _renderContext.Device?.CreateBuffer(
-            new BufferDesc
-            {
-                Name = "Global Transform Buffer",
-                Size = (ulong)(size * GpuTransform.SizeInBytes),
-                Usage = Usage.Default,
-                BindFlags = BindFlags.ShaderResource,
-                Mode = BufferMode.Structured,
-                ElementByteStride = GpuTransform.SizeInBytes,
-            }
-        );
-
-        _headerBuffer = _renderContext.Device?.CreateBuffer(
-            new BufferDesc
-            {
-                Name = "Global Instance Header Buffer",
-                Size = (ulong)(size * GpuInstanceHeader.SizeInBytes),
-                Usage = Usage.Default,
-                BindFlags = BindFlags.ShaderResource,
-                Mode = BufferMode.Structured,
-                ElementByteStride = GpuInstanceHeader.SizeInBytes,
-            }
-        );
-    }
-
-    public void Dispose()
-    {
-        _transformBuffer?.Dispose();
-        _headerBuffer?.Dispose();
     }
 }

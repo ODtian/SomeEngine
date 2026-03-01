@@ -1,6 +1,6 @@
 [submodule "external/DiligentCore"]
 	path = external/DiligentCore
-	url = https://github.com/DiligentGraphics/DiligentCore.git
+	url = https://github.com/ODtian/DiligentCore.git
 [submodule "external/Alimer.Bindings"]
 	path = external/Alimer.Bindings
 	url = https://github.com/ODtian/Alimer.Bindings
@@ -9,7 +9,4 @@
 	url = https://github.com/DominicMaas/SlangShaderSharp
 [submodule "external/Diligent-SharpGenTools"]
 	path = external/Diligent-SharpGenTools
-	url = https://github.com/MikhailGorobets/Diligent-SharpGenTools
-[submodule "external/slang"]
-	path = external/slang
-	url = https://github.com/shader-slang/slang
+	url = https://github.com/ODtian/Diligent-SharpGenTools

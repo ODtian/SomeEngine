@@ -566,7 +566,14 @@ public class RenderGraph : IDisposable
                 if (!handle.IsValid)
                     continue;
 
-                requiredStateByResource[handle.Id] = (handle, state);
+                if (requiredStateByResource.TryGetValue(handle.Id, out var existing))
+                {
+                    requiredStateByResource[handle.Id] = (handle, existing.State | state);
+                }
+                else
+                {
+                    requiredStateByResource[handle.Id] = (handle, state);
+                }
             }
 
             foreach (var (handle, state) in meta.Reads)
@@ -574,7 +581,12 @@ public class RenderGraph : IDisposable
                 if (!handle.IsValid)
                     continue;
 
-                if (!requiredStateByResource.ContainsKey(handle.Id))
+                if (requiredStateByResource.TryGetValue(handle.Id, out var existing))
+                {
+                    // Generally shouldn't mix read and write states, but if they do, OR them (e.g. DepthRead | DepthWrite)
+                    requiredStateByResource[handle.Id] = (handle, existing.State | state);
+                }
+                else
                 {
                     requiredStateByResource[handle.Id] = (handle, state);
                 }
@@ -593,7 +605,7 @@ public class RenderGraph : IDisposable
                     ? tracked
                     : ResourceState.Unknown;
 
-                if (oldState != required.State)
+                if (oldState != required.State || (oldState == ResourceState.UnorderedAccess && required.State == ResourceState.UnorderedAccess))
                 {
                     compiledPass.PreBarriers.Add(
                         new CompiledBarrier(required.Handle, oldState, required.State)
@@ -800,7 +812,8 @@ public class RenderGraph : IDisposable
 
             if (deviceContext != null && compiledPass.PreBarriers.Count > 0)
             {
-                var transitions = new List<StateTransitionDesc>(compiledPass.PreBarriers.Count);
+                var transitions = new List<StateTransitionDesc>();
+                var seenResources = new HashSet<IDeviceObject>();
 
                 foreach (var barrier in compiledPass.PreBarriers)
                 {
@@ -821,13 +834,28 @@ public class RenderGraph : IDisposable
 
                     if (deviceObj != null)
                     {
+                        if (!seenResources.Add(deviceObj))
+                        {
+                            Console.WriteLine($"[RenderGraph] WARNING: Duplicate transition for deviceObj in pass {compiledPass.Pass.Name}");
+                            continue;
+                        }
+
+                        var oldState = ResourceState.Unknown;
+                        var flags = StateTransitionFlags.UpdateState;
+
+                        if (barrier.OldState == ResourceState.UnorderedAccess && barrier.NewState == ResourceState.UnorderedAccess)
+                        {
+                            oldState = ResourceState.UnorderedAccess;
+                            flags = StateTransitionFlags.None;
+                        }
+
                         transitions.Add(
                             new StateTransitionDesc
                             {
                                 Resource = deviceObj,
-                                OldState = ResourceState.Unknown,
+                                OldState = oldState,
                                 NewState = barrier.NewState,
-                                Flags = StateTransitionFlags.UpdateState,
+                                Flags = flags,
                                 MipLevelsCount = Diligent.Native.RemainingMipLevels,
                                 ArraySliceCount = Diligent.Native.RemainingArraySlices,
                             }

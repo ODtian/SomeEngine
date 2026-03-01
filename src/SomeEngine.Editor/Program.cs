@@ -124,12 +124,12 @@ class Program
         ITextureView[] rtv = { bbView };
         ctx.SetRenderTargets(
             rtv,
-            _renderContext.SwapChain!.GetDepthBufferDSV(),
+            _renderContext.DepthBufferDSV!,
             ResourceStateTransitionMode.Verify
         );
         ctx.ClearRenderTarget(bbView, clearColor, ResourceStateTransitionMode.Verify);
         ctx.ClearDepthStencil(
-            _renderContext.SwapChain.GetDepthBufferDSV(),
+            _renderContext.DepthBufferDSV!,
             ClearDepthStencilFlags.Depth,
             1.0f,
             0,
@@ -143,15 +143,16 @@ class Program
             ResourceState.RenderTarget,
             bbView
         );
-        var dsvTex = _renderContext.SwapChain.GetDepthBufferDSV().GetTexture();
+        var dsvTex = _renderContext.DepthBufferDSV!.GetTexture();
         var depthHandle = _renderGraph.ImportTexture(
             "DepthBuffer",
             dsvTex,
             ResourceState.DepthWrite,
-            _renderContext.SwapChain.GetDepthBufferDSV()
+            _renderContext.DepthBufferDSV!
         );
 
         _clusterPipeline!.AddToRenderGraph(_renderGraph, bbHandle, depthHandle);
+        _renderGraph.MarkAsOutput(bbHandle);
         _renderGraph.Compile(_renderContext.Device);
         _renderGraph.Execute(_renderContext);
 

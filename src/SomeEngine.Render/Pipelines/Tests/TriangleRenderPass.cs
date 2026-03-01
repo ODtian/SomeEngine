@@ -84,7 +84,7 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
             {
                 NumRenderTargets = 1,
                 RTVFormats = [context.SwapChain!.GetDesc().ColorBufferFormat],
-                DSVFormat = context.SwapChain!.GetDesc().DepthBufferFormat,
+                DSVFormat = TextureFormat.D32_Float,
                 PrimitiveTopology = PrimitiveTopology.TriangleList,
                 RasterizerDesc = new RasterizerStateDesc { CullMode = CullMode.None },
                 DepthStencilDesc = new DepthStencilStateDesc { DepthEnable = false },
@@ -133,7 +133,7 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
         if (rtv == null)
             return;
 
-        var dsv = context.SwapChain!.GetDepthBufferDSV(); // Using swapchain depth for now
+        var dsv = context.DepthBufferDSV!; // Using custom depth for now
 
         ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Verify);
         ctx.ClearRenderTarget(
@@ -153,20 +153,9 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
 
         if (
             TransformSystem != null
-            && TransformSystem.GlobalTransformBuffer != null
             && TransformSystem.Count > 0
         )
         {
-            var varTransforms = _srb?.GetVariableByName(ShaderType.Vertex, "Transforms");
-            if (varTransforms != null && TransformSystem.GlobalTransformBuffer != null)
-            {
-                varTransforms.Set(
-                    TransformSystem.GlobalTransformBuffer.GetDefaultView(
-                        BufferViewType.ShaderResource
-                    ),
-                    SetShaderResourceFlags.None
-                );
-            }
             if (_srb != null)
                 ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Verify);
 

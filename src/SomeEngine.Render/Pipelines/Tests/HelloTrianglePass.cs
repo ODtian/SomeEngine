@@ -64,7 +64,7 @@ public unsafe class HelloTrianglePass : IDisposable
             {
                 NumRenderTargets = 1,
                 RTVFormats = [_context.SwapChain!.GetDesc().ColorBufferFormat],
-                DSVFormat = _context.SwapChain!.GetDesc().DepthBufferFormat,
+                DSVFormat = TextureFormat.D32_Float,
                 PrimitiveTopology = PrimitiveTopology.TriangleList,
                 RasterizerDesc = new RasterizerStateDesc { CullMode = CullMode.None },
                 DepthStencilDesc = new DepthStencilStateDesc { DepthEnable = false },
@@ -84,7 +84,7 @@ public unsafe class HelloTrianglePass : IDisposable
             return;
 
         var rtv = swapChain.GetCurrentBackBufferRTV();
-        var dsv = swapChain.GetDepthBufferDSV();
+        var dsv = _context.DepthBufferDSV!;
 
         ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Verify);
         ctx.ClearRenderTarget(

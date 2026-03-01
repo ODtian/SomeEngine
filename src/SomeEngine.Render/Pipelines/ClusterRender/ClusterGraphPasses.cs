@@ -9,6 +9,49 @@ using SomeEngine.Render.Systems;
 
 namespace SomeEngine.Render.Pipelines;
 
+internal sealed class ClusterResourceUploadPass(
+    ClusterResourceManager resourceManager,
+    RGResourceHandle globalBVH,
+    RGResourceHandle pageHeap
+) : RenderPass("Cluster Resource Upload")
+{
+    public override void Setup(RenderGraphBuilder builder)
+    {
+        builder.WriteBuffer(globalBVH, ResourceState.CopyDest);
+        builder.WriteBuffer(pageHeap, ResourceState.CopyDest);
+    }
+
+    public override void Execute(RenderContext context, RenderGraphContext graphContext)
+    {
+        var bvhBuffer = graphContext.GetBuffer(globalBVH);
+        var heapBuffer = graphContext.GetBuffer(pageHeap);
+        if (bvhBuffer != null && heapBuffer != null)
+        {
+            resourceManager.ExecutePendingUploads(context, bvhBuffer, heapBuffer);
+        }
+    }
+}
+
+internal sealed class ClusterBVHPatchPass(
+    ClusterResourceManager resourceManager,
+    RGResourceHandle globalBVH
+) : RenderPass("Cluster BVH Patch")
+{
+    public override void Setup(RenderGraphBuilder builder)
+    {
+        builder.WriteBuffer(globalBVH, ResourceState.UnorderedAccess);
+    }
+
+    public override void Execute(RenderContext context, RenderGraphContext graphContext)
+    {
+        var bvhBuffer = graphContext.GetBuffer(globalBVH);
+        if (bvhBuffer != null)
+        {
+            resourceManager.ExecutePendingPatches(context, bvhBuffer);
+        }
+    }
+}
+
 internal sealed class ClusterUploadInstanceDataPass(
     InstanceSyncSystem transformSystem,
     RGResourceHandle globalTransform,
@@ -345,8 +388,8 @@ internal sealed class ClusterDebugSphereDrawPass(
     }
 }
 
-internal sealed class ClusterCullUpdateArgsPass(RenderContext context)
-    : RenderPass("Cull Update Args"), IDisposable
+internal sealed class ClusterCullUpdateArgsPass(RenderContext context, string passName = "Cull Update Args")
+    : RenderPass(passName), IDisposable
 {
     private readonly RenderContext _context = context;
     private IPipelineState? _pso;
@@ -445,3 +488,4 @@ internal sealed class ClusterCullUpdateArgsPass(RenderContext context)
         _pso?.Dispose();
     }
 }
+
