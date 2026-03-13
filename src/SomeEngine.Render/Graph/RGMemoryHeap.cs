@@ -4,7 +4,7 @@ using Diligent;
 
 namespace SomeEngine.Render.Graph;
 
-internal class RGMemoryHeap : IDisposable
+internal class RenderGraphMemoryHeap : IDisposable
 {
     public IDeviceMemory Memory { get; private set; } = null!;
     public ulong Capacity { get; private set; }
@@ -24,14 +24,14 @@ internal class RGMemoryHeap : IDisposable
     private readonly List<AllocationEntry> _allocations = [];
 
     // Only for unit tests
-    internal RGMemoryHeap(ulong capacity)
+    internal RenderGraphMemoryHeap(ulong capacity)
     {
         _device = null!;
         Capacity = capacity;
         MemoryTypeBits = uint.MaxValue;
     }
 
-    public RGMemoryHeap(
+    public RenderGraphMemoryHeap(
         IRenderDevice device,
         ulong initialCapacity,
         uint memoryTypeBits = uint.MaxValue
@@ -69,13 +69,13 @@ internal class RGMemoryHeap : IDisposable
     {
         offset = 0;
 
-        // Conservative mode: treat all existing allocations as overlapping.
-        // This avoids placed-resource aliasing hazards and keeps each resource
-        // at a unique heap address.
+        // Lifetime-aware aliasing: only consider allocations whose
+        // lifetime overlaps with the new resource's lifetime.
         var overlappingAllocs = new List<AllocationEntry>();
         foreach (var alloc in _allocations)
         {
-            overlappingAllocs.Add(alloc);
+            if (alloc.FirstPassIndex <= lastPassIndex && alloc.LastPassIndex >= firstPassIndex)
+                overlappingAllocs.Add(alloc);
         }
 
         // Sort overlapping allocations by offset to find gaps

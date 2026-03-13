@@ -41,7 +41,7 @@ table BackendReflection {
     reflection: ShaderReflectionData;
 }
 
-table ShaderAsset {
+table ShaderAsset (fs_serializer) {
     name: string;
     variants: [ShaderBytecode];
     reflections: [BackendReflection];

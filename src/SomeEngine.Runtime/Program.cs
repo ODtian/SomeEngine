@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -8,12 +9,13 @@ using Diligent;
 using FlatSharp;
 using Friflo.Engine.ECS;
 using ImGuiNET;
+using Microsoft.Extensions.DependencyInjection;
 using Silk.NET.Input;
 using Silk.NET.Maths;
 using Silk.NET.Windowing;
-using SomeEngine.Assets.Schema;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Assets.Pipeline;
+using SomeEngine.Assets.Schema;
 using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
 using SomeEngine.Core.Math;
@@ -122,18 +124,22 @@ class Program
         options.Size = new Vector2D<int>(1280, 720);
         options.Title = "SomeEngine Runtime - Cluster Rendering";
         options.API = GraphicsAPI.None; // We use Diligent
+        options.VSync = true;
+        options.UpdatesPerSecond = 60;
+        options.FramesPerSecond = 60;
 
         var window = Window.Create(options);
 
         RenderContext? context = null;
         ClusterResourceManager? resourceManager = null;
-        ClusterPipeline? clusterPipeline = null;
+        ClusterRenderFeature? clusterPipeline = null;
         RenderGraph? renderGraph = null;
         SimpleMeshRenderPass? simplePass = null;
         ImGuiRenderer? imguiRenderer = null;
         ImGuiInputHandler? imguiInput = null;
         GameWorld? world = null;
         InstanceSyncSystem? transformSystem = null;
+        InstanceDataManager? instanceDataManager = null;
         IInputContext? input = null;
         IKeyboard? keyboard = null;
         IMouse? mouse = null;
@@ -142,6 +148,7 @@ class Program
         bool _key2Pressed = false;
         bool _key3Pressed = false;
         bool _key4Pressed = false;
+        bool _keyF5Pressed = false;
         bool showEntityEditor = true;
         int spawnedEntityCount = 1;
         int selectedAvailableMeshIndex = 0;
@@ -158,7 +165,7 @@ class Program
                 Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../samples")),
                 Path.GetFullPath("samples"),
                 Path.GetFullPath("../../../../../samples"),
-                "d:/SomeEngine/samples"
+                "d:/SomeEngine/samples",
             ];
 
             foreach (string candidate in candidates)
@@ -213,11 +220,13 @@ class Program
 
                 if (rootIndex == uint.MaxValue)
                 {
-                    message = $"Load Mesh failed: {Path.GetFileName(meshFilePath)} produced invalid BVH root.";
+                    message =
+                        $"Load Mesh failed: {Path.GetFileName(meshFilePath)} produced invalid BVH root.";
                     return false;
                 }
 
-                string loadedName = meshAsset.Name ?? Path.GetFileNameWithoutExtension(meshFilePath);
+                string loadedName =
+                    meshAsset.Name ?? Path.GetFileNameWithoutExtension(meshFilePath);
                 message =
                     $"Loaded mesh '{loadedName}' from {Path.GetFileName(meshFilePath)} (BVHRootIndex={rootIndex}).";
                 return true;
@@ -313,7 +322,8 @@ class Program
 
             // 1. Init ECS & Systems
             world = new GameWorld();
-            transformSystem = new InstanceSyncSystem();
+            instanceDataManager = new InstanceDataManager();
+            transformSystem = new InstanceSyncSystem(instanceDataManager);
             world.SystemRoot.Add(transformSystem);
 
             // 2. Init Cluster Manager
@@ -331,8 +341,10 @@ class Program
                     if (resourceManager.MeshBVHRoots.Count > 0)
                     {
                         var firstLoaded = resourceManager
-                            .MeshBVHRoots
-                            .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                            .MeshBVHRoots.OrderBy(
+                                pair => pair.Key,
+                                StringComparer.OrdinalIgnoreCase
+                            )
                             .First();
 
                         var entity = world.EntityStore.CreateEntity();
@@ -352,13 +364,17 @@ class Program
                 Console.WriteLine($"Warning: no .mesh files found in {samplesDirectory}");
             }
 
-            // 4. Init Pipeline
-            clusterPipeline = new ClusterPipeline(context, transformSystem, resourceManager);
-            clusterPipeline.Init();
-            renderGraph = new RenderGraph();
+            // 4. Init Pipeline (DI)
+            var services = new ServiceCollection();
+            services.AddSingleton(context);
+            services.AddSingleton(instanceDataManager!);
+            services.AddSingleton(resourceManager);
+            services.AddSingleton<ClusterRenderFeature>();
+            var provider = services.BuildServiceProvider();
 
-            // simplePass = new SimpleMeshRenderPass(context);
-            // simplePass.Init();
+            clusterPipeline = provider.GetRequiredService<ClusterRenderFeature>();
+            clusterPipeline.Initialize(context);
+            renderGraph = new RenderGraph();
 
             Console.WriteLine("Controls:");
             Console.WriteLine("  WASD + Space/Ctrl: Move");
@@ -401,6 +417,8 @@ class Program
             imguiInput?.Update((float)delta);
         };
 
+        int frameCount = 0;
+
         window.Render += (double delta) =>
         {
             if (
@@ -411,9 +429,10 @@ class Program
                 || resourceManager == null
             )
                 return;
-
+            var _sw = Stopwatch.StartNew();
             // Update Logic
             world.Update(delta);
+            var _tUpdate = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
 
             float dt = (float)delta;
             float moveSpeed = 6.0f;
@@ -495,6 +514,20 @@ class Program
                     _key4Pressed = false;
                 }
 
+                if (keyboard.IsKeyPressed(Key.F5))
+                {
+                    if (!_keyF5Pressed)
+                    {
+                        clusterPipeline.DumpNextFrame = true;
+                        Console.WriteLine("[Debug] HiZ dump triggered for next frame...");
+                        _keyF5Pressed = true;
+                    }
+                }
+                else
+                {
+                    _keyF5Pressed = false;
+                }
+
                 if (move != Vector3.Zero)
                 {
                     move = Vector3.Normalize(move) * (moveSpeed * dt);
@@ -541,35 +574,69 @@ class Program
                         if (ImGui.Checkbox("Debug Spheres", ref debugSpheres))
                             clusterPipeline.DebugSpheresEnabled = debugSpheres;
 
-                        bool visualizeBVH = clusterPipeline.VisualiseBVH;
-                        if (ImGui.Checkbox("Visualize BVH", ref visualizeBVH))
-                            clusterPipeline.VisualiseBVH = visualizeBVH;
-
-                        int bvhDepth = clusterPipeline.DebugBVHDepth;
-                        if (ImGui.SliderInt("BVH Depth (-1=All)", ref bvhDepth, -1, 16))
-                            clusterPipeline.DebugBVHDepth = bvhDepth;
-
                         bool clusterId = clusterPipeline.DebugClusterID;
                         if (ImGui.Checkbox("Debug Cluster ID", ref clusterId))
                             clusterPipeline.DebugClusterID = clusterId;
 
-                        ImGui.Separator();
-                        if (ImGui.TreeNode("BVH Details"))
+                        int hizMode = (int)clusterPipeline.HiZMode;
+                        string[] hizModeNames = Enum.GetNames(typeof(HiZDebugMode));
+                        if (ImGui.Combo("HiZ Mode", ref hizMode, hizModeNames, hizModeNames.Length))
                         {
-                            for (var i = 0; i < 8; i++)
+                            clusterPipeline.HiZMode = (HiZDebugMode)hizMode;
+                        }
+
+                        bool freezeCull = clusterPipeline.FreezeCullingCamera;
+                        if (ImGui.Checkbox("Freeze Culling Camera", ref freezeCull))
+                            clusterPipeline.FreezeCullingCamera = freezeCull;
+
+                        bool showAABBs = clusterPipeline.DebugShowHiZAABBs;
+                        if (ImGui.Checkbox("Debug HiZ AABBs", ref showAABBs))
+                            clusterPipeline.DebugShowHiZAABBs = showAABBs;
+
+                        ImGui.Separator();
+                        if (ImGui.TreeNode("Culling Stats"))
+                        {
+                            uint candidateCount = clusterPipeline.DebugCandidateCount;
+                            uint p1Visible = clusterPipeline.DebugDrawInstanceCount;
+                            uint p2Candidates = clusterPipeline.DebugPhase2Count;
+                            uint p2Visible = clusterPipeline.DebugPhase2DrawInstanceCount;
+                            uint lodRejected =
+                                candidateCount > (p1Visible + p2Candidates)
+                                    ? candidateCount - (p1Visible + p2Candidates)
+                                    : 0;
+                            uint totalDrawn = p1Visible + p2Visible;
+
+                            ImGui.Text($"BVH Output:      {candidateCount}");
+                            ImGui.Text($"  LOD Rejected:  {lodRejected}");
+                            uint afterLod = candidateCount - lodRejected;
+                            ImGui.Text($"  After LOD:     {afterLod}");
+                            ImGui.Separator();
+                            ImGui.Text($"Phase1 HiZ Cull: {p2Candidates}");
+                            ImGui.Text($"Phase1 Drawn:    {p1Visible}");
+                            ImGui.Separator();
+                            ImGui.Text($"Phase2 Input:    {p2Candidates}");
+                            ImGui.Text($"Phase2 HiZ Cull: {p2Candidates - p2Visible}");
+                            ImGui.Text($"Phase2 Drawn:    {p2Visible}");
+                            ImGui.Separator();
+                            ImGui.TextColored(
+                                new System.Numerics.Vector4(0, 1, 0, 1),
+                                $"Total Drawn:     {totalDrawn}  (saved {candidateCount - totalDrawn - lodRejected})"
+                            );
+                            ImGui.Text($"Dispatch: [{clusterPipeline.DebugCandidateArgsX}, ...]");
+                            ImGui.Text($"Page Faults: {clusterPipeline.LastPageFaultCount}");
+                            ImGui.Text($"Loaded Pages: {clusterPipeline.LastLoadedPageCount}");
+                            ImGui.Text(
+                                $"Resident Pages: {resourceManager.ResidentPageCount} / {resourceManager.PageCount}"
+                            );
+                            if (ImGui.Button("Evict All Pages"))
                             {
-                                var groups =
-                                    clusterPipeline.DebugBVHGroupCount.Length > i
-                                        ? clusterPipeline.DebugBVHGroupCount[i]
-                                        : 0;
-                                var items =
-                                    clusterPipeline.DebugBVHItemCount.Length > i
-                                        ? clusterPipeline.DebugBVHItemCount[i]
-                                        : 0;
-                                if (groups > 0 || items > 0)
+                                uint evicted = 0;
+                                for (uint i = 0; i < resourceManager.PageCount; i++)
                                 {
-                                    ImGui.Text($"Level {i}: {groups} groups, {items} items");
+                                    if (resourceManager.MarkPageNonResident(i))
+                                        evicted++;
                                 }
+                                Console.WriteLine($"[Streaming Test] Evicted {evicted} pages");
                             }
                             ImGui.TreePop();
                         }
@@ -601,9 +668,10 @@ class Program
                         else
                         {
                             foreach (
-                                var pair in resourceManager
-                                    .MeshBVHRoots
-                                    .OrderBy(p => p.Key, StringComparer.OrdinalIgnoreCase)
+                                var pair in resourceManager.MeshBVHRoots.OrderBy(
+                                    p => p.Key,
+                                    StringComparer.OrdinalIgnoreCase
+                                )
                             )
                             {
                                 ImGui.BulletText($"{pair.Key} (BVHRootIndex={pair.Value})");
@@ -690,11 +758,13 @@ class Program
 
                     if (ImGui.CollapsingHeader("Entities", ImGuiTreeNodeFlags.DefaultOpen))
                     {
-                        ImGui.Text($"Runtime instances: {transformSystem?.Count ?? 0}");
+                        ImGui.Text($"Runtime instances: {instanceDataManager?.Count ?? 0}");
 
                         var loadedMeshes = resourceManager
-                            .MeshBVHRoots
-                            .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                            .MeshBVHRoots.OrderBy(
+                                pair => pair.Key,
+                                StringComparer.OrdinalIgnoreCase
+                            )
                             .ToArray();
 
                         if (loadedMeshes.Length > 0)
@@ -752,7 +822,9 @@ class Program
                             {
                                 for (int i = 0; i < 100; i++)
                                 {
-                                    uint rootIndex = loadedMeshes[random.Next(loadedMeshes.Length)].Value;
+                                    uint rootIndex = loadedMeshes[
+                                        random.Next(loadedMeshes.Length)
+                                    ].Value;
                                     float x = (random.NextSingle() - 0.5f) * 80.0f;
                                     float y = (random.NextSingle() - 0.5f) * 10.0f;
                                     float z = (random.NextSingle() - 0.5f) * 80.0f;
@@ -784,7 +856,11 @@ class Program
                 }
                 ImGui.End();
             }
+
+            // Draw HiZ AABB debug overlay
+
             ImGui.Render();
+            var _tImGui = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
 
             var scDesc = context.SwapChain!.GetDesc();
             float aspect = scDesc.Width / (float)Math.Max(scDesc.Height, 1u);
@@ -794,67 +870,126 @@ class Program
             clusterPipeline.SetCamera(view, proj, camera.Position, 1.0f, lodScale, debugLOD);
 
             var pRTV = context.SwapChain!.GetCurrentBackBufferRTV();
-            var pDSV = context.DepthBufferDSV!;
 
-            renderGraph.Reset();
+            renderGraph.BeginFrame();
             var bbTex = pRTV.GetTexture();
-            var colorHandle = renderGraph.ImportTexture(
-                "BackBuffer",
-                bbTex,
-                ResourceState.Unknown,
-                pRTV
-            );
-            var depthTex = pDSV.GetTexture();
-            var depthHandle = renderGraph.ImportTexture(
-                "DepthBuffer",
-                depthTex,
-                ResourceState.Unknown,
-                pDSV
-            );
+            var colorHandle = renderGraph.Import("ColorTarget", bbTex, ResourceState.Unknown);
+            var depthHandle = renderGraph.CreateTexture("DepthTarget", context.DepthBufferDesc);
 
             renderGraph.AddPass<object>(
                 "Clear Main RT",
                 (builder, _) =>
                 {
-                    builder.WriteTexture(colorHandle, ResourceState.RenderTarget);
-                    builder.WriteTexture(depthHandle, ResourceState.DepthWrite);
+                    builder.Write(colorHandle, ResourceState.RenderTarget);
+                    builder.Write(depthHandle, ResourceState.DepthWrite);
                 },
                 (ctx, _) =>
                 {
-                    ctx.CommandList.SetRenderTargets([pRTV], pDSV, ResourceStateTransitionMode.Verify);
-                    ctx.CommandList.ClearRenderTarget(pRTV, new System.Numerics.Vector4(0.1f, 0.1f, 0.15f, 1.0f), ResourceStateTransitionMode.Verify);
-                    ctx.CommandList.ClearDepthStencil(pDSV, ClearDepthStencilFlags.Depth | ClearDepthStencilFlags.Stencil, 1.0f, 0, ResourceStateTransitionMode.Verify);
+                    var pDSV = ctx.GetTextureView(depthHandle, TextureViewType.DepthStencil);
+                    if (pDSV == null)
+                        return;
+
+                    ctx.CommandList.SetRenderTargets(
+                        [pRTV],
+                        pDSV,
+                        ResourceStateTransitionMode.Verify
+                    );
+                    ctx.CommandList.ClearRenderTarget(
+                        pRTV,
+                        new System.Numerics.Vector4(0.1f, 0.1f, 0.15f, 1.0f),
+                        ResourceStateTransitionMode.Verify
+                    );
+                    ctx.CommandList.ClearDepthStencil(
+                        pDSV,
+                        ClearDepthStencilFlags.Depth | ClearDepthStencilFlags.Stencil,
+                        1.0f,
+                        0,
+                        ResourceStateTransitionMode.Verify
+                    );
                 }
             );
 
-            clusterPipeline.AddToRenderGraph(renderGraph, colorHandle, depthHandle);
-            renderGraph.MarkAsOutput(colorHandle);
+            var _tSetup = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
+            clusterPipeline.AddPasses(renderGraph);
+            var _tAddPasses = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
 
             if (imguiRenderer != null && imguiRenderer.FontTexture != null)
             {
-                var fontHandle = renderGraph.ImportTexture("ImGui Font", imguiRenderer.FontTexture, ResourceState.Unknown);
-                
+                var drawData = ImGui.GetDrawData();
+                if (drawData.TotalVtxCount > 0)
+                {
+                    imguiRenderer.EnsureBuffers(drawData.TotalVtxCount, drawData.TotalIdxCount);
+                }
+
+                var fontHandle = renderGraph.Import(
+                    "ImGui Font",
+                    imguiRenderer.FontTexture,
+                    ResourceState.Unknown
+                );
+
+                var imguiVbHandle =
+                    imguiRenderer.VertexBuffer != null
+                        ? renderGraph.Import(
+                            "ImGui VB",
+                            imguiRenderer.VertexBuffer,
+                            ResourceState.Unknown
+                        )
+                        : RenderGraphHandle.Invalid;
+                var imguiIbHandle =
+                    imguiRenderer.IndexBuffer != null
+                        ? renderGraph.Import(
+                            "ImGui IB",
+                            imguiRenderer.IndexBuffer,
+                            ResourceState.Unknown
+                        )
+                        : RenderGraphHandle.Invalid;
+                var imguiUbHandle =
+                    imguiRenderer.UniformBuffer != null
+                        ? renderGraph.Import(
+                            "ImGui UB",
+                            imguiRenderer.UniformBuffer,
+                            ResourceState.Unknown
+                        )
+                        : RenderGraphHandle.Invalid;
+
                 renderGraph.AddPass<object>(
                     "ImGui Pass",
                     (builder, _) =>
                     {
-                        builder.ReadTexture(fontHandle, ResourceState.ShaderResource);
-                        builder.WriteTexture(colorHandle, ResourceState.RenderTarget);
+                        builder.Read(fontHandle, ResourceState.ShaderResource);
+                        builder.Write(colorHandle, ResourceState.RenderTarget);
+                        if (imguiVbHandle.IsValid)
+                            builder.Read(imguiVbHandle, ResourceState.VertexBuffer);
+                        if (imguiIbHandle.IsValid)
+                            builder.Read(imguiIbHandle, ResourceState.IndexBuffer);
+                        if (imguiUbHandle.IsValid)
+                            builder.Read(imguiUbHandle, ResourceState.ConstantBuffer);
                     },
                     (ctx, _) =>
                     {
-                        ctx.CommandList.SetRenderTargets([pRTV], null, ResourceStateTransitionMode.Verify);
+                        ctx.CommandList.SetRenderTargets(
+                            [pRTV],
+                            null,
+                            ResourceStateTransitionMode.Verify
+                        );
                         imguiRenderer.Render(ctx.CommandList, ImGui.GetDrawData());
                     }
                 );
             }
 
             renderGraph.Compile(context.Device);
+            var _tCompile = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
             renderGraph.Execute(context);
-            // simplePass?.Execute(context, null);
+            var _tExecute = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
+
+            frameCount++;
 
             // Present handled by RenderContext helper or manually
             context.Present();
+            var _tPresent = _sw.Elapsed.TotalMilliseconds;
+
+            if (frameCount % 120 == 0)
+                Console.WriteLine($"[Profile] Update={_tUpdate:F1} ImGui={_tImGui:F1} Setup={_tSetup:F1} AddPass={_tAddPasses:F1} Compile={_tCompile:F1} Execute={_tExecute:F1} Present={_tPresent:F1}ms");
         };
 
         window.Resize += (Vector2D<int> size) =>

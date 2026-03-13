@@ -14,6 +14,7 @@ namespace SomeEngine.Tests.Systems
     {
         private GameWorld _world;
         private RenderContext _mockContext;
+        private InstanceDataManager _dataManager;
         private InstanceSyncSystem _syncSystem;
 
         [SetUp]
@@ -24,14 +25,14 @@ namespace SomeEngine.Tests.Systems
             // For this test, since RenderContext.Device might be null if not initialized, we just pass an empty context
             // and rely on the null checks inside InstanceSyncSystem to not crash when trying to create/upload buffers.
             _mockContext = new RenderContext();
-            _syncSystem = new InstanceSyncSystem(_mockContext);
+            _dataManager = new InstanceDataManager();
+            _syncSystem = new InstanceSyncSystem(_dataManager);
             _world.SystemRoot.Add(_syncSystem);
         }
 
         [TearDown]
         public void TearDown()
         {
-            _syncSystem?.Dispose();
             _mockContext?.Dispose();
         }
 
@@ -39,7 +40,7 @@ namespace SomeEngine.Tests.Systems
         public void EmptyWorld_HasZeroCount()
         {
             _world.Update(0.16f);
-            Assert.That(_syncSystem.Count, Is.EqualTo(0));
+            Assert.That(_dataManager.Count, Is.EqualTo(0));
         }
 
         [Test]
@@ -49,7 +50,7 @@ namespace SomeEngine.Tests.Systems
             e.AddComponent(new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
 
             _world.Update(0.16f);
-            Assert.That(_syncSystem.Count, Is.EqualTo(0));
+            Assert.That(_dataManager.Count, Is.EqualTo(0));
         }
 
         [Test]
@@ -59,7 +60,7 @@ namespace SomeEngine.Tests.Systems
             e.AddComponent(new MeshInstance { BVHRootIndex = 1 });
 
             _world.Update(0.16f);
-            Assert.That(_syncSystem.Count, Is.EqualTo(0));
+            Assert.That(_dataManager.Count, Is.EqualTo(0));
         }
 
         [Test]
@@ -70,7 +71,7 @@ namespace SomeEngine.Tests.Systems
             e.AddComponent(new MeshInstance { BVHRootIndex = 5 });
 
             _world.Update(0.16f);
-            Assert.That(_syncSystem.Count, Is.EqualTo(1));
+            Assert.That(_dataManager.Count, Is.EqualTo(1));
         }
 
         [Test]
@@ -88,7 +89,7 @@ namespace SomeEngine.Tests.Systems
             e3.AddComponent(new MeshInstance { BVHRootIndex = 12 });
 
             _world.Update(0.16f);
-            Assert.That(_syncSystem.Count, Is.EqualTo(2));
+            Assert.That(_dataManager.Count, Is.EqualTo(2));
         }
     }
 }

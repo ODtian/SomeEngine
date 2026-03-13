@@ -2,57 +2,41 @@ using Diligent;
 
 namespace SomeEngine.Render.Graph;
 
-public class RenderGraphBuilder(RenderGraph graph, RenderPass pass)
+public struct RenderGraphBuilder(RenderGraph graph, int passIndex)
 {
-    public RGResourceHandle ReadTexture(
-        RGResourceHandle handle,
+    public RenderGraphHandle Read(
+        RenderGraphHandle h,
         ResourceState state = ResourceState.ShaderResource
-    )
+    ) => Read(h, state, SubResourceRange.All);
+
+    public RenderGraphHandle Read(RenderGraphHandle h, ResourceState state, SubResourceRange range)
     {
-        graph.RegisterResourceRead(handle, pass, state);
-        return handle;
+        graph.RegisterResourceRead(h, passIndex, state, range);
+        return h;
     }
 
-    public RGResourceHandle WriteTexture(
-        RGResourceHandle handle,
+    public RenderGraphHandle Write(
+        RenderGraphHandle h,
         ResourceState state = ResourceState.RenderTarget
+    ) => Write(h, state, SubResourceRange.All);
+
+    public RenderGraphHandle Write(RenderGraphHandle h, ResourceState state, SubResourceRange range)
+    {
+        graph.RegisterResourceWrite(h, passIndex, state, range);
+        return h;
+    }
+
+    public RenderGraphHandle ReadWrite(RenderGraphHandle h, ResourceState state) =>
+        ReadWrite(h, state, SubResourceRange.All);
+
+    public RenderGraphHandle ReadWrite(
+        RenderGraphHandle h,
+        ResourceState state,
+        SubResourceRange range
     )
     {
-        return graph.RegisterResourceWrite(handle, pass, state);
+        graph.RegisterResourceRead(h, passIndex, state, range);
+        graph.RegisterResourceWrite(h, passIndex, state, range);
+        return h;
     }
-
-    public RGResourceHandle ReadBuffer(
-        RGResourceHandle handle,
-        ResourceState state = ResourceState.ShaderResource
-    )
-    {
-        graph.RegisterResourceRead(handle, pass, state);
-        return handle;
-    }
-
-    public RGResourceHandle WriteBuffer(
-        RGResourceHandle handle,
-        ResourceState state = ResourceState.UnorderedAccess
-    )
-    {
-        return graph.RegisterResourceWrite(handle, pass, state);
-    }
-
-    // Create transient texture for this pass (output)
-    public RGResourceHandle CreateTexture(string name, TextureDesc desc)
-    {
-        return graph.CreateTexture(name, desc);
-    }
-
-    public RGResourceHandle CreateBuffer(string name, BufferDesc desc)
-    {
-        return graph.CreateBuffer(name, desc);
-    }
-
-    public void MarkAsOutput(RGResourceHandle handle)
-    {
-        graph.MarkAsOutput(handle);
-    }
-
-    // ... Add Buffer methods similarly
 }

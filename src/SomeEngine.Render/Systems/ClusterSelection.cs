@@ -47,7 +47,7 @@ public static class ClusterSelection
         // 2. Check Self Error (Skip if I am not good enough, need children)
         // Note: For Self Error evaluation, we use the SAME sphere as the parent 
         // check to maintain hierarchy consistency.
-        bool selfGood = (cluster.LODError / d_parent) <= lodThreshold;
+        bool selfGood = ((float)BitConverter.UInt16BitsToHalf(cluster.LODErrorHalf) / d_parent) <= lodThreshold;
         
         return selfGood;
     }

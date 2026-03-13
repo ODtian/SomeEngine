@@ -45,7 +45,7 @@ public class DagView : Control
         _nodePositions.Clear();
         if (_clusters.Count == 0) return;
 
-        var levels = _clusters.GroupBy(c => (int)c.LODLevel).OrderBy(g => g.Key).ToList();
+        var levels = _clusters.GroupBy(c => (int)((c.PackedCounts >> 16) & 0xFF)).OrderBy(g => g.Key).ToList();
         double height = 2000;
         double width = 5000;
 
@@ -54,7 +54,7 @@ public class DagView : Control
         for (int i = 0; i < levels.Count; i++)
         {
             var levelIndices = _clusters.Select((c, idx) => new { c, idx })
-                                        .Where(x => x.c.LODLevel == i)
+                                        .Where(x => ((x.c.PackedCounts >> 16) & 0xFF) == (uint)i)
                                         .ToList();
             
             /*
@@ -193,7 +193,7 @@ public class DagView : Control
                     for (int j = 0; j < _clusters.Count; j++)
                     {
                         var parent = _clusters[j];
-                        if (parent.GroupId == child.ParentGroupId && parent.LODLevel == child.LODLevel + 1)
+                        if (parent.GroupId == child.ParentGroupId && ((parent.PackedCounts >> 16) & 0xFF) == ((child.PackedCounts >> 16) & 0xFF) + 1)
                         {
                             if (_nodePositions.TryGetValue(i, out var start) && _nodePositions.TryGetValue(j, out var end))
                             {
@@ -232,7 +232,7 @@ public class DagView : Control
                 if (_zoom > 0.3)
                 {
                     var text = new FormattedText(
-                        $"ID:{idx}\nG:{cluster.GroupId}\nE:{cluster.LODError:F4}",
+                        $"ID:{idx}\nG:{cluster.GroupId}\nE:{(float)BitConverter.UInt16BitsToHalf(cluster.LODErrorHalf):F4}",
                         System.Globalization.CultureInfo.CurrentCulture,
                         FlowDirection.LeftToRight, typeface, 12, Brushes.White);
                     context.DrawText(text, pos + new Point(12, -15));

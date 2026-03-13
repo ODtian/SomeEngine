@@ -3,10 +3,11 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Diligent;
 using SomeEngine.Assets.Data;
-using SomeEngine.Assets.Schema;
 using SomeEngine.Assets.Importers;
+using SomeEngine.Assets.Schema;
+using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
-
+using System.Numerics;
 namespace SomeEngine.Render.Systems;
 
 public class ClusterResourceManager : IDisposable
@@ -15,23 +16,15 @@ public class ClusterResourceManager : IDisposable
 
     // Page-Based Streaming Heap
 
-    public IBuffer? PageHeap { get; private set; }
-    public IBuffer? PageFaultBuffer { get; private set; }
-    public IBuffer? PageFaultReadbackBuffer { get; private set; }
+    public BufferDesc PageHeapDesc { get; private set; }
+    public BufferDesc PageFaultDesc { get; private set; }
+    public BufferDesc PageFaultReadbackDesc { get; private set; }
 
     // Global BVH Buffer
 
-    public IBuffer? GlobalBVHBuffer { get; private set; }
+    public BufferDesc GlobalBVHDesc { get; private set; }
     private uint _bvhNodeCount = 0;
     private const uint BVHMaxNodes = 262144; // 256K nodes * 64B = 16MB
-
-    // Patching resources
-    private IPipelineState? _patchPSO;
-    private IShaderResourceBinding? _patchSRB;
-    private ShaderAsset? _patchShaderAsset;
-    private IBuffer? _patchUniformsBuffer;
-    private IBuffer? _patchNodeIndicesBuffer;
-    private bool _patchInitialized = false;
 
     // Track loaded pages
     public struct PageInfo
@@ -53,8 +46,8 @@ public class ClusterResourceManager : IDisposable
     private readonly Dictionary<uint, byte[]> _pageSourceData = new();
     private readonly HashSet<uint> _residentPages = new();
 
-
     public uint PageCount => (uint)_pageOffsets.Count;
+    public uint ResidentPageCount => (uint)_residentPages.Count;
     private readonly List<uint> _pageOffsets = new(); // Current resident offset per page ID, or PageFaultMarker when non-resident
     private readonly List<uint> _pageSizes = new(); // Original page payload size per page ID
     public const uint MaxPageFaults = 4096;
@@ -62,6 +55,10 @@ public class ClusterResourceManager : IDisposable
 
     private const uint HeapSize = 64 * 1024 * 1024; // 64MB
     private const int PageSize = 131072; // 128KB fixed page size as per plan
+
+    // Global quantization parameters (from loaded mesh asset)
+    public Vector3 QuantOrigin { get; private set; } = Vector3.Zero;
+    public float QuantStep { get; private set; } = 1.0f;
 
     private struct FreeBlock
     {
@@ -79,125 +76,55 @@ public class ClusterResourceManager : IDisposable
         InitHeap();
     }
 
-
     private void InitHeap()
     {
-        if (_context.Device == null) return;
-
-
-        BufferDesc heapDesc = new BufferDesc
+        PageHeapDesc = new BufferDesc
         {
             Name = "Global Page Heap",
             Size = HeapSize,
             Usage = Usage.Default,
             BindFlags = BindFlags.ShaderResource | BindFlags.IndexBuffer,
-            Mode = BufferMode.Raw
+            Mode = BufferMode.Raw,
         };
 
-
-        PageHeap = _context.Device.CreateBuffer(heapDesc);
-
-        BufferDesc pageFaultDesc = new BufferDesc
+        PageFaultDesc = new BufferDesc
         {
             Name = "Cluster Page Fault Buffer",
             Size = PageFaultBufferSize,
             Usage = Usage.Default,
             BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
             Mode = BufferMode.Raw,
-            ElementByteStride = 4
+            ElementByteStride = 4,
         };
-        PageFaultBuffer = _context.Device.CreateBuffer(pageFaultDesc);
 
-        BufferDesc pageFaultReadbackDesc = new BufferDesc
+        PageFaultReadbackDesc = new BufferDesc
         {
             Name = "Cluster Page Fault Readback",
             Size = PageFaultBufferSize,
             Usage = Usage.Staging,
             CPUAccessFlags = CpuAccessFlags.Read,
         };
-        PageFaultReadbackBuffer = _context.Device.CreateBuffer(pageFaultReadbackDesc);
 
         // Global BVH Buffer (Structured)
-        BufferDesc bvhDesc = new BufferDesc
+        GlobalBVHDesc = new BufferDesc
         {
             Name = "Global BVH Buffer",
             Size = BVHMaxNodes * 64, // 64 bytes per node
             Usage = Usage.Default,
             BindFlags = BindFlags.ShaderResource | BindFlags.UnorderedAccess,
             Mode = BufferMode.Structured,
-            ElementByteStride = 64
+            ElementByteStride = 64,
         };
-        GlobalBVHBuffer = _context.Device.CreateBuffer(bvhDesc);
 
         _freeBlocks.Clear();
         _freeBlocks.Add(new FreeBlock { Offset = 0, Size = HeapSize });
-
-        // Patch Uniforms
-        _patchUniformsBuffer = _context.Device.CreateBuffer(new BufferDesc
-        {
-            Name = "Patch Uniforms",
-            Size = 16,
-            Usage = Usage.Default,
-            BindFlags = BindFlags.UniformBuffer
-        });
-
-        // Dynamic buffer for node indices
-
-        _patchNodeIndicesBuffer = _context.Device.CreateBuffer(new BufferDesc
-        {
-            Name = "Patch Node Indices",
-            Size = 16384 * 4,
-            Usage = Usage.Dynamic,
-
-            BindFlags = BindFlags.ShaderResource,
-            CPUAccessFlags = CpuAccessFlags.Write,
-            Mode = BufferMode.Structured,
-            ElementByteStride = 4
-        });
-
-
     }
 
-    public IBuffer? GetIndexBuffer() => PageHeap;
-
-
-
-    private void InitPatchPSO(IBuffer globalBVHBuffer)
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BVHPatchData
     {
-        if (_patchInitialized || _context.Device == null) return;
-
-
-        string path = System.IO.Path.GetFullPath(System.IO.Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/bvh_patch.slang"));
-        _patchShaderAsset = SlangShaderImporter.Import(path);
-
-
-        var ci = new ComputePipelineStateCreateInfo();
-        ci.PSODesc.Name = "BVH Patch PSO";
-        ci.PSODesc.PipelineType = PipelineType.Compute;
-        using var cs = _patchShaderAsset.CreateShader(_context, "main");
-        ci.Cs = cs;
-        ci.PSODesc.ResourceLayout.DefaultVariableType = ShaderResourceVariableType.Mutable;
-        ci.PSODesc.ResourceLayout.Variables = _patchShaderAsset.GetResourceVariables(_context, static name => null);
-
-        _patchPSO = _context.Device.CreateComputePipelineState(ci);
-        if (_patchPSO != null)
-        {
-            _patchSRB = _patchPSO.CreateShaderResourceBinding(false);
-            _patchSRB.GetVariableByName(ShaderType.Compute, "GlobalBVH")?.Set(globalBVHBuffer.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-            _patchSRB.GetVariableByName(ShaderType.Compute, "Uniforms")?.Set(_patchUniformsBuffer, SetShaderResourceFlags.None);
-            _patchSRB.GetVariableByName(ShaderType.Compute, "NodeIndices")?.Set(_patchNodeIndicesBuffer?.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        }
-
-
-        _patchInitialized = true;
-    }
-
-    struct PatchUniforms
-    {
-        public uint NodeCount;
+        public uint NodeIndex;
         public uint NewPagePointer;
-        public uint Pad0;
-        public uint Pad1;
     }
 
     private struct PendingPatch
@@ -206,6 +133,7 @@ public class ClusterResourceManager : IDisposable
         public uint ByteOffset;
         public bool Resident;
     }
+
     private readonly List<PendingPatch> _pendingPatches = new();
 
     private struct PendingUploadBVH
@@ -213,6 +141,7 @@ public class ClusterResourceManager : IDisposable
         public uint Offset;
         public ClusterBVHNode[] Data;
     }
+
     private readonly List<PendingUploadBVH> _pendingUploadBVH = new();
 
     private struct PendingUploadData
@@ -220,63 +149,48 @@ public class ClusterResourceManager : IDisposable
         public uint Offset;
         public byte[] Data;
     }
+
     private readonly List<PendingUploadData> _pendingUploadData = new();
 
     public void PatchBVHLeafNodes(uint pageID, uint byteOffset, bool resident)
     {
-        _pendingPatches.Add(new PendingPatch { PageID = pageID, ByteOffset = byteOffset, Resident = resident });
+        _pendingPatches.Add(
+            new PendingPatch
+            {
+                PageID = pageID,
+                ByteOffset = byteOffset,
+                Resident = resident,
+            }
+        );
     }
 
-    private void ExecutePatchBVHLeafNodes(RenderContext context, uint pageID, uint byteOffset, bool resident, IBuffer globalBVHBuffer)
+    public IReadOnlyList<BVHPatchData> ExtractPendingPatches()
     {
-        if (!PageToLeafNodes.TryGetValue(pageID, out var nodes) || nodes.Count == 0) return;
-        if (context.ImmediateContext == null || _patchNodeIndicesBuffer == null || _patchUniformsBuffer == null) return;
+        if (_pendingPatches.Count == 0)
+            return Array.Empty<BVHPatchData>();
 
-
-        InitPatchPSO(globalBVHBuffer);
-        if (_patchPSO == null || _patchSRB == null) return;
-
-        // 1. Update Uniforms
-        uint offsetVal = resident ? byteOffset : ClusterBVHNode.PageFaultMarker;
-        var uniforms = new PatchUniforms { NodeCount = (uint)nodes.Count, NewPagePointer = offsetVal, Pad0 = 0, Pad1 = 0 };
-        context.ImmediateContext.UpdateBuffer(_patchUniformsBuffer, 0, new PatchUniforms[] { uniforms }.AsSpan(), ResourceStateTransitionMode.Verify);
-
-        // 2. Map & Write Node Indices
-        unsafe
+        var patchList = new List<BVHPatchData>();
+        foreach (var patch in _pendingPatches)
         {
-            // Reallocate dynamic buffer if too small
-            if (_patchNodeIndicesBuffer.GetDesc().Size < (ulong)nodes.Count * 4)
-            {
-                _patchNodeIndicesBuffer.Dispose();
-                _patchNodeIndicesBuffer = context.Device!.CreateBuffer(new BufferDesc
-                {
-                    Name = "Patch Node Indices",
-                    Size = (uint)nodes.Count * 4 * 2,
-                    Usage = Usage.Dynamic,
+            if (!PageToLeafNodes.TryGetValue(patch.PageID, out var nodes) || nodes.Count == 0)
+                continue;
 
-                    BindFlags = BindFlags.ShaderResource,
-                    CPUAccessFlags = CpuAccessFlags.Write,
-                    Mode = BufferMode.Structured,
-                    ElementByteStride = 4
-                });
-                _patchSRB.GetVariableByName(ShaderType.Compute, "NodeIndices")?.Set(_patchNodeIndicesBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+            uint offsetVal = patch.Resident ? patch.ByteOffset : ClusterBVHNode.PageFaultMarker;
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                patchList.Add(
+                    new BVHPatchData { NodeIndex = nodes[i], NewPagePointer = offsetVal }
+                );
             }
 
-            var map = context.ImmediateContext.MapBuffer<uint>(_patchNodeIndicesBuffer, MapType.Write, MapFlags.Discard);
-            for (int i = 0; i < nodes.Count; i++) map[i] = nodes[i];
-            context.ImmediateContext.UnmapBuffer(_patchNodeIndicesBuffer, MapType.Write);
+            if (patch.Resident)
+                _residentPages.Add(patch.PageID);
+            else
+                _residentPages.Remove(patch.PageID);
         }
 
-        // 3. Dispatch
-        context.ImmediateContext.SetPipelineState(_patchPSO);
-        context.ImmediateContext.CommitShaderResources(_patchSRB, ResourceStateTransitionMode.Verify);
-        uint groups = ((uint)nodes.Count + 63) / 64;
-        context.ImmediateContext.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = groups, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
-
-        if (resident)
-            _residentPages.Add(pageID);
-        else
-            _residentPages.Remove(pageID);
+        _pendingPatches.Clear();
+        return patchList;
     }
 
     public bool TryGetPageForLeafNode(uint nodeIndex, out uint pageID)
@@ -372,15 +286,20 @@ public class ClusterResourceManager : IDisposable
         if (!mesh.Payload.HasValue || mesh.Payload.Value.IsEmpty)
             return uint.MaxValue;
 
-
         string meshName = mesh.Name ?? "Unnamed";
         if (PageRegistry.ContainsKey(meshName))
-
             return MeshBVHRoots.GetValueOrDefault(meshName, uint.MaxValue);
 
         var payload = mesh.Payload.Value;
         int payloadLength = payload.Length;
         int pageDataEnd = (mesh.BvhOffset > 0) ? (int)mesh.BvhOffset : payloadLength;
+
+        // Store global quantization parameters
+        if (mesh.QuantOrigin != null)
+        {
+            QuantOrigin = new Vector3(mesh.QuantOrigin.X, mesh.QuantOrigin.Y, mesh.QuantOrigin.Z);
+        }
+        QuantStep = mesh.QuantStep > 0 ? mesh.QuantStep : 1.0f;
 
         var pageList = new List<PageInfo>();
         PageRegistry[meshName] = pageList;
@@ -390,21 +309,23 @@ public class ClusterResourceManager : IDisposable
 
         while (offset < pageDataEnd)
         {
-            // Read Header to get PageSize
-            // Header: ClusterCount(0), VertexCount(4), IndexCount(8), PageSize(12)
-            if (offset + 16 > pageDataEnd) break;
+            // Read Header (44 bytes)
+            // ClusterCount(0), VertexCount(4), TriangleCount(8), QuantOriginX(12),
+            // ClustersOff(16), PosOff(20), AttrOff(24), IdxOff(28),
+            // QuantOriginY(32), QuantOriginZ(36), QuantStep(40)
+            if (offset + MeshPageHeader.Size > pageDataEnd)
+                break;
 
-
-            var headerSpan = payload.Span.Slice(offset, 16);
-            uint pageSize = MemoryMarshal.Read<uint>(headerSpan.Slice(12, 4));
+            var headerSpan = payload.Span.Slice(offset, MeshPageHeader.Size);
             uint clusterCount = MemoryMarshal.Read<uint>(headerSpan.Slice(0, 4));
+            uint totalTriangleCount = MemoryMarshal.Read<uint>(headerSpan.Slice(8, 4));
+            uint indicesOffset = MemoryMarshal.Read<uint>(headerSpan.Slice(28, 4));
 
-            // Fallback for old assets or if PageSize was 0 (pad)
+            // Reconstruct page size: IndicesOffset + TotalTriangleCount * 3 (u8 indices)
+            uint pageSize = indicesOffset + totalTriangleCount * 3;
 
-            if (pageSize == 0) pageSize = 131072;
-
-
-            if (offset + pageSize > pageDataEnd) pageSize = (uint)(pageDataEnd - offset);
+            if (offset + pageSize > pageDataEnd)
+                pageSize = (uint)(pageDataEnd - offset);
 
             // Allocate
             uint heapOffset = AllocateHeap(pageSize);
@@ -425,16 +346,15 @@ public class ClusterResourceManager : IDisposable
             _residentPages.Add(pageId);
             TouchPage(pageId);
 
-
-            pageList.Add(new PageInfo
-
-            {
-                PageID = pageId,
-                Offset = heapOffset,
-                Size = pageSize,
-                ClusterCount = clusterCount
-            });
-
+            pageList.Add(
+                new PageInfo
+                {
+                    PageID = pageId,
+                    Offset = heapOffset,
+                    Size = pageSize,
+                    ClusterCount = clusterCount,
+                }
+            );
 
             offset += (int)pageSize;
         }
@@ -489,8 +409,6 @@ public class ClusterResourceManager : IDisposable
             }
         }
 
-
-
         return bvhRootIndex;
     }
 
@@ -511,10 +429,15 @@ public class ClusterResourceManager : IDisposable
         if (TryAllocateHeap(alignedSize, out uint offset))
             return offset;
 
-        if (TryEvictPagesForSize(alignedSize, protectedPageID) && TryAllocateHeap(alignedSize, out offset))
+        if (
+            TryEvictPagesForSize(alignedSize, protectedPageID)
+            && TryAllocateHeap(alignedSize, out offset)
+        )
             return offset;
 
-        throw new Exception($"Cluster Page Heap OOM. Requested {alignedSize}, LargestFreeBlock {GetLargestFreeBlockSize()}");
+        throw new Exception(
+            $"Cluster Page Heap OOM. Requested {alignedSize}, LargestFreeBlock {GetLargestFreeBlockSize()}"
+        );
     }
 
     private static uint AlignTo16(uint size)
@@ -541,7 +464,7 @@ public class ClusterResourceManager : IDisposable
                 _freeBlocks[i] = new FreeBlock
                 {
                     Offset = block.Offset + alignedSize,
-                    Size = block.Size - alignedSize
+                    Size = block.Size - alignedSize,
                 };
             }
 
@@ -575,7 +498,7 @@ public class ClusterResourceManager : IDisposable
                 _freeBlocks[insertIndex - 1] = new FreeBlock
                 {
                     Offset = prev.Offset,
-                    Size = prev.Size + cur.Size
+                    Size = prev.Size + cur.Size,
                 };
                 _freeBlocks.RemoveAt(insertIndex);
                 insertIndex--;
@@ -591,7 +514,7 @@ public class ClusterResourceManager : IDisposable
                 _freeBlocks[insertIndex] = new FreeBlock
                 {
                     Offset = cur.Offset,
-                    Size = cur.Size + next.Size
+                    Size = cur.Size + next.Size,
                 };
                 _freeBlocks.RemoveAt(insertIndex + 1);
             }
@@ -664,57 +587,38 @@ public class ClusterResourceManager : IDisposable
         _pendingUploadData.Add(new PendingUploadData { Offset = offset, Data = data.ToArray() });
     }
 
-    public void ExecutePendingUploads(RenderContext renderContext, IBuffer globalBVHBuffer, IBuffer pageHeapBuffer)
+    public void ExecutePendingUploads(
+        RenderContext renderContext,
+        IBuffer globalBVHBuffer,
+        IBuffer pageHeapBuffer
+    )
     {
         var ctx = renderContext.ImmediateContext;
-        if (ctx == null) return;
+        if (ctx == null)
+            return;
 
         foreach (var upload in _pendingUploadBVH)
         {
-            unsafe
-            {
-                fixed (ClusterBVHNode* ptr = upload.Data)
-                {
-                    ctx.UpdateBuffer(globalBVHBuffer, upload.Offset, (uint)(upload.Data.Length * 64), (IntPtr)ptr, ResourceStateTransitionMode.Verify);
-                }
-            }
+            ctx.UpdateBuffer(
+                globalBVHBuffer,
+                upload.Offset,
+                new ReadOnlySpan<ClusterBVHNode>(upload.Data),
+                ResourceStateTransitionMode.Verify
+            );
         }
         _pendingUploadBVH.Clear();
 
         foreach (var upload in _pendingUploadData)
         {
-            unsafe
-            {
-                fixed (byte* ptr = upload.Data)
-                {
-                    ctx.UpdateBuffer(pageHeapBuffer, upload.Offset, (uint)upload.Data.Length, (IntPtr)ptr, ResourceStateTransitionMode.Verify);
-                }
-            }
+            ctx.UpdateBuffer(
+                pageHeapBuffer,
+                upload.Offset,
+                new ReadOnlySpan<byte>(upload.Data),
+                ResourceStateTransitionMode.Verify
+            );
         }
         _pendingUploadData.Clear();
     }
 
-    public void ExecutePendingPatches(RenderContext renderContext, IBuffer globalBVHBuffer)
-    {
-        var ctx = renderContext.ImmediateContext;
-        if (ctx == null) return;
-
-        foreach (var patch in _pendingPatches)
-        {
-            ExecutePatchBVHLeafNodes(renderContext, patch.PageID, patch.ByteOffset, patch.Resident, globalBVHBuffer);
-        }
-        _pendingPatches.Clear();
-    }
-
-    public void Dispose()
-    {
-        PageHeap?.Dispose();
-        PageFaultBuffer?.Dispose();
-        PageFaultReadbackBuffer?.Dispose();
-        GlobalBVHBuffer?.Dispose();
-        _patchPSO?.Dispose();
-        _patchSRB?.Dispose();
-        _patchUniformsBuffer?.Dispose();
-        _patchNodeIndicesBuffer?.Dispose();
-    }
+    public void Dispose() { }
 }

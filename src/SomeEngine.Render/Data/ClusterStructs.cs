@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 namespace SomeEngine.Render.Data
 {
     /// <summary>
-    /// Header for a streamed geometry page.
+    /// Runtime mirror of MeshPageHeader (44 bytes).
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct PageHeader
@@ -11,11 +11,15 @@ namespace SomeEngine.Render.Data
         public uint ClusterCount;
         public uint TotalVertexCount;
         public uint TotalTriangleCount;
-        public uint PageSize;
+        public float QuantOriginX;
 
         public uint ClustersOffset;
         public uint PositionsOffset;
         public uint AttributesOffset;
         public uint IndicesOffset;
+
+        public float QuantOriginY;
+        public float QuantOriginZ;
+        public float QuantStep;
     }
 }

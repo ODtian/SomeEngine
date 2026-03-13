@@ -1,17 +1,17 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Diligent;
 using ImGuiNET;
-using SomeEngine.Render.RHI;
-using System.Runtime.CompilerServices;
 using SomeEngine.Assets.Importers;
-using System.IO;
+using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Utils;
 
-public unsafe class ImGuiRenderer : IDisposable
+public class ImGuiRenderer : IDisposable
 {
     private readonly RenderContext _context;
     private IBuffer? _vertexBuffer;
@@ -24,6 +24,10 @@ public unsafe class ImGuiRenderer : IDisposable
     private ITextureView? _fontTextureView;
     private ISampler? _sampler;
 
+    public IBuffer? VertexBuffer => _vertexBuffer;
+    public IBuffer? IndexBuffer => _indexBuffer;
+    public IBuffer? UniformBuffer => _uniformBuffer;
+
     private int _vertexBufferSize = 10000;
     private int _indexBufferSize = 10000;
 
@@ -33,7 +37,7 @@ public unsafe class ImGuiRenderer : IDisposable
         Init();
     }
 
-    private void Init()
+    private unsafe void Init()
     {
         var device = _context.Device;
         if (device == null)
@@ -46,56 +50,66 @@ public unsafe class ImGuiRenderer : IDisposable
         io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard;
 
         // Create Font Texture
-        byte *pixels;
-        int width, height, bytesPerPixel;
-        io.Fonts.GetTexDataAsRGBA32(
-            out pixels, out width, out height, out bytesPerPixel
-        );
+        byte* pixels;
+        int width,
+            height,
+            bytesPerPixel;
+        io.Fonts.GetTexDataAsRGBA32(out pixels, out width, out height, out bytesPerPixel);
 
-        TextureDesc texDesc = new TextureDesc {
+        TextureDesc texDesc = new TextureDesc
+        {
             Name = "ImGui Font Texture",
             Type = ResourceDimension.Tex2d,
             Width = (uint)width,
             Height = (uint)height,
             Format = TextureFormat.RGBA8_UNorm,
             Usage = Usage.Immutable,
-            BindFlags = BindFlags.ShaderResource
+            BindFlags = BindFlags.ShaderResource,
         };
 
-        TextureData data = new TextureData {
-            SubResources = [new TextureSubResData {
-                Data = (IntPtr)pixels, Stride = (ulong)(width * bytesPerPixel)
-            }]
+        TextureData data = new TextureData
+        {
+            SubResources =
+            [
+                new TextureSubResData
+                {
+                    Data = (IntPtr)pixels,
+                    Stride = (ulong)(width * bytesPerPixel),
+                },
+            ],
         };
 
         _fontTexture = device.CreateTexture(texDesc, data);
 
-        TextureViewDesc viewDesc = new TextureViewDesc {
+        TextureViewDesc viewDesc = new TextureViewDesc
+        {
             ViewType = TextureViewType.ShaderResource,
             Name = "ImGui Font Texture SRV",
-            Format = texDesc.Format
+            Format = texDesc.Format,
         };
         _fontTextureView = _fontTexture.CreateView(viewDesc);
 
-        SamplerDesc samDesc = new SamplerDesc {
+        SamplerDesc samDesc = new SamplerDesc
+        {
             MinFilter = FilterType.Linear,
             MagFilter = FilterType.Linear,
             MipFilter = FilterType.Linear,
             AddressU = TextureAddressMode.Wrap,
             AddressV = TextureAddressMode.Wrap,
-            AddressW = TextureAddressMode.Wrap
+            AddressW = TextureAddressMode.Wrap,
         };
         _sampler = device.CreateSampler(samDesc);
 
         io.Fonts.SetTexID((IntPtr)1);
 
         // Create Uniform Buffer
-        BufferDesc ubDesc = new BufferDesc {
+        BufferDesc ubDesc = new BufferDesc
+        {
             Name = "ImGui Uniform Buffer",
             Size = (ulong)Marshal.SizeOf<Matrix4x4>(),
             Usage = Usage.Dynamic,
             BindFlags = BindFlags.UniformBuffer,
-            CPUAccessFlags = CpuAccessFlags.Write
+            CPUAccessFlags = CpuAccessFlags.Write,
         };
         _uniformBuffer = device.CreateBuffer(ubDesc);
 
@@ -109,18 +123,20 @@ public unsafe class ImGuiRenderer : IDisposable
             return;
 
         string shaderPath = Path.Combine(
-            AppContext.BaseDirectory, "../../../../../../assets/Shaders/imgui.hlsl"
+            AppContext.BaseDirectory,
+            "../../../../../../assets/Shaders/imgui.hlsl"
         );
 
         // Use standard Diligent HLSL shader creation
-        var shaderCI = new ShaderCreateInfo {
+        using var shaderSourceFactory = _context.Factory?.CreateDefaultShaderSourceStreamFactory(
+            "assets/Shaders"
+        );
+        var shaderCI = new ShaderCreateInfo
+        {
             SourceLanguage = ShaderSourceLanguage.Hlsl,
             ShaderCompiler = ShaderCompiler.Dxc,
             FilePath = shaderPath,
-            ShaderSourceStreamFactory =
-                _context.Factory?.CreateDefaultShaderSourceStreamFactory(
-                    "assets/Shaders"
-                )
+            ShaderSourceStreamFactory = shaderSourceFactory,
         };
 
         shaderCI.Desc.Name = "ImGui VS";
@@ -133,35 +149,36 @@ public unsafe class ImGuiRenderer : IDisposable
         shaderCI.EntryPoint = "PSMain";
         using var ps = device.CreateShader(shaderCI, out _);
 
-        GraphicsPipelineStateCreateInfo psoCI =
-            new GraphicsPipelineStateCreateInfo();
+        GraphicsPipelineStateCreateInfo psoCI = new GraphicsPipelineStateCreateInfo();
         psoCI.PSODesc.Name = "ImGui PSO";
-        psoCI.PSODesc.ResourceLayout.DefaultVariableType =
-            ShaderResourceVariableType.Mutable;
+        psoCI.PSODesc.ResourceLayout.DefaultVariableType = ShaderResourceVariableType.Mutable;
 
         // Use standard Diligent variable description instead of
         // shaderAsset.GetResourceVariables
-        psoCI.PSODesc.ResourceLayout.Variables = [
-            new ShaderResourceVariableDesc {
+        psoCI.PSODesc.ResourceLayout.Variables =
+        [
+            new ShaderResourceVariableDesc
+            {
                 Name = "UniformBuffer",
                 ShaderStages = ShaderType.Vertex,
-                Type = ShaderResourceVariableType.Static
+                Type = ShaderResourceVariableType.Static,
             },
-            new ShaderResourceVariableDesc {
+            new ShaderResourceVariableDesc
+            {
                 Name = "g_Texture",
                 ShaderStages = ShaderType.Pixel,
-                Type = ShaderResourceVariableType.Mutable
+                Type = ShaderResourceVariableType.Mutable,
             },
-            new ShaderResourceVariableDesc {
+            new ShaderResourceVariableDesc
+            {
                 Name = "g_Texture_sampler",
                 ShaderStages = ShaderType.Pixel,
-                Type = ShaderResourceVariableType.Mutable
-            }
+                Type = ShaderResourceVariableType.Mutable,
+            },
         ];
 
         psoCI.GraphicsPipeline.NumRenderTargets = 1;
-        psoCI.GraphicsPipeline.RTVFormats =
-            [_context.SwapChain!.GetDesc().ColorBufferFormat];
+        psoCI.GraphicsPipeline.RTVFormats = [_context.SwapChain!.GetDesc().ColorBufferFormat];
         psoCI.GraphicsPipeline.DSVFormat = TextureFormat.Unknown;
         psoCI.GraphicsPipeline.PrimitiveTopology = PrimitiveTopology.TriangleList;
 
@@ -179,38 +196,43 @@ public unsafe class ImGuiRenderer : IDisposable
         blendDesc.RenderTargets[0].BlendOpAlpha = BlendOperation.Add;
         psoCI.GraphicsPipeline.BlendDesc = blendDesc;
 
-        psoCI.GraphicsPipeline.InputLayout.LayoutElements = [
-            new LayoutElement {
+        psoCI.GraphicsPipeline.InputLayout.LayoutElements =
+        [
+            new LayoutElement
+            {
                 InputIndex = 0,
                 BufferSlot = 0,
                 NumComponents = 2,
                 ValueType = Diligent.ValueType.Float32,
-                IsNormalized = false
+                IsNormalized = false,
             },
-            new LayoutElement {
+            new LayoutElement
+            {
                 InputIndex = 1,
                 BufferSlot = 0,
                 NumComponents = 2,
                 ValueType = Diligent.ValueType.Float32,
-                IsNormalized = false
+                IsNormalized = false,
             },
-            new LayoutElement {
+            new LayoutElement
+            {
                 InputIndex = 2,
                 BufferSlot = 0,
                 NumComponents = 4,
                 ValueType = Diligent.ValueType.UInt8,
-                IsNormalized = true
-            }
+                IsNormalized = true,
+            },
         ];
 
         psoCI.Vs = vs;
         psoCI.Ps = ps;
 
-        _pso = device.CreateGraphicsPipelineState(psoCI) ??
-               throw new Exception(
-                   "[ImGuiRenderer] Failed to create PSO: " +
-                   "CreateGraphicsPipelineState returned null."
-               );
+        _pso =
+            device.CreateGraphicsPipelineState(psoCI)
+            ?? throw new Exception(
+                "[ImGuiRenderer] Failed to create PSO: "
+                    + "CreateGraphicsPipelineState returned null."
+            );
 
         _pso.GetStaticVariableByName(ShaderType.Vertex, "UniformBuffer")
             ?.Set(_uniformBuffer, SetShaderResourceFlags.None);
@@ -223,7 +245,7 @@ public unsafe class ImGuiRenderer : IDisposable
             ?.Set(_sampler, SetShaderResourceFlags.None);
     }
 
-    private void EnsureBuffers(int vertexCount, int indexCount)
+    public void EnsureBuffers(int vertexCount, int indexCount)
     {
         var device = _context.Device;
         if (device == null)
@@ -233,12 +255,13 @@ public unsafe class ImGuiRenderer : IDisposable
         {
             _vertexBuffer?.Dispose();
             _vertexBufferSize = (int)(vertexCount * 1.5);
-            BufferDesc vbDesc = new BufferDesc {
+            BufferDesc vbDesc = new BufferDesc
+            {
                 Name = "ImGui Vertex Buffer",
-                Size = (ulong)(_vertexBufferSize * sizeof(ImDrawVert)),
+                Size = (ulong)(_vertexBufferSize * Unsafe.SizeOf<ImDrawVert>()),
                 Usage = Usage.Dynamic,
                 BindFlags = BindFlags.VertexBuffer,
-                CPUAccessFlags = CpuAccessFlags.Write
+                CPUAccessFlags = CpuAccessFlags.Write,
             };
             _vertexBuffer = device.CreateBuffer(vbDesc);
         }
@@ -247,18 +270,19 @@ public unsafe class ImGuiRenderer : IDisposable
         {
             _indexBuffer?.Dispose();
             _indexBufferSize = (int)(indexCount * 1.5);
-            BufferDesc ibDesc = new BufferDesc {
+            BufferDesc ibDesc = new BufferDesc
+            {
                 Name = "ImGui Index Buffer",
                 Size = (ulong)(_indexBufferSize * sizeof(ushort)),
                 Usage = Usage.Dynamic,
                 BindFlags = BindFlags.IndexBuffer,
-                CPUAccessFlags = CpuAccessFlags.Write
+                CPUAccessFlags = CpuAccessFlags.Write,
             };
             _indexBuffer = device.CreateBuffer(ibDesc);
         }
     }
 
-    public void Render(IDeviceContext context, ImDrawDataPtr drawData)
+    public unsafe void Render(IDeviceContext context, ImDrawDataPtr drawData)
     {
         if (drawData.NativePtr == null || drawData.TotalVtxCount == 0)
             return;
@@ -278,17 +302,20 @@ public unsafe class ImGuiRenderer : IDisposable
         mvp = Matrix4x4.Transpose(mvp);
 
         var mappedUniforms = context.MapBuffer<Matrix4x4>(
-            _uniformBuffer, MapType.Write, MapFlags.Discard
+            _uniformBuffer,
+            MapType.Write,
+            MapFlags.Discard
         );
         mappedUniforms[0] = mvp;
         context.UnmapBuffer(_uniformBuffer, MapType.Write);
 
         // Update VB/IB
         var mappedVb = context.MapBuffer<ImDrawVert>(
-            _vertexBuffer, MapType.Write, MapFlags.Discard
+            _vertexBuffer,
+            MapType.Write,
+            MapFlags.Discard
         );
-        var mappedIb =
-            context.MapBuffer<ushort>(_indexBuffer, MapType.Write, MapFlags.Discard);
+        var mappedIb = context.MapBuffer<ushort>(_indexBuffer, MapType.Write, MapFlags.Discard);
 
         int vtxOffset = 0;
         int idxOffset = 0;
@@ -297,13 +324,12 @@ public unsafe class ImGuiRenderer : IDisposable
             var cmdList = drawData.CmdLists[i];
 
             var vtxSpan = new Span<ImDrawVert>(
-                (void *)cmdList.VtxBuffer.Data, cmdList.VtxBuffer.Size
+                (void*)cmdList.VtxBuffer.Data,
+                cmdList.VtxBuffer.Size
             );
             vtxSpan.CopyTo(mappedVb.Slice(vtxOffset));
 
-            var idxSpan = new Span<ushort>(
-                (void *)cmdList.IdxBuffer.Data, cmdList.IdxBuffer.Size
-            );
+            var idxSpan = new Span<ushort>((void*)cmdList.IdxBuffer.Data, cmdList.IdxBuffer.Size);
             idxSpan.CopyTo(mappedIb.Slice(idxOffset));
 
             vtxOffset += cmdList.VtxBuffer.Size;
@@ -326,9 +352,7 @@ public unsafe class ImGuiRenderer : IDisposable
             ResourceStateTransitionMode.Verify,
             SetVertexBuffersFlags.None
         );
-        context.SetIndexBuffer(
-            _indexBuffer!, 0, ResourceStateTransitionMode.Verify
-        );
+        context.SetIndexBuffer(_indexBuffer!, 0, ResourceStateTransitionMode.Verify);
 
         vtxOffset = 0;
         idxOffset = 0;
@@ -344,21 +368,23 @@ public unsafe class ImGuiRenderer : IDisposable
                 }
                 else
                 {
-                    var rect = new Rect {
+                    var rect = new Rect
+                    {
                         Left = (int)cmd.ClipRect.X,
                         Top = (int)cmd.ClipRect.Y,
                         Right = (int)cmd.ClipRect.Z,
-                        Bottom = (int)cmd.ClipRect.W
+                        Bottom = (int)cmd.ClipRect.W,
                     };
                     var scDesc = _context.SwapChain!.GetDesc();
                     context.SetScissorRects([rect], scDesc.Width, scDesc.Height);
 
-                    DrawIndexedAttribs drawAttrs = new DrawIndexedAttribs {
+                    DrawIndexedAttribs drawAttrs = new DrawIndexedAttribs
+                    {
                         IndexType = Diligent.ValueType.UInt16,
                         NumIndices = cmd.ElemCount,
                         FirstIndexLocation = (uint)(idxOffset + cmd.IdxOffset),
                         BaseVertex = (uint)(vtxOffset + (int)cmd.VtxOffset),
-                        Flags = DrawFlags.VerifyAll
+                        Flags = DrawFlags.VerifyAll,
                     };
                     context.DrawIndexed(drawAttrs);
                 }

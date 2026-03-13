@@ -24,7 +24,12 @@ public class VertexAttributeDescriptor
     public ValueType Type = ValueType.Float32;
     public byte NumComponents = 3;
     public bool IsNormalized = false;
-    public ushort Offset;
+    /// <summary>
+    /// Stream index: the position of this attribute in the SoA stream order.
+    /// To compute the byte offset of stream N in a page:
+    ///   streamBase = attributesOffset + sum(stream[0..N-1].GetSize() * totalVertexCount)
+    /// </summary>
+    public ushort StreamIndex;
 
     public int GetSize()
     {

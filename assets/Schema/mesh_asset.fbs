@@ -38,6 +38,8 @@ table MeshAsset (fs_serializer) {
     attributes:[VertexAttribute] (fs_vector:"IList");
     payload:[ubyte] (fs_vector:"Memory");
     bvh_offset:ulong;
+    quant_origin:Vec3;
+    quant_step:float;
 }
 
 root_type MeshAsset;

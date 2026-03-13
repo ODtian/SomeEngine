@@ -71,7 +71,7 @@ public static class ClusterBuilder
     private const int GroupSize = 4;
     private const float SimplifyRatio = 0.5f;
     private const int PageSize = 128 * 1024; // 128KB
-    private const int PageHeaderSize = 32;
+    private const int PageHeaderSize = 44; // New header with quant params
 
     private struct BuilderMeshlet
     {
@@ -370,6 +370,26 @@ public static class ClusterBuilder
                 new RawAttribute(key, data, dimension, targetType, (byte)dimension, normalized)
             );
         }
+
+        // Sort attributes into canonical order for deterministic SoA stream layout:
+        // NORMAL → TANGENT → TEXCOORD_* → COLOR_* → JOINTS_* → WEIGHTS_* → others
+        static int AttributeOrder(string name) => name switch
+        {
+            "NORMAL" => 0,
+            "TANGENT" => 1,
+            _ when name.StartsWith("TEXCOORD") => 2,
+            _ when name.StartsWith("COLOR") => 3,
+            _ when name.StartsWith("JOINTS") => 4,
+            _ when name.StartsWith("WEIGHTS") => 5,
+            _ => 6,
+        };
+        rawAttributes.Sort((a, b) =>
+        {
+            int orderA = AttributeOrder(a.Name);
+            int orderB = AttributeOrder(b.Name);
+            if (orderA != orderB) return orderA.CompareTo(orderB);
+            return string.Compare(a.Name, b.Name, StringComparison.Ordinal);
+        });
 
         return ProcessRaw(rawPos, rawAttributes, rawIndices, mesh.Name ?? "Unnamed");
     }
@@ -686,16 +706,22 @@ public static class ClusterBuilder
                 globalIndices
             );
 
-            // Compute Bounds for Morton Code
+            // Compute Bounds for Morton Code + Global Quantization
             Vector3 sceneMin = new Vector3(float.MaxValue);
             Vector3 sceneMax = new Vector3(float.MinValue);
-            for (int i = 0; i < pPos.Length; ++i)
+            for (int i = 0; i < (int)vertexCount; ++i)
             {
                 sceneMin = Vector3.Min(sceneMin, pPos[i]);
                 sceneMax = Vector3.Max(sceneMax, pPos[i]);
             }
             Vector3 sceneExtent = sceneMax - sceneMin;
             sceneExtent = Vector3.Max(sceneExtent, new Vector3(1e-6f));
+
+            // Global Quantization: power-of-2 step size for watertight vertex decode
+            float maxExtent = Math.Max(sceneExtent.X, Math.Max(sceneExtent.Y, sceneExtent.Z));
+            float quantStep = MathF.Pow(2, MathF.Ceiling(MathF.Log2(maxExtent / 65535f)));
+            if (quantStep < 1e-12f) quantStep = 1e-12f; // Safety floor
+            Vector3 quantOrigin = sceneMin;
 
             // Sort clusters by PageIndex, then ParentGroupId, then Morton Code
             // This ensures consistent grouping in the BVH leaf nodes
@@ -722,28 +748,29 @@ public static class ClusterBuilder
 
             var currentClusters = new List<GPUCluster>();
             var currentPositions = new List<ushort>();
-            var currentAttrs = new List<byte>();
+            var currentStreams = new List<byte>[finalAttributes.Count];
+            for (int s = 0; s < finalAttributes.Count; s++)
+                currentStreams[s] = new List<byte>();
             var currentIndices = new List<byte>();
 
             int currentBytes = PageHeaderSize;
 
             // Build Layout
             var descriptors = new List<VertexAttributeDescriptor>();
-            ushort currentOffset = 0;
             int vertexStride = 0;
-            foreach (var attr in finalAttributes)
+            for (int ai = 0; ai < finalAttributes.Count; ai++)
             {
+                var attr = finalAttributes[ai];
                 var desc = new VertexAttributeDescriptor
                 {
                     Name = attr.Name,
                     Type = attr.TargetType,
                     NumComponents = attr.NumComponents,
                     IsNormalized = attr.Normalized,
-                    Offset = currentOffset,
+                    StreamIndex = (ushort)ai,
                 };
                 int size = desc.GetSize();
                 vertexStride += size;
-                currentOffset += (ushort)size;
                 descriptors.Add(desc);
             }
 
@@ -752,14 +779,16 @@ public static class ClusterBuilder
                 if (currentClusters.Count == 0)
                     return;
 
-                uint clustersOffset = PageHeaderSize;
+                uint clustersOffset = (uint)PageHeaderSize;
                 int clustersSize = currentClusters.Count * Unsafe.SizeOf<GPUCluster>();
 
                 uint positionsOffset = clustersOffset + (uint)clustersSize;
                 int positionsSize = currentPositions.Count * sizeof(ushort);
 
                 uint attributesOffset = positionsOffset + (uint)positionsSize;
-                int attrsSize = currentAttrs.Count;
+                int attrsSize = 0;
+                for (int s = 0; s < currentStreams.Length; s++)
+                    attrsSize += currentStreams[s].Count;
 
                 uint indicesOffset = attributesOffset + (uint)attrsSize;
                 int indicesSize = currentIndices.Count;
@@ -772,18 +801,21 @@ public static class ClusterBuilder
                     );
                 }
 
-                Array.Clear(reusablePageBuffer, 0, totalSize); // Only clear used part or optimize? Clear all is safer.
+                Array.Clear(reusablePageBuffer, 0, totalSize);
                 var span = new Span<byte>(reusablePageBuffer);
 
                 ref var header = ref Unsafe.As<byte, MeshPageHeader>(ref span[0]);
                 header.ClusterCount = (uint)currentClusters.Count;
                 header.TotalVertexCount = (uint)(currentPositions.Count / 3);
                 header.TotalTriangleCount = (uint)(currentIndices.Count / 3);
-                header.PageSize = (uint)totalSize;
+                header.QuantOriginX = quantOrigin.X;
                 header.ClustersOffset = clustersOffset;
                 header.PositionsOffset = positionsOffset;
                 header.AttributesOffset = attributesOffset;
                 header.IndicesOffset = indicesOffset;
+                header.QuantOriginY = quantOrigin.Y;
+                header.QuantOriginZ = quantOrigin.Z;
+                header.QuantStep = quantStep;
 
                 MemoryMarshal
                     .Cast<GPUCluster, byte>(CollectionsMarshal.AsSpan(currentClusters))
@@ -791,9 +823,13 @@ public static class ClusterBuilder
                 MemoryMarshal
                     .Cast<ushort, byte>(CollectionsMarshal.AsSpan(currentPositions))
                     .CopyTo(span.Slice((int)positionsOffset, positionsSize));
-                CollectionsMarshal
-                    .AsSpan(currentAttrs)
-                    .CopyTo(span.Slice((int)attributesOffset, attrsSize));
+                int streamWriteOffset = (int)attributesOffset;
+                for (int s = 0; s < currentStreams.Length; s++)
+                {
+                    var streamSpan = CollectionsMarshal.AsSpan(currentStreams[s]);
+                    streamSpan.CopyTo(span.Slice(streamWriteOffset, streamSpan.Length));
+                    streamWriteOffset += streamSpan.Length;
+                }
                 CollectionsMarshal
                     .AsSpan(currentIndices)
                     .CopyTo(span.Slice((int)indicesOffset, indicesSize));
@@ -816,7 +852,8 @@ public static class ClusterBuilder
 
                 currentClusters.Clear();
                 currentPositions.Clear();
-                currentAttrs.Clear();
+                for (int s = 0; s < currentStreams.Length; s++)
+                    currentStreams[s].Clear();
                 currentIndices.Clear();
                 currentBytes = PageHeaderSize;
             }
@@ -824,7 +861,9 @@ public static class ClusterBuilder
             var usedMap = new Dictionary<uint, ushort>(MaxVerticesPerMeshlet);
             var localPos = new List<ushort>(MaxVerticesPerMeshlet * 3);
             var localIndices = new List<byte>(MaxTrianglesPerMeshlet * 3);
-            var localAttrBytes = new List<byte>(MaxVerticesPerMeshlet * vertexStride);
+            var localStreamBytes = new List<byte>[finalAttributes.Count];
+            for (int s = 0; s < finalAttributes.Count; s++)
+                localStreamBytes[s] = new List<byte>(MaxVerticesPerMeshlet * descriptors[s].GetSize());
 
             var globalIndicesSpan = CollectionsMarshal.AsSpan(globalIndices);
 
@@ -836,22 +875,40 @@ public static class ClusterBuilder
                 usedMap.Clear();
                 localPos.Clear();
                 localIndices.Clear();
-                localAttrBytes.Clear();
+                for (int s = 0; s < finalAttributes.Count; s++)
+                    localStreamBytes[s].Clear();
 
-                Vector3 center = m.Center;
-                float radius = m.Radius;
-                if (radius < 1e-6f)
-                    radius = 1.0f;
+                // --- Phase 1: Compute IntBase (min global integer coord in this cluster) ---
+                int minGx = int.MaxValue, minGy = int.MaxValue, minGz = int.MaxValue;
+                int maxGx = int.MinValue, maxGy = int.MinValue, maxGz = int.MinValue;
 
                 Vector3 cMin = new Vector3(float.MaxValue);
                 Vector3 cMax = new Vector3(float.MinValue);
 
                 foreach (var globalIdx in mIndices)
                 {
-                    Vector3 p_bound = pPos[(int)globalIdx];
-                    cMin = Vector3.Min(cMin, p_bound);
-                    cMax = Vector3.Max(cMax, p_bound);
+                    Vector3 p = pPos[(int)globalIdx];
+                    cMin = Vector3.Min(cMin, p);
+                    cMax = Vector3.Max(cMax, p);
 
+                    int gx = (int)MathF.Round((p.X - quantOrigin.X) / quantStep);
+                    int gy = (int)MathF.Round((p.Y - quantOrigin.Y) / quantStep);
+                    int gz = (int)MathF.Round((p.Z - quantOrigin.Z) / quantStep);
+                    minGx = Math.Min(minGx, gx);
+                    minGy = Math.Min(minGy, gy);
+                    minGz = Math.Min(minGz, gz);
+                    maxGx = Math.Max(maxGx, gx);
+                    maxGy = Math.Max(maxGy, gy);
+                    maxGz = Math.Max(maxGz, gz);
+                }
+
+                int clusterIntBaseX = minGx;
+                int clusterIntBaseY = minGy;
+                int clusterIntBaseZ = minGz;
+
+                // --- Phase 2: Encode vertices as local u16 offsets from IntBase ---
+                foreach (var globalIdx in mIndices)
+                {
                     if (!usedMap.TryGetValue(globalIdx, out ushort localIdx))
                     {
                         localIdx = (ushort)vCount;
@@ -859,10 +916,13 @@ public static class ClusterBuilder
                         vCount++;
 
                         Vector3 p = pPos[(int)globalIdx];
-                        Vector3 rel = (p - center) / radius;
-                        ushort qx = (ushort)((Math.Clamp(rel.X, -1f, 1f) * 0.5f + 0.5f) * 65535f);
-                        ushort qy = (ushort)((Math.Clamp(rel.Y, -1f, 1f) * 0.5f + 0.5f) * 65535f);
-                        ushort qz = (ushort)((Math.Clamp(rel.Z, -1f, 1f) * 0.5f + 0.5f) * 65535f);
+                        int gx = (int)MathF.Round((p.X - quantOrigin.X) / quantStep);
+                        int gy = (int)MathF.Round((p.Y - quantOrigin.Y) / quantStep);
+                        int gz = (int)MathF.Round((p.Z - quantOrigin.Z) / quantStep);
+
+                        ushort qx = (ushort)(gx - clusterIntBaseX);
+                        ushort qy = (ushort)(gy - clusterIntBaseY);
+                        ushort qz = (ushort)(gz - clusterIntBaseZ);
 
                         localPos.Add(qx);
                         localPos.Add(qy);
@@ -870,7 +930,7 @@ public static class ClusterBuilder
 
                         for (int i = 0; i < finalAttributes.Count; ++i)
                         {
-                            PackAttribute(localAttrBytes, finalAttributes[i], (int)globalIdx);
+                            PackAttribute(localStreamBytes[i], finalAttributes[i], (int)globalIdx);
                         }
                     }
                     localIndices.Add((byte)localIdx);
@@ -878,7 +938,9 @@ public static class ClusterBuilder
 
                 int clusterSize = Unsafe.SizeOf<GPUCluster>();
                 int vSize = localPos.Count * 2;
-                int aSize = localAttrBytes.Count;
+                int aSize = 0;
+                for (int s = 0; s < finalAttributes.Count; s++)
+                    aSize += localStreamBytes[s].Count;
                 int iSize = localIndices.Count;
                 int totalAdded = clusterSize + vSize + aSize + iSize;
 
@@ -891,25 +953,53 @@ public static class ClusterBuilder
                 uint tStart = (uint)currentIndices.Count;
 
                 currentPositions.AddRange(localPos);
-                currentAttrs.AddRange(localAttrBytes);
+                for (int s = 0; s < finalAttributes.Count; s++)
+                    currentStreams[s].AddRange(localStreamBytes[s]);
                 currentIndices.AddRange(localIndices);
                 currentBytes += totalAdded;
+
+                // --- Pack CenterOffset and RadiusQuant for culling ---
+                Vector3 center = m.Center;
+                float radius = m.Radius;
+                if (radius < 1e-6f) radius = quantStep;
+
+                // CenterOffset in global integer grid, relative to IntBase
+                int centerGx = (int)MathF.Round((center.X - quantOrigin.X) / quantStep);
+                int centerGy = (int)MathF.Round((center.Y - quantOrigin.Y) / quantStep);
+                int centerGz = (int)MathF.Round((center.Z - quantOrigin.Z) / quantStep);
+                ushort centerOffX = (ushort)Math.Clamp(centerGx - clusterIntBaseX, 0, 65535);
+                ushort centerOffY = (ushort)Math.Clamp(centerGy - clusterIntBaseY, 0, 65535);
+                ushort centerOffZ = (ushort)Math.Clamp(centerGz - clusterIntBaseZ, 0, 65535);
+
+                // RadiusQuant: round UP to be conservative
+                // Add half-diagonal quantization error to compensate for center quantization
+                float centerQuantError = quantStep * MathF.Sqrt(3.0f) * 0.5f;
+                ushort radiusQuant = (ushort)Math.Clamp(
+                    (int)MathF.Ceiling((radius + centerQuantError) / quantStep), 1, 65535);
+
+                // LODError → float16
+                ushort lodErrorHalf = BitConverter.HalfToUInt16Bits((Half)m.Error);
+
+                // PackedCounts: [VertexCount:8][TriangleCount:8][LODLevel:8][Pad:8]
+                uint packedCounts = (uint)vCount
+                    | ((uint)(localIndices.Count / 3) << 8)
+                    | ((uint)(byte)m.Level << 16);
 
                 currentClusters.Add(
                     new GPUCluster
                     {
-                        Center = m.Center,
-                        Radius = m.Radius,
+                        IntBaseX = clusterIntBaseX,
+                        IntBaseY = clusterIntBaseY,
+                        IntBaseZ = clusterIntBaseZ,
+                        PackedCenterXY = GPUCluster.PackU16Pair(centerOffX, centerOffY),
                         LODCenter = m.SelfLodCenter,
                         LODRadius = m.SelfLodRadius,
-                        LODError = m.Error,
-                        VertexStart = vStart,
-                        TriangleStart = tStart,
-                        GroupId = m.GroupId,
-                        VertexCount = (byte)vCount,
-                        TriangleCount = (byte)(localIndices.Count / 3),
-                        LODLevel = (byte)m.Level,
-                        _Pad1 = 0,
+                        PackedCenterZRadius = GPUCluster.PackU16Pair(centerOffZ, radiusQuant),
+                        LODErrorHalf = lodErrorHalf,
+                        VertexStart = (ushort)vStart,
+                        TriangleStart = (ushort)tStart,
+                        GroupId = (short)m.GroupId,
+                        PackedCounts = packedCounts,
                     }
                 );
 
@@ -924,7 +1014,7 @@ public static class ClusterBuilder
                             m.LodCenter.Z,
                             m.LodRadius
                         ),
-                        LODError = m.ParentError,
+                        LODError = (float)(Half)m.ParentError,
                         PageIndex = (uint)pagesDataList.Count,
                         ClusterStart = (uint)(currentClusters.Count - 1),
                         ParentGroupId = m.ParentGroupId,
@@ -949,7 +1039,7 @@ public static class ClusterBuilder
                     Type = (SomeEngine.Assets.Schema.ValueType)descriptors[i].Type,
                     Components = descriptors[i].NumComponents,
                     Normalized = descriptors[i].IsNormalized,
-                    Offset = descriptors[i].Offset,
+                    Offset = descriptors[i].StreamIndex,
                 };
             }
 
@@ -960,15 +1050,22 @@ public static class ClusterBuilder
                 {
                     Center = new SomeEngine.Assets.Schema.Vec3()
                     {
-                        X = 0,
-                        Y = 0,
-                        Z = 0,
+                        X = (sceneMin.X + sceneMax.X) * 0.5f,
+                        Y = (sceneMin.Y + sceneMax.Y) * 0.5f,
+                        Z = (sceneMin.Z + sceneMax.Z) * 0.5f,
                     },
-                    Radius = 0,
+                    Radius = maxExtent * 0.5f,
                 },
                 Payload = new byte[fs.Length],
                 Attributes = schemaAttrs,
                 BvhOffset = (ulong)bvhOffset,
+                QuantOrigin = new SomeEngine.Assets.Schema.Vec3()
+                {
+                    X = quantOrigin.X,
+                    Y = quantOrigin.Y,
+                    Z = quantOrigin.Z,
+                },
+                QuantStep = quantStep,
             };
 
             fs.Seek(0, SeekOrigin.Begin);

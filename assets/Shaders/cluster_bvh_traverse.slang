@@ -25,6 +25,19 @@ struct CullingUniforms
     uint HasPrevHistory;
     uint HiZMipCount;
     float2 HiZInvSize;
+
+    float4x4 View;
+    float P00;
+    float P11;
+    float2 Pad7;
+
+    float3 QuantOrigin;
+    float QuantStep;
+
+    float4x4 PrevView;
+    float PrevP00;
+    float PrevP11;
+    float2 Pad8;
 };
 
 ConstantBuffer<CullingUniforms> Uniforms;
@@ -49,9 +62,6 @@ RWByteAddressBuffer NextDispatchArgs;
 RWByteAddressBuffer CandidateCount;
 RWStructuredBuffer<uint3> CandidateClusters;
 RWByteAddressBuffer PageFaultBuffer;
-
-RWStructuredBuffer<AABB> DebugAABBs;
-RWByteAddressBuffer DebugAABBCount;
 
 static const uint MaxPageFaults = 4096;
 
@@ -122,14 +132,11 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
     GpuTransform t = Instances[instanceID];
 
     bool culled = false;
-    uint color = 0x8000FF00; // Default: Green (Accepted)
-
     if (Uniforms.DebugMode == 0)
     {
         if (IsNodeOutsideFrustum(node, t))
         {
             culled = true;
-            color = 0x800000FF; // Red: culled by frustum
         }
     }
 
@@ -146,34 +153,6 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
         if (node.LODError * Uniforms.LodScale <= Uniforms.LodThreshold * distToSurface)
         {
             culled = true;
-            color = 0x80FF0000; // Blue: Culled by LOD (RGBA: R=0, G=0, B=255, A=128 -> wait, 0x80FF0000 is B=255 in RGBA? No. 0xRRGGBBAA? Or 0xAABBGGRR?)
-            // debug_aabb.slang uses:
-            // float r = (color >> 0) & 0xFF;
-            // float g = (color >> 8) & 0xFF;
-            // float b = (color >> 16) & 0xFF;
-            // float a = (color >> 24) & 0xFF;
-            // So it's RGBA.
-            // Red:   0x800000FF (A=128, B=0, G=0, R=255)
-            // Green: 0x8000FF00 (A=128, G=255)
-            color = 0x80FF0000;
-        }
-    }
-
-    if (Uniforms.VisualiseBVH != 0)
-    {
-        bool showThisDepth = (Uniforms.DebugBVHDepth < 0) || (Uniforms.DebugBVHDepth == (int)Uniforms.CurrentDepth);
-        if (showThisDepth)
-        {
-            uint debugIndex;
-            // Offset 4 used for InstanceCount in Draw Args
-            DebugAABBCount.InterlockedAdd(4, 1, debugIndex);
-
-            AABB box;
-            box.Min = node.BoundMin.xyz;
-            box.Max = node.BoundMax.xyz;
-            box.Color = color;
-            box.Pad = 0;
-            DebugAABBs[debugIndex] = box;
         }
     }
 
@@ -238,6 +217,7 @@ void ClearArgs(uint3 id: SV_DispatchThreadID)
 void InitQueue(uint3 dispatchThreadID: SV_DispatchThreadID)
 {
     uint instanceID = dispatchThreadID.x;
+
     if (instanceID >= Uniforms.InstanceCount)
         return;
 

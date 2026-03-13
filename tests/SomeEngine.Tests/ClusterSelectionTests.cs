@@ -23,18 +23,18 @@ public class ClusterSelectionTests
         
         var root = new GPUCluster
         {
-            Center = new Vector3(0, 0, 100),
-            Radius = 10.0f,
-            LODError = 10.0f,
-            LODLevel = 1
+            LODCenter = new Vector3(0, 0, 100),
+            LODRadius = 10.0f,
+            LODErrorHalf = BitConverter.HalfToUInt16Bits((Half)10.0f),
+            PackedCounts = 0 | (0u << 8) | (1u << 16), // LODLevel=1
         };
 
         var child = new GPUCluster
         {
-            Center = new Vector3(0, 0, 100),
-            Radius = 5.0f,
-            LODError = 1.0f,
-            LODLevel = 0
+            LODCenter = new Vector3(0, 0, 100),
+            LODRadius = 5.0f,
+            LODErrorHalf = BitConverter.HalfToUInt16Bits((Half)1.0f),
+            PackedCounts = 0 | (0u << 8) | (0u << 16), // LODLevel=0
         };
 
         // Parent info for Child (which is Root's group info)

@@ -1,5 +1,6 @@
 ﻿using System.Numerics;
 using Diligent;
+using Microsoft.Extensions.DependencyInjection;
 using Silk.NET.Maths;
 using Silk.NET.Windowing;
 using SomeEngine.Assets.Schema; // Added
@@ -18,11 +19,12 @@ class Program
     private static IWindow? _window;
     private static RenderContext? _renderContext;
     private static TriangleRenderPass? _trianglePass;
-    private static ClusterPipeline? _clusterPipeline;
+    private static ClusterRenderFeature? _clusterPipeline;
     private static ClusterResourceManager? _clusterManager;
     private static RenderGraph? _renderGraph;
     private static GameWorld? _gameWorld;
     private static InstanceSyncSystem? _transformSync;
+    private static InstanceDataManager? _instanceDataManager;
 
     static void Main(string[] args)
     {
@@ -64,7 +66,8 @@ class Program
             _renderContext.Initialize(_window);
         }
 
-        _transformSync = new InstanceSyncSystem(_renderContext);
+        _instanceDataManager = new InstanceDataManager();
+        _transformSync = new InstanceSyncSystem(_instanceDataManager);
         _gameWorld.SystemRoot.Add(_transformSync);
 
         // Create Clusters
@@ -88,11 +91,18 @@ class Program
 
         _renderGraph = new RenderGraph();
         _trianglePass = new TriangleRenderPass(_renderContext);
-        _trianglePass.TransformSystem = _transformSync;
+        _trianglePass.TransformSystem = _instanceDataManager;
         _trianglePass.InitPSO();
 
-        _clusterPipeline = new ClusterPipeline(_renderContext, _transformSync, _clusterManager);
-        _clusterPipeline.Init();
+        var services = new ServiceCollection();
+        services.AddSingleton(_renderContext);
+        services.AddSingleton(_instanceDataManager!);
+        services.AddSingleton(_clusterManager);
+        services.AddSingleton<ClusterRenderFeature>();
+        var provider = services.BuildServiceProvider();
+
+        _clusterPipeline = provider.GetRequiredService<ClusterRenderFeature>();
+        _clusterPipeline.Initialize(_renderContext);
     }
 
     /*
@@ -119,40 +129,50 @@ class Program
         if (bbView == null)
             return;
 
-        var clearColor = new Vector4(0.1f, 0.2f, 0.4f, 1.0f);
-        var ctx = _renderContext!.ImmediateContext!;
-        ITextureView[] rtv = { bbView };
-        ctx.SetRenderTargets(
-            rtv,
-            _renderContext.DepthBufferDSV!,
-            ResourceStateTransitionMode.Verify
-        );
-        ctx.ClearRenderTarget(bbView, clearColor, ResourceStateTransitionMode.Verify);
-        ctx.ClearDepthStencil(
-            _renderContext.DepthBufferDSV!,
-            ClearDepthStencilFlags.Depth,
-            1.0f,
-            0,
-            ResourceStateTransitionMode.Verify
-        );
-
-        _renderGraph!.Reset();
-        var bbHandle = _renderGraph.ImportTexture(
-            "BackBuffer",
+        _renderGraph!.BeginFrame();
+        var bbHandle = _renderGraph.Import(
+            "ColorTarget",
             bbView.GetTexture(),
-            ResourceState.RenderTarget,
-            bbView
+            ResourceState.RenderTarget
         );
-        var dsvTex = _renderContext.DepthBufferDSV!.GetTexture();
-        var depthHandle = _renderGraph.ImportTexture(
-            "DepthBuffer",
-            dsvTex,
-            ResourceState.DepthWrite,
-            _renderContext.DepthBufferDSV!
+        var depthHandle = _renderGraph.CreateTexture("DepthTarget", _renderContext.DepthBufferDesc);
+
+        // Clear pass via RG
+        _renderGraph.AddPass<object>(
+            "Clear Main RT",
+            (builder, _) =>
+            {
+                builder.Write(bbHandle, ResourceState.RenderTarget);
+                builder.Write(depthHandle, ResourceState.DepthWrite);
+            },
+            (rgCtx, _) =>
+            {
+                var pRTV = bbView;
+                var pDSV = rgCtx.GetTextureView(depthHandle, TextureViewType.DepthStencil);
+                if (pDSV == null)
+                    return;
+
+                rgCtx.RenderContext.ImmediateContext?.SetRenderTargets(
+                    [pRTV],
+                    pDSV,
+                    ResourceStateTransitionMode.Verify
+                );
+                rgCtx.RenderContext.ImmediateContext?.ClearRenderTarget(
+                    pRTV,
+                    new Vector4(0.1f, 0.2f, 0.4f, 1.0f),
+                    ResourceStateTransitionMode.Verify
+                );
+                rgCtx.RenderContext.ImmediateContext?.ClearDepthStencil(
+                    pDSV,
+                    ClearDepthStencilFlags.Depth,
+                    1.0f,
+                    0,
+                    ResourceStateTransitionMode.Verify
+                );
+            }
         );
 
-        _clusterPipeline!.AddToRenderGraph(_renderGraph, bbHandle, depthHandle);
-        _renderGraph.MarkAsOutput(bbHandle);
+        _clusterPipeline!.AddPasses(_renderGraph);
         _renderGraph.Compile(_renderContext.Device);
         _renderGraph.Execute(_renderContext);
 

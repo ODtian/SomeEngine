@@ -54,7 +54,7 @@ public partial class MainWindow : Window
                     var cluster = MemoryMarshal.Read<GPUCluster>(span.Slice(offset + clusterOffset + i * clusterSize, clusterSize));
                     clusters.Add(cluster);
                 }
-                offset += (int)header.PageSize;
+                offset += (int)(header.IndicesOffset + header.TotalTriangleCount * 3);
             }
 
             DagView.SetClusters(clusters);

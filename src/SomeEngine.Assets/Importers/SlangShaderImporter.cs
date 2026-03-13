@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
 using System.Text;
 using SlangShaderSharp;
+using SomeEngine.Assets.Pipeline;
 using SomeEngine.Assets.Schema;
 
 namespace SomeEngine.Assets.Importers;
@@ -13,6 +14,7 @@ namespace SomeEngine.Assets.Importers;
 public static class SlangShaderImporter
 {
     private static IGlobalSession? _globalSession;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (ShaderAsset Asset, DateTime LastModified)> _cache = new();
 
     public static IGlobalSession GlobalSession
     {
@@ -28,8 +30,37 @@ public static class SlangShaderImporter
 
     public static ShaderAsset Import(string filePath, string? source = null)
     {
+        filePath = Path.GetFullPath(filePath);
+        string cachePath = filePath + ".asset";
+
         if (source == null)
         {
+            if (File.Exists(filePath))
+            {
+                var lastModified = File.GetLastWriteTime(filePath);
+                if (_cache.TryGetValue(filePath, out var cached) && cached.LastModified >= lastModified)
+                {
+                    return cached.Asset;
+                }
+
+                if (File.Exists(cachePath))
+                {
+                    var cacheLastModified = File.GetLastWriteTime(cachePath);
+                    if (cacheLastModified >= lastModified)
+                    {
+                        try
+                        {
+                            var cachedAsset = ShaderAssetSerializer.Load(cachePath);
+                            _cache[filePath] = (cachedAsset, lastModified);
+                            return cachedAsset;
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Warning: Failed to load shader asset cache from {cachePath}: {ex.Message}");
+                        }
+                    }
+                }
+            }
             source = File.ReadAllText(filePath);
         }
 
@@ -197,6 +228,20 @@ public static class SlangShaderImporter
             };
             FinalizeReflection(kvp.Value, backendRef.Reflection);
             asset.Reflections.Add(backendRef);
+        }
+
+        if (!string.IsNullOrEmpty(filePath) && File.Exists(filePath))
+        {
+            _cache[filePath] = (asset, File.GetLastWriteTime(filePath));
+
+            try
+            {
+                ShaderAssetSerializer.Save(asset, cachePath);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Failed to save shader asset cache to {cachePath}: {ex.Message}");
+            }
         }
 
         return asset;

@@ -1,4 +1,3 @@
-using System;
 using Diligent;
 using SomeEngine.Render.RHI;
 
@@ -6,27 +5,36 @@ namespace SomeEngine.Render.Graph;
 
 public class RenderGraphContext(RenderGraph graph, RenderContext renderContext)
 {
-    public ITexture? GetTexture(RGResourceHandle handle)
+    public ITexture? GetTexture(RenderGraphHandle h)
     {
-        return graph.GetPhysicalTexture(handle);
+        return graph.GetPhysicalTexture(h);
     }
 
-    public IBuffer? GetBuffer(RGResourceHandle handle)
+    public IBuffer? GetBuffer(RenderGraphHandle h)
     {
-        return graph.GetPhysicalBuffer(handle);
+        return graph.GetPhysicalBuffer(h);
     }
 
-    public ITextureView? GetTextureView(RGResourceHandle handle, TextureViewType type)
+    public ITextureView? GetView(RenderGraphHandle h, TextureViewType type)
     {
-        return graph.GetPhysicalTextureView(handle, type);
+        return graph.GetPhysicalTextureView(h, type);
     }
 
-    public IBufferView? GetBufferView(RGResourceHandle handle, BufferViewType type)
+    public ITextureView? GetTextureView(RenderGraphHandle h, TextureViewType type)
     {
-        return graph.GetPhysicalBufferView(handle, type);
+        return graph.GetPhysicalTextureView(h, type);
     }
 
-    // Helper accessors
+    public ITextureView? GetOrCreateView(RenderGraphHandle h, TextureViewDesc viewDesc)
+    {
+        return graph.GetOrCreateTextureView(h, viewDesc);
+    }
+
+    public IBufferView? GetBufferView(RenderGraphHandle h, BufferViewType type)
+    {
+        return graph.GetPhysicalBufferView(h, type);
+    }
+
     public RenderContext RenderContext => renderContext;
     public IDeviceContext CommandList => renderContext.ImmediateContext!;
 }

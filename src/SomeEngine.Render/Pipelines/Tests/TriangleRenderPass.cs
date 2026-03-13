@@ -7,14 +7,15 @@ using SomeEngine.Render.Systems;
 
 namespace SomeEngine.Render.Pipelines;
 
-public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePass"), IDisposable
+public class TriangleRenderPass(RenderContext context) : IRenderGraphPass, IDisposable
 {
-    private RGResourceHandle _outputHandle;
+    public string Name => "Triangle Render";
+    private RenderGraphHandle _outputHandle;
     private IPipelineState? _pso;
     private bool _psoInitialized = false;
     private IShaderResourceBinding? _srb;
 
-    public InstanceSyncSystem? TransformSystem { get; set; }
+    public InstanceDataManager? TransformSystem { get; set; }
 
     public void InitPSO()
     {
@@ -27,10 +28,7 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
 
         // Shaders
         var shaderPath = Path.GetFullPath(
-            Path.Combine(
-                AppContext.BaseDirectory,
-                "../../../../../../assets/Shaders/triangle.hlsl"
-            )
+            Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/triangle.hlsl")
         );
 
         using var shaderSourceFactory = context.Factory?.CreateDefaultShaderSourceStreamFactory(
@@ -71,9 +69,6 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
                         new ShaderResourceVariableDesc
                         {
                             Name = "Transforms",
-                            Binding = 0,
-                            Set = 0,
-                            ResourceType = ShaderResourceType.BufferSrv,
                             Type = ShaderResourceVariableType.Mutable,
                             ShaderStages = ShaderType.Vertex,
                         },
@@ -99,11 +94,11 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
         _psoInitialized = true;
     }
 
-    public override void Setup(RenderGraphBuilder builder)
+    public void Setup(RenderGraphBuilder builder)
     {
         if (_outputHandle.IsValid)
         {
-            builder.WriteTexture(_outputHandle);
+            builder.Write(_outputHandle);
         }
     }
 
@@ -117,12 +112,12 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
     // the builder/graph. But builder hides graph. I'll update Builder to helper
     // lookups.
 
-    public void SetOutput(RGResourceHandle handle)
+    public void SetOutput(RenderGraphHandle handle)
     {
         _outputHandle = handle;
     }
 
-    public override void Execute(RenderContext context, RenderGraphContext graphContext)
+    public void Execute(RenderGraphContext graphContext)
     {
         if (!_psoInitialized)
             InitPSO();
@@ -133,28 +128,16 @@ public class TriangleRenderPass(RenderContext context) : RenderPass("TrianglePas
         if (rtv == null)
             return;
 
-        var dsv = context.DepthBufferDSV!; // Using custom depth for now
-
-        ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Verify);
+        ctx.SetRenderTargets([rtv], null, ResourceStateTransitionMode.Verify);
         ctx.ClearRenderTarget(
             rtv,
             new System.Numerics.Vector4(0.2f, 0.2f, 0.2f, 1.0f),
             ResourceStateTransitionMode.Verify
         );
-        ctx.ClearDepthStencil(
-            dsv,
-            ClearDepthStencilFlags.Depth,
-            1.0f,
-            0,
-            ResourceStateTransitionMode.Verify
-        );
 
         ctx.SetPipelineState(_pso);
 
-        if (
-            TransformSystem != null
-            && TransformSystem.Count > 0
-        )
+        if (TransformSystem != null && TransformSystem.Count > 0)
         {
             if (_srb != null)
                 ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Verify);

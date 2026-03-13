@@ -6,6 +6,10 @@ struct DrawUniforms
     float4x4 View; // Needed for billboard/impostors if any
     uint PageTableSize;
     uint DebugMode;
+    uint ScreenWidth;
+    uint ScreenHeight;
+    float3 QuantOrigin;  // Global quantization origin
+    float QuantStep;     // Global quantization step (power of 2)
 };
 
 ConstantBuffer<DrawUniforms> Uniforms;
@@ -43,6 +47,9 @@ struct DrawRequest
 
 StructuredBuffer<DrawRequest> RequestBuffer;
 
+// Phase1 binds a zeroed buffer; Phase2 binds Phase2DrawArgs (offset at byte 16)
+ByteAddressBuffer VisibleClusterMeta;
+
 struct PSInput
 {
     float4 Pos : SV_POSITION;
@@ -52,52 +59,32 @@ struct PSInput
     nointerpolation uint ClusterID : CLUSTER_ID;
 };
 
-struct GPUPageHeader
-{
-    uint ClusterCount;
-    uint TotalVertexCount;
-    uint TotalTriangleCount;
-    uint _Pad0;
-    uint ClustersOffset;
-    uint PositionsOffset;
-    uint AttributesOffset;
-    uint IndicesOffset;
-};
-
-struct GPUCluster
-{
-    float3 Center;
-    float Radius;
-    float3 LODCenter;
-    float LODRadius;
-    // ... we only need offsets here
-    uint VertexStart;
-    uint TriangleStart;
-    uint PackedCounts;
-};
+// NOTE: GPUPageHeader and GPUCluster are defined in cluster_structures.slang
 
 // Helper to load partial cluster info needed for draw
-void LoadClusterInfo(uint pageOffset, uint clusterId, out float3 center, out float radius, out uint vStart, out uint tStart, out uint packedCounts)
+void LoadClusterInfo(uint pageOffset, uint clusterId,
+                     out int3 intBase, out uint vStart, out uint tStart, out uint packedCounts)
 {
     uint clustersOffset = PageHeap.Load(pageOffset + 16);
-    uint clusterOffset = pageOffset + clustersOffset + clusterId * 52;
+    uint clusterOffset = pageOffset + clustersOffset + clusterId * 48;
 
-    // 1. Center (0), Radius (12)
-    float4 v0 = asfloat(PageHeap.Load4(clusterOffset));
-    center = v0.xyz;
-    radius = v0.w;
+    // IntBase at offset 0 (int3 = 12 bytes)
+    int3 ib;
+    ib.x = asint(PageHeap.Load(clusterOffset + 0));
+    ib.y = asint(PageHeap.Load(clusterOffset + 4));
+    ib.z = asint(PageHeap.Load(clusterOffset + 8));
+    intBase = ib;
 
-    // 2. LODCenter (16), LODRadius (28) - Skipped for draw
+    // PackedLodErrVStart at offset 36 — LODErrorHalf:16 | VertexStart:16
+    uint packedLodVStart = PageHeap.Load(clusterOffset + 36);
+    vStart = (packedLodVStart >> 16) & 0xFFFF;
 
-    // 3. LODError (32), VertexStart (36), TriangleStart (40), GroupId (44)
-    uint4 v1 = PageHeap.Load4(clusterOffset + 32);
-    // v1.x = LODError
-    vStart = v1.y;
-    tStart = v1.z;
-    // v1.w = GroupId
+    // PackedTStartGroup at offset 40 — TriangleStart:16 | GroupId:16
+    uint packedTStartGroup = PageHeap.Load(clusterOffset + 40);
+    tStart = packedTStartGroup & 0xFFFF;
 
-    // 4. PackedCounts is at 48
-    packedCounts = PageHeap.Load(clusterOffset + 48);
+    // PackedCounts at offset 44
+    packedCounts = PageHeap.Load(clusterOffset + 44);
 }
 
 [shader("vertex")]
@@ -106,26 +93,26 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
     PSInput output;
 
     // 1. Decode Page and Cluster from RequestBuffer
-    DrawRequest req = RequestBuffer[instanceID];
+    uint clusterOffset = VisibleClusterMeta.Load(4);  // InstanceCount field of Phase1's DrawArgs
+    DrawRequest req = RequestBuffer[instanceID + clusterOffset];
     uint pageOffset = req.PageOffset;
     uint clusterID = req.ClusterID;
     uint realInstanceID = req.InstanceID;
 
     // 3. Load Header (To get stream offsets)
-    // Header is always at pageOffset
-    uint4 header1 = PageHeap.Load4(pageOffset + 16); // Offsets are at 16
-    uint clustersOffset = header1.x;                 // Not used, we computed it
+    // Header: clusters(16), pos(20), attr(24), idx(28)
+    uint4 header1 = PageHeap.Load4(pageOffset + 16);
+    uint clustersOffset = header1.x;
     uint posOffset = header1.y;
     uint attrOffset = header1.z;
     uint idxOffset = header1.w;
 
     // 4. Load Cluster Info
-    float3 center;
-    float radius;
+    int3 intBase;
     uint vStart;
     uint tStart;
     uint packedCounts;
-    LoadClusterInfo(pageOffset, clusterID, center, radius, vStart, tStart, packedCounts);
+    LoadClusterInfo(pageOffset, clusterID, intBase, vStart, tStart, packedCounts);
 
     // 5. Get triangle count from packed cluster counts.
     // [VertexCount:8][TriangleCount:8][LODLevel:8][Pad:8]
@@ -204,13 +191,10 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
         p2 = 0;
     }
 
-    // Dequantize (assuming normalized u16 to -1..1)
-    float3 localPos;
-    localPos.x = (float(p0) / 65535.0) * 2.0 - 1.0;
-    localPos.y = (float(p1) / 65535.0) * 2.0 - 1.0;
-    localPos.z = (float(p2) / 65535.0) * 2.0 - 1.0;
-
-    float3 position = center + localPos * radius;
+    // Dequantize: IntBase + local offset → global integer → float position
+    // This is bit-exact across clusters sharing the same vertex
+    int3 globalIntPos = int3(int(p0), int(p1), int(p2)) + intBase;
+    float3 position = float3(globalIntPos) * Uniforms.QuantStep + Uniforms.QuantOrigin;
 
     // 8. Transform
     GpuTransform t = Instances[realInstanceID];
@@ -218,7 +202,7 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
     output.Pos = mul(float4(worldPos, 1.0), Uniforms.ViewProj);
 
     // 9. Fake Normal/Color for Debug
-    float3 N = normalize(localPos); // Approx normal from sphere center
+    float3 N = normalize(float3(globalIntPos) - float3(intBase)); // Approx normal from cluster base
     output.Normal = N;
 
     // Color by LOD Level if DebugMode is set in specific way, or just pass LOD
@@ -255,4 +239,102 @@ float4 PSOverdraw(PSInput input) : SV_TARGET
 {
     // Return small additive value
     return float4(0.05, 0.05, 0.05, 1.0);
+}
+
+// ============================================================
+// Visibility Buffer output mode
+// ============================================================
+
+struct PSVisBufferInput
+{
+    float4 Pos : SV_POSITION;
+    nointerpolation uint VisibleClusterIndex : VIS_CLUSTER_IDX;
+    nointerpolation uint TriangleID : TRIANGLE_ID;
+};
+
+[shader("vertex")]
+PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
+{
+    PSVisBufferInput output;
+
+    uint clusterOffset = VisibleClusterMeta.Load(4);  // InstanceCount field of Phase1's DrawArgs
+    DrawRequest req = RequestBuffer[instanceID + clusterOffset];
+    uint pageOffset = req.PageOffset;
+    uint clusterID = req.ClusterID;
+    uint realInstanceID = req.InstanceID;
+
+    // Load header
+    uint4 header1 = PageHeap.Load4(pageOffset + 16);
+    uint posOffset = header1.y;
+    uint idxOffset = header1.w;
+
+    // Load cluster info
+    int3 intBase;
+    uint vStart;
+    uint tStart;
+    uint packedCounts;
+    LoadClusterInfo(pageOffset, clusterID, intBase, vStart, tStart, packedCounts);
+
+    uint triCount = (packedCounts >> 8) & 0xFF;
+
+    output.VisibleClusterIndex = instanceID + clusterOffset;  // Global index into VisibleClusters
+    output.TriangleID = vertexID / 3;
+
+    if (vertexID >= triCount * 3)
+    {
+        output.Pos = asfloat(uint4(0x7FC00000, 0x7FC00000, 0x7FC00000, 0x7FC00000));
+        return output;
+    }
+
+    // Fetch triangle index
+    uint triIdx = vertexID / 3;
+    uint corner = vertexID % 3;
+
+    uint indexByteAddr = pageOffset + idxOffset + tStart + triIdx * 3 + corner;
+    uint alignedAddr = indexByteAddr & ~3;
+    uint shift = (indexByteAddr & 3) * 8;
+    uint packedIndex = PageHeap.Load(alignedAddr);
+    uint localVIdx = (packedIndex >> shift) & 0xFF;
+
+    // Fetch position (u16[3])
+    uint posByteAddr = pageOffset + posOffset + (vStart + localVIdx) * 6;
+    uint alignedPosAddr = posByteAddr & ~3;
+    uint offsetInWord = posByteAddr & 3;
+
+    uint2 rawPosWords = PageHeap.Load2(alignedPosAddr);
+
+    uint p0, p1, p2;
+    if (offsetInWord == 0)
+    {
+        p0 = rawPosWords.x & 0xFFFF;
+        p1 = (rawPosWords.x >> 16) & 0xFFFF;
+        p2 = rawPosWords.y & 0xFFFF;
+    }
+    else if (offsetInWord == 2)
+    {
+        p0 = (rawPosWords.x >> 16) & 0xFFFF;
+        p1 = rawPosWords.y & 0xFFFF;
+        p2 = (rawPosWords.y >> 16) & 0xFFFF;
+    }
+    else
+    {
+        p0 = 0; p1 = 0; p2 = 0;
+    }
+
+    int3 globalIntPos = int3(int(p0), int(p1), int(p2)) + intBase;
+    float3 position = float3(globalIntPos) * Uniforms.QuantStep + Uniforms.QuantOrigin;
+
+    GpuTransform t = Instances[realInstanceID];
+    float3 worldPos = ApplyTransform(position, t);
+    output.Pos = mul(float4(worldPos, 1.0), Uniforms.ViewProj);
+
+    return output;
+}
+
+[shader("pixel")]
+uint PSVisBuffer(PSVisBufferInput input) : SV_TARGET
+{
+    // Encode: (VisibleClusterIndex + 1) in high 25 bits | TriangleID in low 7 bits
+    // +1 offset so that 0 is reserved as "no geometry" sentinel (clear value)
+    return ((input.VisibleClusterIndex + 1) << 7) | (input.TriangleID & 0x7F);
 }

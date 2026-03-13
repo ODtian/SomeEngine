@@ -16,7 +16,8 @@ void BuildMip0(uint3 dispatchThreadID: SV_DispatchThreadID)
     if (coord.x >= width || coord.y >= height)
         return;
 
-    HiZMip0[coord] = DepthTexture.Load(int3(coord, 0));
+    float d = DepthTexture.Load(int3(coord, 0));
+    HiZMip0[coord] = d;
 }
 
 [numthreads(8, 8, 1)]
@@ -35,18 +36,19 @@ void DownsampleMip(uint3 dispatchThreadID: SV_DispatchThreadID)
     uint srcHeight;
     SrcMip.GetDimensions(srcWidth, srcHeight);
 
-    uint2 maxCoord = uint2(srcWidth - 1, srcHeight - 1);
     uint2 baseCoord = coord * 2;
 
-    uint2 c0 = min(baseCoord, maxCoord);
-    uint2 c1 = min(baseCoord + uint2(1, 0), maxCoord);
-    uint2 c2 = min(baseCoord + uint2(0, 1), maxCoord);
-    uint2 c3 = min(baseCoord + uint2(1, 1), maxCoord);
+    // For the last texel in each dimension, extend to cover any extra
+    // row/column left over from odd source dimensions.
+    // Normal texels sample a 2×2 region [base, base+1].
+    // Edge texels sample [base, srcDim-1] which can be 2×2 or 3×2/2×3/3×3.
+    uint endX = (coord.x == width  - 1) ? srcWidth  - 1 : baseCoord.x + 1;
+    uint endY = (coord.y == height - 1) ? srcHeight - 1 : baseCoord.y + 1;
 
-    float d0 = SrcMip[c0];
-    float d1 = SrcMip[c1];
-    float d2 = SrcMip[c2];
-    float d3 = SrcMip[c3];
+    float result = 0.0;
+    for (uint y = baseCoord.y; y <= endY; y++)
+        for (uint x = baseCoord.x; x <= endX; x++)
+            result = max(result, SrcMip[uint2(x, y)]);
 
-    DstMip[coord] = max(max(d0, d1), max(d2, d3));
+    DstMip[coord] = result;
 }

@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using Diligent;
 using SomeEngine.Assets.Importers;
@@ -20,14 +19,6 @@ public class HiZBuildPass(RenderContext context) : IDisposable
     private IShaderResourceBinding? _downsampleSRB;
     private bool _initialized;
 
-    private readonly List<ITextureView> _srvMipViews = [];
-    private readonly List<ITextureView> _uavMipViews = [];
-    private ITexture? _cachedHiZTexture;
-    private uint _cachedMipCount;
-
-    private readonly List<List<IDisposable>> _disposeQueue = [new(), new(), new(), new()];
-    private int _frameIndex = 0;
-
     public void Init()
     {
         if (_initialized)
@@ -38,7 +29,10 @@ public class HiZBuildPass(RenderContext context) : IDisposable
             return;
 
         string shaderPath = Path.GetFullPath(
-            Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/hiz_build.slang")
+            Path.Combine(
+                AppContext.BaseDirectory,
+                "../../../../../../assets/Shaders/hiz_build.slang"
+            )
         );
 
         _shaderAsset = SlangShaderImporter.Import(shaderPath);
@@ -53,14 +47,7 @@ public class HiZBuildPass(RenderContext context) : IDisposable
                     PipelineType = PipelineType.Compute,
                     ResourceLayout = new PipelineResourceLayoutDesc
                     {
-                        DefaultVariableType = ShaderResourceVariableType.Mutable,
-                        Variables = _shaderAsset.GetResourceVariables(
-                            _context,
-                            name =>
-                                (name == "DepthTexture" || name == "HiZMip0")
-                                    ? ShaderResourceVariableType.Dynamic
-                                    : null
-                        ),
+                        DefaultVariableType = ShaderResourceVariableType.Dynamic,
                     },
                 },
                 Cs = cs,
@@ -81,14 +68,7 @@ public class HiZBuildPass(RenderContext context) : IDisposable
                     PipelineType = PipelineType.Compute,
                     ResourceLayout = new PipelineResourceLayoutDesc
                     {
-                        DefaultVariableType = ShaderResourceVariableType.Mutable,
-                        Variables = _shaderAsset.GetResourceVariables(
-                            _context,
-                            name =>
-                                (name == "SrcMip" || name == "DstMip")
-                                    ? ShaderResourceVariableType.Dynamic
-                                    : null
-                        ),
+                        DefaultVariableType = ShaderResourceVariableType.Dynamic,
                     },
                 },
                 Cs = cs,
@@ -102,40 +82,56 @@ public class HiZBuildPass(RenderContext context) : IDisposable
         _initialized = true;
     }
 
-    public void SetupMip0(RenderGraphBuilder builder, RGResourceHandle hDepth, RGResourceHandle hHiZ)
+    public void SetupMip0(
+        RenderGraphBuilder builder,
+        RenderGraphHandle hDepth,
+        RenderGraphHandle hHiZ
+    )
     {
-        builder.ReadTexture(hDepth, ResourceState.ShaderResource);
-        builder.WriteTexture(hHiZ, ResourceState.UnorderedAccess);
+        builder.Read(hDepth, ResourceState.ShaderResource);
+        builder.Write(hHiZ, ResourceState.UnorderedAccess, SubResourceRange.Mip(0));
     }
 
-    public void ExecuteMip0(RenderContext context, RenderGraphContext rgCtx, RGResourceHandle hDepth, RGResourceHandle hHiZ)
-    {        _frameIndex++;
-        int oldFrame = _frameIndex % _disposeQueue.Count;
-        foreach (var obj in _disposeQueue[oldFrame])
-        {
-            obj.Dispose();
-        }
-        _disposeQueue[oldFrame].Clear();
+    public void ExecuteMip0(
+        RenderGraphContext rgCtx,
+        RenderGraphHandle hDepth,
+        RenderGraphHandle hHiZ
+    )
+    {
         if (_buildMip0PSO == null || _buildMip0SRB == null)
             return;
 
-        var ctx = context.ImmediateContext;
-        if (ctx == null)
+        var hiZTexture = rgCtx.GetTexture(hHiZ);
+        if (hiZTexture == null)
             return;
+
+        var hiZDesc = hiZTexture.GetDesc();
 
         var depthSRV = rgCtx.GetTextureView(hDepth, TextureViewType.ShaderResource);
-        var hiZTexture = rgCtx.GetTexture(hHiZ);
-        if (depthSRV == null || hiZTexture == null)
+        var hiZUAV0 = rgCtx.GetOrCreateView(hHiZ, new TextureViewDesc
+        {
+            Name = "MipView_UAV_0",
+            ViewType = TextureViewType.UnorderedAccess,
+            TextureDim = hiZDesc.Type,
+            Format = hiZDesc.Format,
+            MostDetailedMip = 0,
+            NumMipLevels = 1,
+            FirstSlice = 0,
+            NumSlices = hiZDesc.ArraySizeOrDepth,
+        });
+        if (depthSRV == null || hiZUAV0 == null)
             return;
 
-        EnsureMipViews(hiZTexture);
-        if (_uavMipViews.Count == 0)
-            return;
+        var ctx = rgCtx.CommandList;
 
-        var desc = hiZTexture.GetDesc();
+        var desc = hiZDesc;
 
-        _buildMip0SRB.GetVariableByName(ShaderType.Compute, "DepthTexture")?.Set(depthSRV, SetShaderResourceFlags.None);
-        _buildMip0SRB.GetVariableByName(ShaderType.Compute, "HiZMip0")?.Set(_uavMipViews[0], SetShaderResourceFlags.None);
+        _buildMip0SRB
+            .GetVariableByName(ShaderType.Compute, "DepthTexture")
+            ?.Set(depthSRV, SetShaderResourceFlags.None);
+        _buildMip0SRB
+            .GetVariableByName(ShaderType.Compute, "HiZMip0")
+            ?.Set(hiZUAV0, SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(_buildMip0PSO);
         ctx.CommitShaderResources(_buildMip0SRB, ResourceStateTransitionMode.Verify);
@@ -149,34 +145,59 @@ public class HiZBuildPass(RenderContext context) : IDisposable
         );
     }
 
-    public void SetupDownsample(RenderGraphBuilder builder, RGResourceHandle hHiZ, uint mip)
+    public void SetupDownsample(RenderGraphBuilder builder, RenderGraphHandle hHiZ, uint mip)
     {
-        builder.WriteTexture(hHiZ, ResourceState.UnorderedAccess);
+        builder.Read(hHiZ, ResourceState.UnorderedAccess, SubResourceRange.Mip(mip - 1));
+        builder.Write(hHiZ, ResourceState.UnorderedAccess, SubResourceRange.Mip(mip));
     }
 
-    public void ExecuteDownsample(RenderContext context, RenderGraphContext rgCtx, RGResourceHandle hHiZ, uint mip)
+    public void ExecuteDownsample(RenderGraphContext rgCtx, RenderGraphHandle hHiZ, uint mip)
     {
         if (_downsamplePSO == null || _downsampleSRB == null)
-            return;
-
-        var ctx = context.ImmediateContext;
-        if (ctx == null)
             return;
 
         var hiZTexture = rgCtx.GetTexture(hHiZ);
         if (hiZTexture == null)
             return;
 
-        EnsureMipViews(hiZTexture);
-        if (mip >= _cachedMipCount || _srvMipViews.Count <= mip - 1 || _uavMipViews.Count <= mip)
+        var hiZDesc = hiZTexture.GetDesc();
+
+        var srcMipView = rgCtx.GetOrCreateView(hHiZ, new TextureViewDesc
+        {
+            Name = $"MipView_UAV_{mip - 1}",
+            ViewType = TextureViewType.UnorderedAccess,
+            TextureDim = hiZDesc.Type,
+            Format = hiZDesc.Format,
+            MostDetailedMip = mip - 1,
+            NumMipLevels = 1,
+            FirstSlice = 0,
+            NumSlices = hiZDesc.ArraySizeOrDepth,
+        });
+        var dstMipView = rgCtx.GetOrCreateView(hHiZ, new TextureViewDesc
+        {
+            Name = $"MipView_UAV_{mip}",
+            ViewType = TextureViewType.UnorderedAccess,
+            TextureDim = hiZDesc.Type,
+            Format = hiZDesc.Format,
+            MostDetailedMip = mip,
+            NumMipLevels = 1,
+            FirstSlice = 0,
+            NumSlices = hiZDesc.ArraySizeOrDepth,
+        });
+        if (srcMipView == null || dstMipView == null)
             return;
 
-        var desc = hiZTexture.GetDesc();
-        uint mipWidth = Math.Max(1u, desc.Width >> (int)mip);
-        uint mipHeight = Math.Max(1u, desc.Height >> (int)mip);
+        var ctx = rgCtx.CommandList;
 
-        _downsampleSRB.GetVariableByName(ShaderType.Compute, "SrcMip")?.Set(_uavMipViews[(int)mip - 1], SetShaderResourceFlags.None);
-        _downsampleSRB.GetVariableByName(ShaderType.Compute, "DstMip")?.Set(_uavMipViews[(int)mip], SetShaderResourceFlags.None);
+        uint mipWidth = Math.Max(1u, hiZDesc.Width >> (int)mip);
+        uint mipHeight = Math.Max(1u, hiZDesc.Height >> (int)mip);
+
+        _downsampleSRB
+            .GetVariableByName(ShaderType.Compute, "SrcMip")
+            ?.Set(srcMipView, SetShaderResourceFlags.None);
+        _downsampleSRB
+            .GetVariableByName(ShaderType.Compute, "DstMip")
+            ?.Set(dstMipView, SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(_downsamplePSO);
         ctx.CommitShaderResources(_downsampleSRB, ResourceStateTransitionMode.Verify);
@@ -190,90 +211,13 @@ public class HiZBuildPass(RenderContext context) : IDisposable
         );
     }
 
-
-    private void EnsureMipViews(ITexture texture)
-    {
-        var desc = texture.GetDesc();
-        uint mipCount = Math.Max(1u, desc.MipLevels);
-
-        if (_cachedHiZTexture == texture && _cachedMipCount == mipCount)
-            return;
-
-        ClearMipViews();
-
-        _cachedHiZTexture = texture;
-        _cachedMipCount = mipCount;
-
-        for (uint mip = 0; mip < mipCount; mip++)
-        {
-            var srvDesc = new TextureViewDesc
-            {
-                Name = $"HiZ SRV Mip {mip}",
-                ViewType = TextureViewType.ShaderResource,
-                TextureDim = desc.Type,
-                Format = desc.Format,
-                MostDetailedMip = mip,
-                NumMipLevels = 1,
-                FirstSlice = 0,
-                NumSlices = desc.ArraySizeOrDepth,
-            };
-
-            var uavDesc = new TextureViewDesc
-            {
-                Name = $"HiZ UAV Mip {mip}",
-                ViewType = TextureViewType.UnorderedAccess,
-                TextureDim = desc.Type,
-                Format = desc.Format,
-                MostDetailedMip = mip,
-                NumMipLevels = 1,
-                FirstSlice = 0,
-                NumSlices = desc.ArraySizeOrDepth,
-            };
-
-            var srv = texture.CreateView(srvDesc);
-            var uav = texture.CreateView(uavDesc);
-
-            if (srv != null)
-                _srvMipViews.Add(srv);
-            if (uav != null)
-                _uavMipViews.Add(uav);
-        }
-    }
-
     private static uint DispatchCount(uint size)
     {
         return (size + 7) / 8;
     }
 
-    private void ClearMipViews()
-    {
-        int queueIdx = _frameIndex % _disposeQueue.Count;
-        foreach (var view in _srvMipViews)
-            _disposeQueue[queueIdx].Add(view);
-        foreach (var view in _uavMipViews)
-            _disposeQueue[queueIdx].Add(view);
-
-        _srvMipViews.Clear();
-        _uavMipViews.Clear();
-
-        _cachedHiZTexture = null;
-        _cachedMipCount = 0;
-    }
-
     public void Dispose()
     {
-        foreach (var queue in _disposeQueue)
-        {
-            foreach (var obj in queue)
-            {
-                obj.Dispose();
-            }
-            queue.Clear();
-        }
-
-        ClearMipViews();
-        _disposeQueue[0].Clear(); // Just to avoid leaking if called after ClearMipViews
-
         _buildMip0SRB?.Dispose();
         _buildMip0PSO?.Dispose();
         _downsampleSRB?.Dispose();

@@ -10,8 +10,9 @@ using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Pipelines;
 
-public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMeshPass"), IDisposable
+public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDisposable
 {
+    public string Name => "Simple Mesh Render";
     private readonly RenderContext _context = context;
     private IPipelineState? _pso;
     private IShaderResourceBinding? _srb;
@@ -56,63 +57,20 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
         var vbDesc = new BufferDesc
         {
             Name = "SimpleMesh VB",
-            Usage = Usage.Default,
+            Usage = Usage.Immutable,
             BindFlags = BindFlags.VertexBuffer,
             Size = (ulong)(vertData.Length * sizeof(float)),
         };
-        _vb = device!.CreateBuffer(vbDesc);
-        _context.ImmediateContext!.TransitionResourceStates([
-            new StateTransitionDesc {
-                Resource = _vb,
-                OldState = ResourceState.Unknown,
-                NewState = ResourceState.CopyDest,
-                Flags = StateTransitionFlags.UpdateState
-            }
-        ]);
-        _context.ImmediateContext!.UpdateBuffer(
-            _vb,
-            0,
-            vertData,
-            ResourceStateTransitionMode.Verify
-        );
+        _vb = device!.CreateBuffer(vbDesc, vertData);
 
         var ibDesc = new BufferDesc
         {
             Name = "SimpleMesh IB",
-            Usage = Usage.Default,
+            Usage = Usage.Immutable,
             BindFlags = BindFlags.IndexBuffer,
             Size = (ulong)(indices.Length * sizeof(uint)),
         };
-        _ib = device!.CreateBuffer(ibDesc);
-        _context.ImmediateContext!.TransitionResourceStates([
-            new StateTransitionDesc {
-                Resource = _ib,
-                OldState = ResourceState.Unknown,
-                NewState = ResourceState.CopyDest,
-                Flags = StateTransitionFlags.UpdateState
-            }
-        ]);
-        _context.ImmediateContext!.UpdateBuffer(
-            _ib,
-            0,
-            indices,
-            ResourceStateTransitionMode.Verify
-        );
-
-        _context.ImmediateContext!.TransitionResourceStates([
-            new StateTransitionDesc {
-                Resource = _vb,
-                OldState = ResourceState.CopyDest,
-                NewState = ResourceState.VertexBuffer,
-                Flags = StateTransitionFlags.UpdateState
-            },
-            new StateTransitionDesc {
-                Resource = _ib,
-                OldState = ResourceState.CopyDest,
-                NewState = ResourceState.IndexBuffer,
-                Flags = StateTransitionFlags.UpdateState
-            }
-        ]);
+        _ib = device!.CreateBuffer(ibDesc, indices);
 
         var cbDesc = new BufferDesc
         {
@@ -217,12 +175,15 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
         if (_pso == null)
             throw new Exception("Failed to create SimpleMesh PSO");
 
-        _pso!.GetStaticVariableByName(ShaderType.Vertex, "g_Constants")
+        _pso!
+            .GetStaticVariableByName(ShaderType.Vertex, "g_Constants")
             ?.Set(_cb!, SetShaderResourceFlags.None);
         _srb = _pso!.CreateShaderResourceBinding(true);
     }
 
-    public override void Execute(RenderContext context, RenderGraphContext? graphContext)
+    public void Setup(RenderGraphBuilder builder) { }
+
+    public void Execute(RenderGraphContext graphContext)
     {
         if (!_initialized)
             Init();
@@ -235,11 +196,10 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
         if (swapChain == null)
             return;
         var rtv = swapChain.GetCurrentBackBufferRTV();
-        var dsv = _context.DepthBufferDSV!;
-        if (rtv == null || dsv == null)
+        if (rtv == null)
             return;
 
-        ctx.SetRenderTargets([rtv], dsv, ResourceStateTransitionMode.Verify);
+        ctx.SetRenderTargets([rtv], null, ResourceStateTransitionMode.Verify);
         ctx.SetPipelineState(_pso);
         ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Verify);
 
@@ -255,14 +215,13 @@ public class SimpleMeshRenderPass(RenderContext context) : RenderPass("SimpleMes
             var world = Matrix4x4.CreateRotationY(time) * Matrix4x4.CreateRotationX(time * 0.5f);
             var wvp = world * view * proj;
 
-            unsafe
+            var mapped = ctx.MapBuffer<Constants>(_cb, MapType.Write, MapFlags.Discard);
+            mapped[0] = new Constants
             {
-                IntPtr pData = ctx.MapBuffer(_cb, MapType.Write, MapFlags.Discard);
-                Constants* pConsts = (Constants*)pData;
-                pConsts->WorldViewProj = Matrix4x4.Transpose(wvp);
-                pConsts->Color = new Vector4(1, 0, 0, 1);
-                ctx.UnmapBuffer(_cb, MapType.Write);
-            }
+                WorldViewProj = Matrix4x4.Transpose(wvp),
+                Color = new Vector4(1, 0, 0, 1),
+            };
+            ctx.UnmapBuffer(_cb, MapType.Write);
         }
 
         ctx.SetVertexBuffers(

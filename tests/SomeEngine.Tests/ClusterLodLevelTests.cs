@@ -36,11 +36,13 @@ public class ClusterLodLevelTests
         while (offset < payloadLength)
         {
             var pageSpan = payload.Span.Slice(offset);
-            if (pageSpan.Length < 32) break;
+            if (pageSpan.Length < MeshPageHeader.Size) break;
 
             uint pClusterCount = MemoryMarshal.Read<uint>(pageSpan.Slice(0, 4));
-            uint pPageSize = MemoryMarshal.Read<uint>(pageSpan.Slice(12, 4));
+            uint pTotalTriCount = MemoryMarshal.Read<uint>(pageSpan.Slice(8, 4));
             uint pClustersOffset = MemoryMarshal.Read<uint>(pageSpan.Slice(16, 4));
+            uint pIndicesOffset = MemoryMarshal.Read<uint>(pageSpan.Slice(28, 4));
+            uint pPageSize = pIndicesOffset + pTotalTriCount * 3;
 
             int clusterByteSize = Marshal.SizeOf<GPUCluster>();
             if (pClustersOffset + pClusterCount * clusterByteSize > pageSpan.Length) break;
@@ -50,7 +52,7 @@ public class ClusterLodLevelTests
             for (int i = 0; i < clusters.Length; i++)
             {
                 var c = clusters[i];
-                int level = c.LODLevel;
+                int level = (int)((c.PackedCounts >> 16) & 0xFF);
                 if (level < 16) levelCounts[level]++;
                 if (level > maxLevel) maxLevel = level;
             }

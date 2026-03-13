@@ -11,8 +11,7 @@ public unsafe class RenderContext : IDisposable
     public IRenderDevice? Device { get; private set; }
     public IDeviceContext? ImmediateContext { get; private set; }
     public ISwapChain? SwapChain { get; private set; }
-    public ITexture? DepthBuffer { get; private set; }
-    public ITextureView? DepthBufferDSV { get; private set; }
+    public TextureDesc DepthBufferDesc { get; private set; }
 
     public void Initialize(IWindow window)
     {
@@ -23,7 +22,7 @@ public unsafe class RenderContext : IDisposable
         var scDesc = new SwapChainDesc
         {
             ColorBufferFormat = TextureFormat.RGBA8_UNorm,
-            DepthBufferFormat = TextureFormat.Unknown, // We manage depth buffer manually
+            DepthBufferFormat = TextureFormat.Unknown, // We manage depth buffer via RG
             BufferCount = 2,
             Width = (uint)window.Size.X,
             Height = (uint)window.Size.Y,
@@ -48,9 +47,7 @@ public unsafe class RenderContext : IDisposable
         Factory = factory;
         var engineCI = new EngineD3D12CreateInfo
         {
-            EnableValidation = true,
-            D3D12ValidationFlags =
-                D3D12ValidationFlags.BreakOnError | D3D12ValidationFlags.BreakOnCorruption,
+            EnableValidation = false,
         };
         factory.CreateDeviceAndContextsD3D12(engineCI, out var device, out var contexts);
         Device = device;
@@ -60,16 +57,17 @@ public unsafe class RenderContext : IDisposable
         var win32Window = new Win32NativeWindow { Wnd = windowHandle };
 
         SwapChain = factory.CreateSwapChainD3D12(device, contexts[0], scDesc, fsDesc, win32Window);
-        CreateDepthBuffer(scDesc.Width, scDesc.Height);
+        UpdateDepthBufferDesc(scDesc.Width, scDesc.Height);
     }
 
-    private void CreateDepthBuffer(uint width, uint height)
+    private void UpdateDepthBufferDesc(uint width, uint height)
     {
-        DepthBuffer?.Dispose();
-        
-        var depthDesc = new TextureDesc
+        if (width == 0 || height == 0)
+            return;
+
+        DepthBufferDesc = new TextureDesc
         {
-            Name = "Custom Depth Buffer",
+            Name = "DepthBuffer",
             Type = ResourceDimension.Tex2d,
             Width = width,
             Height = height,
@@ -78,18 +76,15 @@ public unsafe class RenderContext : IDisposable
             ClearValue = new OptimizedClearValue
             {
                 Format = TextureFormat.D32_Float,
-                DepthStencil = new DepthStencilClearValue { Depth = 1.0f, Stencil = 0 }
-            }
+                DepthStencil = new DepthStencilClearValue { Depth = 1.0f, Stencil = 0 },
+            },
         };
-
-        DepthBuffer = Device!.CreateTexture(depthDesc);
-        DepthBufferDSV = DepthBuffer.GetDefaultView(TextureViewType.DepthStencil);
     }
 
     public void Resize(uint width, uint height)
     {
         SwapChain?.Resize(width, height, SurfaceTransform.Optimal);
-        CreateDepthBuffer(width, height);
+        UpdateDepthBufferDesc(width, height);
     }
 
     public void Present()
@@ -99,7 +94,8 @@ public unsafe class RenderContext : IDisposable
 
     public void Dispose()
     {
-        DepthBuffer?.Dispose();
+        ImmediateContext?.Flush();
+        ImmediateContext?.WaitForIdle();
         SwapChain?.Dispose();
         ImmediateContext?.Dispose();
         Device?.Dispose();

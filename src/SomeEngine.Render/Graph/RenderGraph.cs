@@ -5,87 +5,193 @@ using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Graph;
 
+internal class PassMetadata
+{
+    public bool Active;
+    public List<(RenderGraphHandle Handle, ResourceState State, SubResourceRange Range)> Reads = [];
+    public List<(RenderGraphHandle Handle, ResourceState State, SubResourceRange Range)> Writes =
+    [];
+}
+
 public class RenderGraph : IDisposable
 {
-    private readonly List<RenderPass> _passes = [];
-    private readonly List<RGResource> _resources = [];
-    private readonly Dictionary<string, RGResourceHandle> _resourceMap = [];
-    private readonly List<TextureExtractionRequest> _textureExtractionQueue = [];
-    private readonly List<BufferExtractionRequest> _bufferExtractionQueue = [];
+    // ── 帧内 ──
+    private readonly List<IRenderGraphPass> _passes = [];
+    private readonly List<RenderGraphResource> _resources = [];
+    private readonly Dictionary<string, int> _resourceLookup = [];
+    private readonly Dictionary<int, ITexture> _importedTextures = [];
+    private readonly Dictionary<int, IBuffer> _importedBuffers = [];
+    private readonly List<PassMetadata> _passMetadata = [];
+    private readonly HashSet<int> _markedOutputResources = [];
 
-    // Pass metadata
-    private class PassMetadata
+    // Compile state
+    private readonly struct CompiledBarrier(
+        RenderGraphHandle handle,
+        ResourceState oldState,
+        ResourceState newState,
+        uint firstMipLevel = 0,
+        uint mipLevelCount = uint.MaxValue,
+        uint firstArraySlice = 0,
+        uint arraySliceCount = uint.MaxValue
+    )
     {
-        public bool IsActive = true;
-        public List<(RGResourceHandle Handle, ResourceState State)> Reads = [];
-        public List<(RGResourceHandle Handle, ResourceState State)> Writes = [];
+        public RenderGraphHandle Handle { get; } = handle;
+        public ResourceState OldState { get; } = oldState;
+        public ResourceState NewState { get; } = newState;
+        public uint FirstMipLevel { get; } = firstMipLevel;
+        public uint MipLevelCount { get; } = mipLevelCount;
+        public uint FirstArraySlice { get; } = firstArraySlice;
+        public uint ArraySliceCount { get; } = arraySliceCount;
     }
 
-    private readonly struct CompiledBarrier
+    private class CompiledPass(IRenderGraphPass pass, int originalIndex)
     {
-        public CompiledBarrier(RGResourceHandle handle, ResourceState oldState, ResourceState newState)
-        {
-            Handle = handle;
-            OldState = oldState;
-            NewState = newState;
-        }
-
-        public RGResourceHandle Handle { get; }
-        public ResourceState OldState { get; }
-        public ResourceState NewState { get; }
-    }
-
-    private class CompiledPass
-    {
-        public CompiledPass(RenderPass pass, int originalIndex)
-        {
-            Pass = pass;
-            OriginalIndex = originalIndex;
-        }
-
-        public RenderPass Pass { get; }
-        public int OriginalIndex { get; }
+        public IRenderGraphPass Pass { get; } = pass;
+        public int OriginalIndex { get; } = originalIndex;
         public bool Active { get; set; }
         public List<CompiledBarrier> PreBarriers { get; } = [];
-        public List<(RGResourceHandle Handle, ResourceState State)> RequiredStates { get; } = [];
+        public List<(
+            RenderGraphHandle Handle,
+            ResourceState State,
+            SubResourceRange Range
+        )> RequiredStates { get; } = [];
     }
 
-    private readonly Dictionary<RenderPass, PassMetadata> _passMetadata = [];
-    private readonly HashSet<int> _markedOutputResources = [];
     private readonly List<CompiledPass> _compiledPasses = [];
     private readonly List<int> _executionOrder = [];
     private readonly HashSet<int> _activeResourceIds = [];
 
-    private readonly List<RGMemoryHeap> _memoryHeaps = [];
+    // ── 跨帧 ──
+    private readonly List<IRenderFeature> _features = [];
+    private readonly Dictionary<string, CachedTexture> _textureCache = [];
+    private readonly Dictionary<string, CachedBuffer> _bufferCache = [];
 
-    private readonly struct TextureExtractionRequest
+    // Persisted per-subresource state across frames: (resourceName, mip, slice) -> ResourceState
+    private Dictionary<
+        (string Name, uint Mip, uint Slice),
+        ResourceState
+    > _persistedSubresourceStates = [];
+    private readonly List<RenderGraphMemoryHeap> _heaps = [];
+    private IRenderDevice? _device;
+    private IFence? _fence;
+    private ulong _fenceValue;
+    private readonly Queue<(ulong Fence, IDisposable Resource)> _deferredReleases = new();
+    private readonly List<(string Name, double Ms)> _lastPassTimings = [];
+    private int _executeFrameCount;
+
+    // Physical resource resolution (per-frame, keyed by resource index)
+    private ITexture?[] _resolvedTextures = [];
+    private IBuffer?[] _resolvedBuffers = [];
+
+    private struct PlacementInfo
     {
-        public TextureExtractionRequest(RGResourceHandle handle, Action<ITexture?> assign)
-        {
-            Handle = handle;
-            Assign = assign;
-        }
-
-        public RGResourceHandle Handle { get; }
-        public Action<ITexture?> Assign { get; }
+        public ulong Size;
+        public ulong Alignment;
+        public ulong Offset;
+        public int HeapIndex;
     }
 
-    private readonly struct BufferExtractionRequest
-    {
-        public BufferExtractionRequest(RGResourceHandle handle, Action<IBuffer?> assign)
-        {
-            Handle = handle;
-            Assign = assign;
-        }
+    private PlacementInfo[] _placements = [];
 
-        public RGResourceHandle Handle { get; }
-        public Action<IBuffer?> Assign { get; }
+    // Store descs for transient resources
+    private readonly Dictionary<int, TextureDesc> _textureDescs = [];
+    private readonly Dictionary<int, BufferDesc> _bufferDescs = [];
+
+    // ── Feature API ──
+
+    public void AddFeature(IRenderFeature feature)
+    {
+        _features.Add(feature);
     }
 
-    public void AddPass(RenderPass pass)
+    public void RemoveFeature(IRenderFeature feature)
     {
+        _features.Remove(feature);
+    }
+
+    // ── API ──
+
+    public void BeginFrame()
+    {
+        ProcessDeferredReleases();
+
+        _passes.Clear();
+        _resources.Clear();
+        _resourceLookup.Clear();
+        _importedTextures.Clear();
+        _importedBuffers.Clear();
+        _passMetadata.Clear();
+        _markedOutputResources.Clear();
+        _compiledPasses.Clear();
+        _executionOrder.Clear();
+        _activeResourceIds.Clear();
+        _textureDescs.Clear();
+        _bufferDescs.Clear();
+        Array.Clear(_placements);
+    }
+
+    public void Initialize(IRenderDevice device)
+    {
+        _device = device;
+        _fence = device.CreateFence(
+            new FenceDesc { Name = "RenderGraph Fence", Type = FenceType.General }
+        );
+    }
+
+    public RenderGraphHandle CreateTexture(string name, TextureDesc desc)
+    {
+        int index = _resources.Count;
+        _resources.Add(new RenderGraphResource(name, ResourceKind.Texture));
+        _resourceLookup[name] = index;
+        _textureDescs[index] = desc;
+        return new RenderGraphHandle(index);
+    }
+
+    public RenderGraphHandle CreateBuffer(string name, BufferDesc desc)
+    {
+        int index = _resources.Count;
+        _resources.Add(new RenderGraphResource(name, ResourceKind.Buffer));
+        _resourceLookup[name] = index;
+        _bufferDescs[index] = desc;
+        return new RenderGraphHandle(index);
+    }
+
+    public RenderGraphHandle Import(
+        string name,
+        ITexture texture,
+        ResourceState state = ResourceState.Unknown
+    )
+    {
+        int index = _resources.Count;
+        var res = new RenderGraphResource(name, ResourceKind.Texture) { CurrentState = state };
+        _resources.Add(res);
+        _resourceLookup[name] = index;
+        _importedTextures[index] = texture;
+        // Store desc from the actual texture
+        _textureDescs[index] = texture.GetDesc();
+        return new RenderGraphHandle(index);
+    }
+
+    public RenderGraphHandle Import(
+        string name,
+        IBuffer buffer,
+        ResourceState state = ResourceState.Unknown
+    )
+    {
+        int index = _resources.Count;
+        var res = new RenderGraphResource(name, ResourceKind.Buffer) { CurrentState = state };
+        _resources.Add(res);
+        _resourceLookup[name] = index;
+        _importedBuffers[index] = buffer;
+        _bufferDescs[index] = buffer.GetDesc();
+        return new RenderGraphHandle(index);
+    }
+
+    public void AddPass(IRenderGraphPass pass)
+    {
+        int passIndex = _passes.Count;
         _passes.Add(pass);
-        _passMetadata[pass] = new PassMetadata();
+        _passMetadata.Add(new PassMetadata { Active = true });
     }
 
     public void AddPass<TData>(
@@ -95,156 +201,46 @@ public class RenderGraph : IDisposable
     )
         where TData : class, new()
     {
-        var pass = new LambdaRenderPass<TData>(name, new TData(), setup, execute);
+        var pass = new LambdaRenderGraphPass<TData>(name, new TData(), setup, execute);
         AddPass(pass);
     }
 
-    public RGResourceHandle CreateTexture(string name, TextureDesc desc)
+    public void MarkOutput(RenderGraphHandle h)
     {
-        var handle = new RGResourceHandle { Id = _resources.Count, Version = 0 };
-        var tex = new RGTexture(name, desc) { Handle = handle };
-        _resources.Add(tex);
-        _resourceMap[name] = handle;
-        return handle;
-    }
-
-    public RGResourceHandle CreateBuffer(string name, BufferDesc desc)
-    {
-        var handle = new RGResourceHandle { Id = _resources.Count, Version = 0 };
-        var buf = new RGBuffer(name, desc) { Handle = handle };
-        _resources.Add(buf);
-        _resourceMap[name] = handle;
-        return handle;
-    }
-
-    public void MarkAsOutput(RGResourceHandle handle)
-    {
-        if (!handle.IsValid)
+        if (!h.IsValid)
             return;
-
-        _markedOutputResources.Add(handle.Id);
+        _markedOutputResources.Add(h.Index);
     }
 
-    public RGResourceHandle ImportTexture(
+    public RenderGraphHandle GetResourceHandle(string name)
+    {
+        if (_resourceLookup.TryGetValue(name, out int index))
+            return new RenderGraphHandle(index);
+        return RenderGraphHandle.Invalid;
+    }
+
+    public delegate MemoryRequirements GetMemoryRequirementsDelegate(
         string name,
-        ITexture texture,
-        ResourceState initialState = ResourceState.Unknown,
-        ITextureView? view = null
-    )
-    {
-        var handle = new RGResourceHandle { Id = _resources.Count, Version = 0 };
-        var desc = texture.GetDesc();
-        var tex = new RGTexture(name, desc)
-        {
-            Handle = handle,
-            InternalTexture = texture,
-            InternalView = view,
-            IsImported = true,
-            InitialState = initialState,
-            CurrentState = initialState,
-        };
-        _resources.Add(tex);
-        _resourceMap[name] = handle;
-        return handle;
-    }
-
-    public RGResourceHandle RegisterExternalTexture(
-        string name,
-        ITexture texture,
-        ResourceState initialState = ResourceState.Unknown,
-        ITextureView? view = null
-    )
-    {
-        var handle = ImportTexture(name, texture, initialState, view);
-        if (handle.IsValid)
-        {
-            _resources[handle.Id].IsExternal = true;
-        }
-
-        return handle;
-    }
-
-    public RGResourceHandle ImportBuffer(
-        string name,
-        IBuffer buffer,
-        ResourceState initialState = ResourceState.Unknown
-    )
-    {
-        var handle = new RGResourceHandle { Id = _resources.Count, Version = 0 };
-        var desc = buffer.GetDesc();
-        var buf = new RGBuffer(name, desc)
-        {
-            Handle = handle,
-            InternalBuffer = buffer,
-            IsImported = true,
-            InitialState = initialState,
-            CurrentState = initialState,
-        };
-        _resources.Add(buf);
-        _resourceMap[name] = handle;
-        return handle;
-    }
-
-    public RGResourceHandle RegisterExternalBuffer(
-        string name,
-        IBuffer buffer,
-        ResourceState initialState = ResourceState.Unknown
-    )
-    {
-        var handle = ImportBuffer(name, buffer, initialState);
-        if (handle.IsValid)
-        {
-            _resources[handle.Id].IsExternal = true;
-        }
-
-        return handle;
-    }
-
-    public void QueueTextureExtraction(RGResourceHandle handle, Action<ITexture?> assign)
-    {
-        ArgumentNullException.ThrowIfNull(assign);
-
-        if (!handle.IsValid)
-        {
-            assign(null);
-            return;
-        }
-
-        _textureExtractionQueue.Add(new TextureExtractionRequest(handle, assign));
-    }
-
-    public void QueueBufferExtraction(RGResourceHandle handle, Action<IBuffer?> assign)
-    {
-        ArgumentNullException.ThrowIfNull(assign);
-
-        if (!handle.IsValid)
-        {
-            assign(null);
-            return;
-        }
-
-        _bufferExtractionQueue.Add(new BufferExtractionRequest(handle, assign));
-    }
-
-    public RGResourceHandle GetResourceHandle(string name)
-    {
-        if (_resourceMap.TryGetValue(name, out var handle))
-            return handle;
-        return RGResourceHandle.Invalid;
-    }
-
-    public delegate MemoryRequirements GetMemoryRequirementsDelegate(RGResource resource);
+        ResourceKind kind,
+        TextureDesc? texDesc,
+        BufferDesc? bufDesc
+    );
 
     public void Compile(
         IRenderDevice? device = null,
         GetMemoryRequirementsDelegate? getMemoryReqs = null
     )
     {
-        PrepareForCompile();
+        // Feature 注册 pass（按添加顺序）
+        foreach (var feature in _features)
+            feature.AddPasses(this);
 
+        _device = device;
+        PrepareForCompile();
         foreach (var pass in _passes)
         {
-            var builder = new RenderGraphBuilder(this, pass);
+            int passIndex = _passes.IndexOf(pass);
+            var builder = new RenderGraphBuilder(this, passIndex);
             pass.Setup(builder);
         }
 
@@ -267,29 +263,30 @@ public class RenderGraph : IDisposable
             if (!compiledPass.Active)
                 continue;
 
-            if (!_passMetadata.TryGetValue(compiledPass.Pass, out var meta))
+            var meta = _passMetadata[passIndex];
+            if (!meta.Active)
                 continue;
 
-            foreach (var (handle, _) in meta.Reads)
+            foreach (var (handle, _, _) in meta.Reads)
             {
                 if (!handle.IsValid)
                     continue;
 
-                _activeResourceIds.Add(handle.Id);
-                if (!firstPass.ContainsKey(handle.Id))
-                    firstPass[handle.Id] = executionIndex;
-                lastPass[handle.Id] = executionIndex;
+                _activeResourceIds.Add(handle.Index);
+                if (!firstPass.ContainsKey(handle.Index))
+                    firstPass[handle.Index] = executionIndex;
+                lastPass[handle.Index] = executionIndex;
             }
 
-            foreach (var (handle, _) in meta.Writes)
+            foreach (var (handle, _, _) in meta.Writes)
             {
                 if (!handle.IsValid)
                     continue;
 
-                _activeResourceIds.Add(handle.Id);
-                if (!firstPass.ContainsKey(handle.Id))
-                    firstPass[handle.Id] = executionIndex;
-                lastPass[handle.Id] = executionIndex;
+                _activeResourceIds.Add(handle.Index);
+                if (!firstPass.ContainsKey(handle.Index))
+                    firstPass[handle.Index] = executionIndex;
+                lastPass[handle.Index] = executionIndex;
             }
         }
 
@@ -298,6 +295,441 @@ public class RenderGraph : IDisposable
             AllocateMemoryHeaps(device, getMemoryReqs, firstPass, lastPass);
         }
     }
+
+    public void Execute(RenderContext context)
+    {
+        var deviceContext = context.ImmediateContext;
+
+        if (_compiledPasses.Count == 0 || _executionOrder.Count == 0)
+        {
+            return;
+        }
+
+        // Resolve physical resources
+        if (_resolvedTextures.Length < _resources.Count)
+        {
+            Array.Resize(ref _resolvedTextures, _resources.Count);
+            Array.Resize(ref _resolvedBuffers, _resources.Count);
+        }
+
+        Array.Clear(_resolvedTextures, 0, _resources.Count);
+        Array.Clear(_resolvedBuffers, 0, _resources.Count);
+
+        for (int i = 0; i < _resources.Count; i++)
+        {
+            if (!_activeResourceIds.Contains(i))
+                continue;
+
+            var res = _resources[i];
+
+            // Check imported
+            if (_importedTextures.TryGetValue(i, out var importedTex))
+            {
+                _resolvedTextures[i] = importedTex;
+                continue;
+            }
+            if (_importedBuffers.TryGetValue(i, out var importedBuf))
+            {
+                _resolvedBuffers[i] = importedBuf;
+                continue;
+            }
+
+            // Resolve from cache by name
+            if (res.Kind == ResourceKind.Texture && _textureDescs.TryGetValue(i, out var texDesc))
+            {
+                if (
+                    _textureCache.TryGetValue(res.Name, out var cached)
+                    && cached.Texture != null
+                    && AreCompatible(cached.Desc, texDesc)
+                )
+                {
+                    _resolvedTextures[i] = cached.Texture;
+                    // Opt out of Diligent's whole-resource state tracking;
+                    // RenderGraph manages per-subresource state.
+                    cached.Texture.SetState(ResourceState.Unknown);
+                    cached.IdleFrames = 0;
+                    cached.LastUsedFence = _fenceValue + 1; // Will be signaled at end of Execute
+                }
+                else
+                {
+                    // Create new
+                    var newTex = context.Device?.CreateTexture(texDesc, null);
+                    // Opt out of Diligent's whole-resource state tracking
+                    newTex?.SetState(ResourceState.Unknown);
+                    _resolvedTextures[i] = newTex;
+
+                    // Defer old resource release using its last fence
+                    if (cached != null)
+                    {
+                        DeferRelease(cached, cached.LastUsedFence);
+                    }
+
+                    _textureCache[res.Name] = new CachedTexture
+                    {
+                        Desc = texDesc,
+                        Texture = newTex,
+                        IdleFrames = 0,
+                        LastUsedFence = _fenceValue + 1,
+                    };
+                }
+            }
+            else if (
+                res.Kind == ResourceKind.Buffer
+                && _bufferDescs.TryGetValue(i, out var bufDesc)
+            )
+            {
+                if (
+                    _bufferCache.TryGetValue(res.Name, out var cached)
+                    && cached.Buffer != null
+                    && AreCompatible(cached.Desc, bufDesc)
+                )
+                {
+                    _resolvedBuffers[i] = cached.Buffer;
+                    // Only opt out of Diligent tracking for default-usage buffers.
+                    // Dynamic buffers have no D3D12 resource and must stay in GENERIC_READ.
+                    if (bufDesc.Usage == Usage.Default || bufDesc.Usage == Usage.Immutable)
+                        cached.Buffer.SetState(ResourceState.Unknown);
+                    cached.IdleFrames = 0;
+                    cached.LastUsedFence = _fenceValue + 1;
+                }
+                else
+                {
+                    var newBuf = context.Device?.CreateBuffer(bufDesc, null);
+                    if (
+                        newBuf != null
+                        && (bufDesc.Usage == Usage.Default || bufDesc.Usage == Usage.Immutable)
+                    )
+                        newBuf.SetState(ResourceState.Unknown);
+                    _resolvedBuffers[i] = newBuf;
+
+                    if (cached != null)
+                    {
+                        DeferRelease(cached, cached.LastUsedFence);
+                    }
+
+                    _bufferCache[res.Name] = new CachedBuffer
+                    {
+                        Desc = bufDesc,
+                        Buffer = newBuf,
+                        IdleFrames = 0,
+                        LastUsedFence = _fenceValue + 1,
+                    };
+                }
+            }
+        }
+
+        // Execute passes
+        var rgContext = new RenderGraphContext(this, context);
+        var passSw = new System.Diagnostics.Stopwatch();
+        _lastPassTimings.Clear();
+
+        foreach (int passIndex in _executionOrder)
+        {
+            var compiledPass = _compiledPasses[passIndex];
+            if (!compiledPass.Active)
+                continue;
+
+            passSw.Restart();
+
+            if (deviceContext != null && compiledPass.PreBarriers.Count > 0)
+            {
+                var transitions = new List<StateTransitionDesc>();
+
+                foreach (var barrier in compiledPass.PreBarriers)
+                {
+                    if (barrier.Handle.Index < 0 || barrier.Handle.Index >= _resources.Count)
+                        continue;
+
+                    IDeviceObject? deviceObj = null;
+                    var res = _resources[barrier.Handle.Index];
+                    if (res.Kind == ResourceKind.Texture)
+                    {
+                        deviceObj = _resolvedTextures[barrier.Handle.Index];
+                    }
+                    else if (res.Kind == ResourceKind.Buffer)
+                    {
+                        deviceObj = _resolvedBuffers[barrier.Handle.Index];
+                    }
+
+                    if (deviceObj != null)
+                    {
+                        var resIdx = barrier.Handle.Index;
+                        // Resources that still use Diligent's internal state tracking:
+                        // imported resources, and dynamic/staging buffers (no D3D12 backing).
+                        bool isImported =
+                            _importedTextures.ContainsKey(resIdx)
+                            || _importedBuffers.ContainsKey(resIdx);
+                        if (
+                            !isImported
+                            && res.Kind == ResourceKind.Buffer
+                            && _bufferDescs.TryGetValue(resIdx, out var bd)
+                            && bd.Usage != Usage.Default
+                            && bd.Usage != Usage.Immutable
+                        )
+                        {
+                            isImported = true;
+                        }
+
+                        ResourceState oldState;
+                        StateTransitionFlags flags;
+
+                        if (isImported)
+                        {
+                            // Imported resources: let Diligent auto-detect from its
+                            // internal whole-resource tracker (which is correct for these).
+                            oldState = ResourceState.Unknown;
+                            flags = StateTransitionFlags.UpdateState;
+
+                            if (
+                                barrier.OldState == ResourceState.UnorderedAccess
+                                && barrier.NewState == ResourceState.UnorderedAccess
+                            )
+                            {
+                                oldState = ResourceState.UnorderedAccess;
+                                flags = StateTransitionFlags.None;
+                            }
+                        }
+                        else
+                        {
+                            // RenderGraph-managed resources: SetState(Unknown) was called,
+                            // so Diligent will use our explicit OldState directly.
+                            oldState = barrier.OldState;
+                            flags = StateTransitionFlags.None;
+
+                            if (
+                                barrier.OldState == ResourceState.UnorderedAccess
+                                && barrier.NewState == ResourceState.UnorderedAccess
+                            )
+                            {
+                                oldState = ResourceState.UnorderedAccess;
+                            }
+
+                            // Map tracker's Unknown (never used) to Undefined
+                            // (= D3D12_RESOURCE_STATE_COMMON, the initial physical state).
+                            if (oldState == ResourceState.Unknown)
+                                oldState = ResourceState.Undefined;
+                        }
+
+                        transitions.Add(
+                            new StateTransitionDesc
+                            {
+                                Resource = deviceObj,
+                                OldState = oldState,
+                                NewState = barrier.NewState,
+                                Flags = flags,
+                                FirstMipLevel = barrier.FirstMipLevel,
+                                MipLevelsCount =
+                                    barrier.MipLevelCount == uint.MaxValue
+                                        ? Diligent.Native.RemainingMipLevels
+                                        : barrier.MipLevelCount,
+                                FirstArraySlice = barrier.FirstArraySlice,
+                                ArraySliceCount =
+                                    barrier.ArraySliceCount == uint.MaxValue
+                                        ? Diligent.Native.RemainingArraySlices
+                                        : barrier.ArraySliceCount,
+                            }
+                        );
+                    }
+                }
+
+                if (transitions.Count > 0)
+                {
+                    // Unbind RTs before transitioning to avoid Diligent info spam
+                    deviceContext.SetRenderTargets(
+                        [],
+                        null,
+                        ResourceStateTransitionMode.None
+                    );
+                    deviceContext.TransitionResourceStates([.. transitions]);
+                }
+            }
+
+            foreach (var (handle, requiredState, _) in compiledPass.RequiredStates)
+            {
+                if (!handle.IsValid)
+                    continue;
+
+                _resources[handle.Index] = _resources[handle.Index] with
+                {
+                    CurrentState = requiredState,
+                };
+            }
+
+            compiledPass.Pass.Execute(rgContext);
+            passSw.Stop();
+            _lastPassTimings.Add((compiledPass.Pass.Name, passSw.Elapsed.TotalMilliseconds));
+        }
+
+        _executeFrameCount++;
+        if (_executeFrameCount % 120 == 0)
+        {
+            Console.WriteLine("[Pass Timings]");
+            foreach (var (name, ms) in _lastPassTimings)
+            {
+                if (ms >= 0.1)
+                    Console.WriteLine($"  {name,-40} {ms,6:F1}ms");
+            }
+        }
+
+        // Signal fence on GPU timeline after all passes
+        if (_fence != null)
+        {
+            _fenceValue++;
+            deviceContext.EnqueueSignal(_fence, _fenceValue);
+        }
+    }
+
+    public void EndFrame()
+    {
+        // Mark idle frames for unused cache entries
+        foreach (var (_, cached) in _textureCache)
+        {
+            cached.IdleFrames++;
+        }
+        foreach (var (_, cached) in _bufferCache)
+        {
+            cached.IdleFrames++;
+        }
+
+        // Evict resources idle for too long
+        const int maxIdleFrames = 4;
+        var texToRemove = new List<string>();
+        foreach (var (name, cached) in _textureCache)
+        {
+            if (cached.IdleFrames > maxIdleFrames)
+            {
+                DeferRelease(cached, cached.LastUsedFence);
+                texToRemove.Add(name);
+            }
+        }
+        foreach (var name in texToRemove)
+            _textureCache.Remove(name);
+
+        var bufToRemove = new List<string>();
+        foreach (var (name, cached) in _bufferCache)
+        {
+            if (cached.IdleFrames > maxIdleFrames)
+            {
+                DeferRelease(cached, cached.LastUsedFence);
+                bufToRemove.Add(name);
+            }
+        }
+        foreach (var name in bufToRemove)
+            _bufferCache.Remove(name);
+    }
+
+    private void DeferRelease(IDisposable resource, ulong lastUsedFence)
+    {
+        _deferredReleases.Enqueue((lastUsedFence, resource));
+    }
+
+    private void ProcessDeferredReleases()
+    {
+        if (_fence == null)
+        {
+            // No fence available, drain everything
+            while (_deferredReleases.Count > 0)
+            {
+                var (_, resource) = _deferredReleases.Dequeue();
+                resource.Dispose();
+            }
+            return;
+        }
+
+        ulong completedValue = _fence.GetCompletedValue();
+        while (_deferredReleases.Count > 0 && _deferredReleases.Peek().Fence <= completedValue)
+        {
+            var (_, resource) = _deferredReleases.Dequeue();
+            resource.Dispose();
+        }
+    }
+
+    // ── Internal methods for Builder ──
+
+    internal void RegisterResourceRead(
+        RenderGraphHandle handle,
+        int passIndex,
+        ResourceState state,
+        SubResourceRange range
+    )
+    {
+        if (!handle.IsValid || passIndex < 0 || passIndex >= _passMetadata.Count)
+            return;
+
+        _passMetadata[passIndex].Reads.Add((handle, state, range));
+    }
+
+    internal void RegisterResourceWrite(
+        RenderGraphHandle handle,
+        int passIndex,
+        ResourceState state,
+        SubResourceRange range
+    )
+    {
+        if (!handle.IsValid || passIndex < 0 || passIndex >= _passMetadata.Count)
+            return;
+
+        _passMetadata[passIndex].Writes.Add((handle, state, range));
+    }
+
+    // ── Internal methods for Context (resource resolution) ──
+
+    internal ITexture? GetPhysicalTexture(RenderGraphHandle handle)
+    {
+        if (handle.Index >= 0 && handle.Index < _resolvedTextures.Length)
+            return _resolvedTextures[handle.Index];
+        return null;
+    }
+
+    internal IBuffer? GetPhysicalBuffer(RenderGraphHandle handle)
+    {
+        if (handle.Index >= 0 && handle.Index < _resolvedBuffers.Length)
+            return _resolvedBuffers[handle.Index];
+        return null;
+    }
+
+    internal ITextureView? GetPhysicalTextureView(RenderGraphHandle handle, TextureViewType type)
+    {
+        var texture = GetPhysicalTexture(handle);
+        return texture?.GetDefaultView(type);
+    }
+
+    internal ITextureView? GetOrCreateTextureView(
+        RenderGraphHandle handle,
+        TextureViewDesc viewDesc
+    )
+    {
+        var texture = GetPhysicalTexture(handle);
+        if (texture == null)
+            return null;
+
+        int idx = handle.Index;
+        if (idx < 0 || idx >= _resources.Count)
+            return null;
+
+        var resName = _resources[idx].Name;
+        if (_textureCache.TryGetValue(resName, out var cached))
+        {
+            if (cached.Views.TryGetValue(viewDesc.Name, out var existing))
+                return existing;
+
+            var view = texture.CreateView(viewDesc);
+            if (view != null)
+                cached.Views[viewDesc.Name] = view;
+            return view;
+        }
+
+        // Imported texture: use GetDefaultView instead
+        return texture.CreateView(viewDesc);
+    }
+
+    internal IBufferView? GetPhysicalBufferView(RenderGraphHandle handle, BufferViewType type)
+    {
+        var buffer = GetPhysicalBuffer(handle);
+        return buffer?.GetDefaultView(type);
+    }
+
+    // ── Compile helpers ──
 
     private void PrepareForCompile()
     {
@@ -309,9 +741,9 @@ public class RenderGraph : IDisposable
             _compiledPasses.Add(new CompiledPass(_passes[i], i));
         }
 
-        foreach (var meta in _passMetadata.Values)
+        foreach (var meta in _passMetadata)
         {
-            meta.IsActive = true;
+            meta.Active = true;
             meta.Reads.Clear();
             meta.Writes.Clear();
         }
@@ -319,21 +751,7 @@ public class RenderGraph : IDisposable
 
     private HashSet<int> CollectSinkResources()
     {
-        var sinkResources = new HashSet<int>(_markedOutputResources);
-
-        foreach (var request in _textureExtractionQueue)
-        {
-            if (request.Handle.IsValid)
-                sinkResources.Add(request.Handle.Id);
-        }
-
-        foreach (var request in _bufferExtractionQueue)
-        {
-            if (request.Handle.IsValid)
-                sinkResources.Add(request.Handle.Id);
-        }
-
-        return sinkResources;
+        return new HashSet<int>(_markedOutputResources);
     }
 
     private Dictionary<int, List<int>> BuildProducerPassLookup()
@@ -342,19 +760,19 @@ public class RenderGraph : IDisposable
 
         for (int passIndex = 0; passIndex < _passes.Count; passIndex++)
         {
-            var pass = _passes[passIndex];
-            if (!_passMetadata.TryGetValue(pass, out var meta) || !meta.IsActive)
+            var meta = _passMetadata[passIndex];
+            if (!meta.Active)
                 continue;
 
-            foreach (var (handle, _) in meta.Writes)
+            foreach (var (handle, _, _) in meta.Writes)
             {
                 if (!handle.IsValid)
                     continue;
 
-                if (!producerPassByResource.TryGetValue(handle.Id, out var producers))
+                if (!producerPassByResource.TryGetValue(handle.Index, out var producers))
                 {
                     producers = new List<int>();
-                    producerPassByResource[handle.Id] = producers;
+                    producerPassByResource[handle.Index] = producers;
                 }
                 producers.Add(passIndex);
             }
@@ -374,11 +792,8 @@ public class RenderGraph : IDisposable
         {
             for (int passIndex = 0; passIndex < _passes.Count; passIndex++)
             {
-                var pass = _passes[passIndex];
-                if (_passMetadata.TryGetValue(pass, out var meta) && meta.IsActive)
-                {
+                if (_passMetadata[passIndex].Active)
                     reachablePasses.Add(passIndex);
-                }
             }
 
             return reachablePasses;
@@ -401,14 +816,11 @@ public class RenderGraph : IDisposable
                 if (!reachablePasses.Add(producerPass))
                     continue;
 
-                var pass = _passes[producerPass];
-                if (!_passMetadata.TryGetValue(pass, out var meta))
-                    continue;
-
-                foreach (var (handle, _) in meta.Reads)
+                var meta = _passMetadata[producerPass];
+                foreach (var (handle, _, _) in meta.Reads)
                 {
                     if (handle.IsValid)
-                        pendingResources.Enqueue(handle.Id);
+                        pendingResources.Enqueue(handle.Index);
                 }
             }
         }
@@ -424,11 +836,7 @@ public class RenderGraph : IDisposable
         {
             bool isActive = activePasses.Contains(i);
             _compiledPasses[i].Active = isActive;
-
-            if (_passMetadata.TryGetValue(_compiledPasses[i].Pass, out var meta))
-            {
-                meta.IsActive = isActive;
-            }
+            _passMetadata[i].Active = isActive;
         }
 
         if (activePasses.Count == 0)
@@ -450,32 +858,32 @@ public class RenderGraph : IDisposable
             if (!activePasses.Contains(passIndex))
                 continue;
 
-            var pass = _passes[passIndex];
-            if (!_passMetadata.TryGetValue(pass, out var meta) || !meta.IsActive)
+            var meta = _passMetadata[passIndex];
+            if (!meta.Active)
                 continue;
 
-            foreach (var (handle, _) in meta.Reads)
+            foreach (var (handle, _, _) in meta.Reads)
             {
                 if (!handle.IsValid)
                     continue;
 
-                if (lastWriterPassByResource.TryGetValue(handle.Id, out int producerPass))
+                if (lastWriterPassByResource.TryGetValue(handle.Index, out int producerPass))
                 {
                     AddDependencyEdge(producerPass, passIndex, indegree, outgoingEdges);
                 }
             }
 
-            foreach (var (handle, _) in meta.Writes)
+            foreach (var (handle, _, _) in meta.Writes)
             {
                 if (!handle.IsValid)
                     continue;
 
-                if (lastWriterPassByResource.TryGetValue(handle.Id, out int producerPass))
+                if (lastWriterPassByResource.TryGetValue(handle.Index, out int producerPass))
                 {
                     AddDependencyEdge(producerPass, passIndex, indegree, outgoingEdges);
                 }
 
-                lastWriterPassByResource[handle.Id] = passIndex;
+                lastWriterPassByResource[handle.Index] = passIndex;
             }
         }
 
@@ -540,14 +948,61 @@ public class RenderGraph : IDisposable
 
     private void BuildAutomaticBarriersAndTrackedStates()
     {
-        var trackedStateByResource = new Dictionary<int, ResourceState>(_resources.Count);
-        foreach (var resource in _resources)
+        // Track state per subresource: (resourceId, mip, slice) -> ResourceState
+        var trackedState = new Dictionary<(int ResourceId, uint Mip, uint Slice), ResourceState>();
+
+        // Initialize tracked state
+        for (int i = 0; i < _resources.Count; i++)
         {
-            ResourceState initialState = resource.IsImported
-                ? resource.InitialState
-                : ResourceState.Unknown;
-            trackedStateByResource[resource.Handle.Id] = initialState;
-            resource.CurrentState = initialState;
+            bool isImported = _importedTextures.ContainsKey(i) || _importedBuffers.ContainsKey(i);
+
+            if (isImported)
+            {
+                // Imported resources: use their declared current state
+                trackedState[(i, uint.MaxValue, uint.MaxValue)] = _resources[i].CurrentState;
+            }
+            else
+            {
+                // RenderGraph-managed resources: seed from persisted state (last frame's end state)
+                // ONLY if the resource will be reused from cache (same desc).
+                // If the desc changed (e.g., window resize), a new resource will be created
+                // with physical state COMMON, so we must NOT use stale persisted state.
+                var resName = _resources[i].Name;
+                var res = _resources[i];
+                bool canReuse = false;
+
+                if (res.Kind == ResourceKind.Texture && _textureDescs.TryGetValue(i, out var td))
+                {
+                    canReuse =
+                        _textureCache.TryGetValue(resName, out var ct)
+                        && ct.Texture != null
+                        && AreCompatible(ct.Desc, td);
+                }
+                else if (res.Kind == ResourceKind.Buffer && _bufferDescs.TryGetValue(i, out var bd))
+                {
+                    canReuse =
+                        _bufferCache.TryGetValue(resName, out var cb)
+                        && cb.Buffer != null
+                        && AreCompatible(cb.Desc, bd);
+                }
+
+                bool seeded = false;
+                if (canReuse)
+                {
+                    foreach (var kv in _persistedSubresourceStates)
+                    {
+                        if (kv.Key.Name == resName)
+                        {
+                            trackedState[(i, kv.Key.Mip, kv.Key.Slice)] = kv.Value;
+                            seeded = true;
+                        }
+                    }
+                }
+                if (!seeded)
+                {
+                    trackedState[(i, uint.MaxValue, uint.MaxValue)] = ResourceState.Unknown;
+                }
+            }
         }
 
         foreach (int passIndex in _executionOrder)
@@ -556,66 +1011,229 @@ public class RenderGraph : IDisposable
             compiledPass.PreBarriers.Clear();
             compiledPass.RequiredStates.Clear();
 
-            if (!_passMetadata.TryGetValue(compiledPass.Pass, out var meta) || !meta.IsActive)
+            var meta = _passMetadata[passIndex];
+            if (!meta.Active)
                 continue;
 
-            var requiredStateByResource = new Dictionary<int, (RGResourceHandle Handle, ResourceState State)>();
+            // Collect required states per subresource for this pass
+            var requiredBySubRes =
+                new Dictionary<
+                    (int ResourceId, uint Mip, uint Slice),
+                    (RenderGraphHandle Handle, ResourceState State)
+                >();
 
-            foreach (var (handle, state) in meta.Writes)
+            void AccumulateRange(
+                RenderGraphHandle handle,
+                ResourceState state,
+                SubResourceRange range
+            )
             {
                 if (!handle.IsValid)
-                    continue;
+                    return;
 
-                if (requiredStateByResource.TryGetValue(handle.Id, out var existing))
+                int resourceId = handle.Index;
+                uint mipCount = range.MipLevelCount;
+                uint sliceCount = range.ArraySliceCount;
+
+                // Resolve "all" counts from resource desc
+                if (range.IsAll || mipCount == uint.MaxValue || sliceCount == uint.MaxValue)
                 {
-                    requiredStateByResource[handle.Id] = (handle, existing.State | state);
+                    var res = _resources[resourceId];
+                    if (
+                        res.Kind == ResourceKind.Texture
+                        && _textureDescs.TryGetValue(resourceId, out var td)
+                    )
+                    {
+                        if (mipCount == uint.MaxValue)
+                            mipCount = Math.Max(1u, td.MipLevels) - range.FirstMipLevel;
+                        if (sliceCount == uint.MaxValue)
+                            sliceCount = Math.Max(1u, td.ArraySizeOrDepth) - range.FirstArraySlice;
+                    }
+                    else
+                    {
+                        // Buffer or unknown texture: single entry
+                        mipCount = 1;
+                        sliceCount = 1;
+                    }
                 }
-                else
+
+                for (uint m = range.FirstMipLevel; m < range.FirstMipLevel + mipCount; m++)
                 {
-                    requiredStateByResource[handle.Id] = (handle, state);
+                    for (
+                        uint s = range.FirstArraySlice;
+                        s < range.FirstArraySlice + sliceCount;
+                        s++
+                    )
+                    {
+                        var key = (resourceId, m, s);
+                        if (requiredBySubRes.TryGetValue(key, out var existing))
+                        {
+                            requiredBySubRes[key] = (handle, existing.State | state);
+                        }
+                        else
+                        {
+                            requiredBySubRes[key] = (handle, state);
+                        }
+                    }
                 }
             }
 
-            foreach (var (handle, state) in meta.Reads)
-            {
-                if (!handle.IsValid)
-                    continue;
+            foreach (var (handle, state, range) in meta.Writes)
+                AccumulateRange(handle, state, range);
+            foreach (var (handle, state, range) in meta.Reads)
+                AccumulateRange(handle, state, range);
 
-                if (requiredStateByResource.TryGetValue(handle.Id, out var existing))
-                {
-                    // Generally shouldn't mix read and write states, but if they do, OR them (e.g. DepthRead | DepthWrite)
-                    requiredStateByResource[handle.Id] = (handle, existing.State | state);
-                }
-                else
-                {
-                    requiredStateByResource[handle.Id] = (handle, state);
-                }
-            }
-
-            if (requiredStateByResource.Count == 0)
+            if (requiredBySubRes.Count == 0)
                 continue;
 
-            var sortedResourceIds = new List<int>(requiredStateByResource.Keys);
+            // Group by resource, then determine barriers
+            var byResource =
+                new Dictionary<int, List<(uint Mip, uint Slice, ResourceState State)>>();
+            foreach (var (key, val) in requiredBySubRes)
+            {
+                if (!byResource.TryGetValue(key.ResourceId, out var list))
+                {
+                    list = [];
+                    byResource[key.ResourceId] = list;
+                }
+                list.Add((key.Mip, key.Slice, val.State));
+            }
+
+            var sortedResourceIds = new List<int>(byResource.Keys);
             sortedResourceIds.Sort();
 
             foreach (int resourceId in sortedResourceIds)
             {
-                var required = requiredStateByResource[resourceId];
-                ResourceState oldState = trackedStateByResource.TryGetValue(resourceId, out var tracked)
-                    ? tracked
-                    : ResourceState.Unknown;
+                var entries = byResource[resourceId];
+                var handle =
+                    entries[0].Mip == 0 && entries[0].Slice == 0
+                        ? requiredBySubRes[(resourceId, entries[0].Mip, entries[0].Slice)].Handle
+                        : requiredBySubRes[(resourceId, entries[0].Mip, entries[0].Slice)].Handle;
 
-                if (oldState != required.State || (oldState == ResourceState.UnorderedAccess && required.State == ResourceState.UnorderedAccess))
+                // Annotate each entry with its tracked (old) state, then merge
+                // contiguous mip runs that share the same transition.
+                var annotated = new List<(
+                    uint Mip,
+                    uint Slice,
+                    ResourceState NewState,
+                    ResourceState OldState
+                )>(entries.Count);
+                foreach (var entry in entries)
                 {
-                    compiledPass.PreBarriers.Add(
-                        new CompiledBarrier(required.Handle, oldState, required.State)
-                    );
+                    var oldSt = GetTrackedState(trackedState, resourceId, entry.Mip, entry.Slice);
+                    annotated.Add((entry.Mip, entry.Slice, entry.State, oldSt));
                 }
 
-                compiledPass.RequiredStates.Add((required.Handle, required.State));
-                trackedStateByResource[resourceId] = required.State;
+                // Sort by (OldState, NewState, Slice, Mip) so mergeable runs are adjacent
+                annotated.Sort(
+                    (a, b) =>
+                    {
+                        int c = a.OldState.CompareTo(b.OldState);
+                        if (c != 0)
+                            return c;
+                        c = a.NewState.CompareTo(b.NewState);
+                        if (c != 0)
+                            return c;
+                        c = a.Slice.CompareTo(b.Slice);
+                        return c != 0 ? c : a.Mip.CompareTo(b.Mip);
+                    }
+                );
+
+                int ai = 0;
+                while (ai < annotated.Count)
+                {
+                    var cur = annotated[ai];
+                    bool needsBarrier =
+                        cur.OldState != cur.NewState
+                        || (
+                            cur.OldState == ResourceState.UnorderedAccess
+                            && cur.NewState == ResourceState.UnorderedAccess
+                        );
+
+                    // Extend run: same OldState, NewState, Slice, and contiguous Mip
+                    uint runMipStart = cur.Mip;
+                    uint runMipEnd = cur.Mip;
+                    int runEnd = ai + 1;
+                    while (runEnd < annotated.Count)
+                    {
+                        var next = annotated[runEnd];
+                        if (
+                            next.OldState == cur.OldState
+                            && next.NewState == cur.NewState
+                            && next.Slice == cur.Slice
+                            && next.Mip == runMipEnd + 1
+                        )
+                        {
+                            runMipEnd = next.Mip;
+                            runEnd++;
+                        }
+                        else
+                            break;
+                    }
+
+                    uint mipCount = runMipEnd - runMipStart + 1;
+                    if (needsBarrier)
+                    {
+                        compiledPass.PreBarriers.Add(
+                            new CompiledBarrier(
+                                handle,
+                                cur.OldState,
+                                cur.NewState,
+                                runMipStart,
+                                mipCount,
+                                cur.Slice,
+                                1
+                            )
+                        );
+                    }
+
+                    for (uint m = runMipStart; m <= runMipEnd; m++)
+                    {
+                        compiledPass.RequiredStates.Add(
+                            (handle, cur.NewState, new SubResourceRange(m, 1, cur.Slice, 1))
+                        );
+                        trackedState[(resourceId, m, cur.Slice)] = cur.NewState;
+                    }
+
+                    ai = runEnd;
+                }
             }
         }
+
+        // Persist tracked state for next frame, keyed by resource name
+        var newPersisted = new Dictionary<(string Name, uint Mip, uint Slice), ResourceState>();
+        foreach (var kv in trackedState)
+        {
+            int resId = kv.Key.ResourceId;
+            if (
+                resId >= 0
+                && resId < _resources.Count
+                && !_importedTextures.ContainsKey(resId)
+                && !_importedBuffers.ContainsKey(resId)
+            )
+            {
+                var resName = _resources[resId].Name;
+                newPersisted[(resName, kv.Key.Mip, kv.Key.Slice)] = kv.Value;
+            }
+        }
+        _persistedSubresourceStates = newPersisted;
+    }
+
+    private static ResourceState GetTrackedState(
+        Dictionary<(int, uint, uint), ResourceState> trackedState,
+        int resourceId,
+        uint mip,
+        uint slice
+    )
+    {
+        // Try exact subresource first
+        if (trackedState.TryGetValue((resourceId, mip, slice), out var state))
+            return state;
+        // Fall back to sentinel (whole-resource initial state)
+        // Uses uint.MaxValue to never collide with real subresource keys
+        if (trackedState.TryGetValue((resourceId, uint.MaxValue, uint.MaxValue), out state))
+            return state;
+        return ResourceState.Unknown;
     }
 
     private void AllocateMemoryHeaps(
@@ -625,58 +1243,77 @@ public class RenderGraph : IDisposable
         Dictionary<int, int> lastPass
     )
     {
-        foreach (var heap in _memoryHeaps)
+        foreach (var heap in _heaps)
         {
             heap.Reset();
         }
 
-        // Collect transient resources to allocate
-        var transientResources = new List<RGResource>();
-        foreach (var res in _resources)
+        if (_placements.Length < _resources.Count)
         {
-            if (res.IsImported)
+            Array.Resize(ref _placements, _resources.Count);
+        }
+
+        var transientResources = new List<(int Index, string Name, ResourceKind Kind)>();
+        for (int i = 0; i < _resources.Count; i++)
+        {
+            // Skip imported resources
+            if (_importedTextures.ContainsKey(i) || _importedBuffers.ContainsKey(i))
                 continue;
-            if (!firstPass.ContainsKey(res.Handle.Id))
+            if (!firstPass.ContainsKey(i))
                 continue; // Dead resource
 
             bool requiresCpuAccessibleMemory = false;
-            if (res is RGBuffer cpuBuf)
+            if (
+                _resources[i].Kind == ResourceKind.Buffer
+                && _bufferDescs.TryGetValue(i, out var bDesc)
+            )
             {
                 requiresCpuAccessibleMemory =
-                    cpuBuf.Desc.Usage == Usage.Dynamic
-                    || cpuBuf.Desc.Usage == Usage.Staging
-                    || cpuBuf.Desc.CPUAccessFlags != CpuAccessFlags.None;
+                    bDesc.Usage == Usage.Dynamic
+                    || bDesc.Usage == Usage.Staging
+                    || bDesc.CPUAccessFlags != CpuAccessFlags.None;
             }
-            else if (res is RGTexture cpuTex)
+            else if (
+                _resources[i].Kind == ResourceKind.Texture
+                && _textureDescs.TryGetValue(i, out var tDesc)
+            )
             {
                 requiresCpuAccessibleMemory =
-                    cpuTex.Desc.Usage == Usage.Dynamic
-                    || cpuTex.Desc.Usage == Usage.Staging
-                    || cpuTex.Desc.CPUAccessFlags != CpuAccessFlags.None;
+                    tDesc.Usage == Usage.Dynamic
+                    || tDesc.Usage == Usage.Staging
+                    || tDesc.CPUAccessFlags != CpuAccessFlags.None;
             }
 
             if (requiresCpuAccessibleMemory)
             {
-                res.HeapIndex = -1;
-                res.MemoryOffset = ulong.MaxValue;
+                _placements[i].HeapIndex = -1;
+                _placements[i].Offset = ulong.MaxValue;
                 continue;
             }
 
-            // Query memory requirements
             MemoryRequirements reqs = default;
             if (getMemoryReqs != null)
             {
-                reqs = getMemoryReqs(res);
+                var res = _resources[i];
+                TextureDesc? td = _textureDescs.TryGetValue(i, out var tdv) ? tdv : null;
+                BufferDesc? bd = _bufferDescs.TryGetValue(i, out var bdv) ? bdv : null;
+                reqs = getMemoryReqs(res.Name, res.Kind, td, bd);
             }
             else if (device != null)
             {
-                if (res is RGTexture tex)
+                if (
+                    _resources[i].Kind == ResourceKind.Texture
+                    && _textureDescs.TryGetValue(i, out var td)
+                )
                 {
-                    reqs = device.GetTextureMemoryRequirements(tex.Desc);
+                    reqs = device.GetTextureMemoryRequirements(td);
                 }
-                else if (res is RGBuffer buf)
+                else if (
+                    _resources[i].Kind == ResourceKind.Buffer
+                    && _bufferDescs.TryGetValue(i, out var bd)
+                )
                 {
-                    reqs = device.GetBufferMemoryRequirements(buf.Desc);
+                    reqs = device.GetBufferMemoryRequirements(bd);
                 }
                 else
                     continue;
@@ -684,389 +1321,144 @@ public class RenderGraph : IDisposable
             else
                 continue;
 
-            res.MemorySize = reqs.Size;
-            res.MemoryAlignment = reqs.Alignment;
-            res.HeapIndex = -1;
-            res.MemoryOffset = ulong.MaxValue;
+            _placements[i].Size = reqs.Size;
+            _placements[i].Alignment = reqs.Alignment;
+            _placements[i].HeapIndex = -1;
+            _placements[i].Offset = ulong.MaxValue;
 
-            transientResources.Add(res);
+            transientResources.Add((i, _resources[i].Name, _resources[i].Kind));
         }
 
         // Greedily allocate: largest resources first
-        transientResources.Sort((a, b) => b.MemorySize.CompareTo(a.MemorySize));
+        transientResources.Sort(
+            (a, b) => _placements[b.Index].Size.CompareTo(_placements[a.Index].Size)
+        );
 
-        foreach (var res in transientResources)
+        foreach (var (resIndex, _, _) in transientResources)
         {
             bool allocated = false;
-            int first = firstPass[res.Handle.Id];
-            int last = lastPass[res.Handle.Id];
+            int first = firstPass[resIndex];
+            int last = lastPass[resIndex];
 
-            // Try existing heaps
-            for (int i = 0; i < _memoryHeaps.Capacity && i < _memoryHeaps.Count; i++)
+            for (int i = 0; i < _heaps.Count; i++)
             {
                 if (
-                    _memoryHeaps[i]
+                    _heaps[i]
                         .TryAllocate(
-                            res.MemorySize,
-                            res.MemoryAlignment,
-                            res.Handle.Id,
+                            _placements[resIndex].Size,
+                            _placements[resIndex].Alignment,
+                            resIndex,
                             first,
                             last,
                             out ulong offset
                         )
                 )
                 {
-                    res.HeapIndex = i;
-                    res.MemoryOffset = offset;
+                    _placements[resIndex].HeapIndex = i;
+                    _placements[resIndex].Offset = offset;
                     allocated = true;
                     break;
                 }
             }
 
-            // Create new heap if needed
             if (!allocated)
             {
-                // Simple heuristic: 64MB min, up to the resource size
                 ulong minHeapSize = 64ul * 1024 * 1024;
-                ulong heapCapacity = Math.Max(minHeapSize, res.MemorySize + res.MemoryAlignment);
+                ulong heapCapacity = Math.Max(
+                    minHeapSize,
+                    _placements[resIndex].Size + _placements[resIndex].Alignment
+                );
 
-                int heapIdx = _memoryHeaps.Count;
+                int heapIdx = _heaps.Count;
                 var newHeap =
                     device != null
-                        ? new RGMemoryHeap(device, heapCapacity)
-                        : new RGMemoryHeap(heapCapacity);
-                _memoryHeaps.Add(newHeap);
+                        ? new RenderGraphMemoryHeap(device, heapCapacity)
+                        : new RenderGraphMemoryHeap(heapCapacity);
+                _heaps.Add(newHeap);
 
                 if (
                     newHeap.TryAllocate(
-                        res.MemorySize,
-                        res.MemoryAlignment,
-                        res.Handle.Id,
+                        _placements[resIndex].Size,
+                        _placements[resIndex].Alignment,
+                        resIndex,
                         first,
                         last,
                         out ulong offset
                     )
                 )
                 {
-                    res.HeapIndex = heapIdx;
-                    res.MemoryOffset = offset;
+                    _placements[resIndex].HeapIndex = heapIdx;
+                    _placements[resIndex].Offset = offset;
                 }
             }
         }
     }
 
-    public void Execute(RenderContext context)
+    // ── Compatibility checks ──
+
+    private static bool AreCompatible(TextureDesc a, TextureDesc b)
     {
-        var rgContext = new RenderGraphContext(this, context);
-        var deviceContext = context.ImmediateContext;
-
-        if (_compiledPasses.Count == 0 || _executionOrder.Count == 0)
-        {
-            ResolveExtractions();
-            return;
-        }
-
-        foreach (var res in _resources)
-        {
-            if (!_activeResourceIds.Contains(res.Handle.Id))
-                continue;
-
-            if (res.IsImported)
-            {
-                res.CurrentState = res.InitialState;
-                continue;
-            }
-
-            if (res.HeapIndex >= 0)
-            {
-                var heap = _memoryHeaps[res.HeapIndex];
-                if (res is RGTexture tex && tex.InternalTexture == null)
-                    tex.InternalTexture = context.Device?.CreatePlacedTexture(
-                        tex.Desc,
-                        heap.Memory,
-                        res.MemoryOffset
-                    );
-                else if (res is RGBuffer buf && buf.InternalBuffer == null)
-                    buf.InternalBuffer = context.Device?.CreatePlacedBuffer(
-                        buf.Desc,
-                        heap.Memory,
-                        res.MemoryOffset
-                    );
-            }
-            else
-            {
-                if (res is RGTexture tex && tex.InternalTexture == null)
-                    tex.InternalTexture = context.Device?.CreateTexture(tex.Desc, null);
-                else if (res is RGBuffer buf && buf.InternalBuffer == null)
-                    buf.InternalBuffer = context.Device?.CreateBuffer(buf.Desc, null);
-            }
-
-            res.CurrentState = ResourceState.Unknown;
-        }
-
-        foreach (int passIndex in _executionOrder)
-        {
-            var compiledPass = _compiledPasses[passIndex];
-            if (!compiledPass.Active)
-                continue;
-
-            if (deviceContext != null && compiledPass.PreBarriers.Count > 0)
-            {
-                var transitions = new List<StateTransitionDesc>();
-                var seenResources = new HashSet<IDeviceObject>();
-
-                foreach (var barrier in compiledPass.PreBarriers)
-                {
-                    if (barrier.Handle.Id < 0 || barrier.Handle.Id >= _resources.Count)
-                        continue;
-
-                    var resource = _resources[barrier.Handle.Id];
-                    IDeviceObject? deviceObj = null;
-
-                    if (resource is RGTexture texture && texture.InternalTexture != null)
-                    {
-                        deviceObj = texture.InternalTexture;
-                    }
-                    else if (resource is RGBuffer buffer && buffer.InternalBuffer != null)
-                    {
-                        deviceObj = buffer.InternalBuffer;
-                    }
-
-                    if (deviceObj != null)
-                    {
-                        if (!seenResources.Add(deviceObj))
-                        {
-                            Console.WriteLine($"[RenderGraph] WARNING: Duplicate transition for deviceObj in pass {compiledPass.Pass.Name}");
-                            continue;
-                        }
-
-                        var oldState = ResourceState.Unknown;
-                        var flags = StateTransitionFlags.UpdateState;
-
-                        if (barrier.OldState == ResourceState.UnorderedAccess && barrier.NewState == ResourceState.UnorderedAccess)
-                        {
-                            oldState = ResourceState.UnorderedAccess;
-                            flags = StateTransitionFlags.None;
-                        }
-
-                        transitions.Add(
-                            new StateTransitionDesc
-                            {
-                                Resource = deviceObj,
-                                OldState = oldState,
-                                NewState = barrier.NewState,
-                                Flags = flags,
-                                MipLevelsCount = Diligent.Native.RemainingMipLevels,
-                                ArraySliceCount = Diligent.Native.RemainingArraySlices,
-                            }
-                        );
-                    }
-                }
-
-                if (transitions.Count > 0)
-                {
-                    deviceContext.TransitionResourceStates([.. transitions]);
-                }
-            }
-
-            foreach (var (handle, requiredState) in compiledPass.RequiredStates)
-            {
-                if (!handle.IsValid)
-                    continue;
-
-                var res = _resources[handle.Id];
-                res.CurrentState = requiredState;
-            }
-
-            compiledPass.Pass.Execute(context, rgContext);
-        }
-
-        ResolveExtractions();
+        return a.Width == b.Width
+            && a.Height == b.Height
+            && a.Format == b.Format
+            && a.BindFlags == b.BindFlags
+            && a.Type == b.Type
+            && a.ArraySizeOrDepth == b.ArraySizeOrDepth
+            && a.MipLevels == b.MipLevels;
     }
 
-    private void ResolveExtractions()
+    private static bool AreCompatible(BufferDesc a, BufferDesc b)
     {
-        if (_textureExtractionQueue.Count > 0)
-        {
-            foreach (var request in _textureExtractionQueue)
-            {
-                ITexture? texture = null;
-                if (TryGetTextureResource(request.Handle, out var resource))
-                {
-                    texture = resource.InternalTexture;
-                    resource.IsExternal = true;
-                }
-
-                request.Assign(texture);
-            }
-
-            _textureExtractionQueue.Clear();
-        }
-
-        if (_bufferExtractionQueue.Count > 0)
-        {
-            foreach (var request in _bufferExtractionQueue)
-            {
-                IBuffer? buffer = null;
-                if (TryGetBufferResource(request.Handle, out var resource))
-                {
-                    buffer = resource.InternalBuffer;
-                    resource.IsExternal = true;
-                }
-
-                request.Assign(buffer);
-            }
-
-            _bufferExtractionQueue.Clear();
-        }
+        return a.Size == b.Size
+            && a.BindFlags == b.BindFlags
+            && a.Usage == b.Usage
+            && a.Mode == b.Mode;
     }
 
-    private bool TryGetTextureResource(RGResourceHandle handle, out RGTexture texture)
-    {
-        if (
-            handle.Id >= 0
-            && handle.Id < _resources.Count
-            && _resources[handle.Id] is RGTexture tex
-        )
-        {
-            texture = tex;
-            return true;
-        }
-
-        texture = null!;
-        return false;
-    }
-
-    private bool TryGetBufferResource(RGResourceHandle handle, out RGBuffer buffer)
-    {
-        if (handle.Id >= 0 && handle.Id < _resources.Count && _resources[handle.Id] is RGBuffer buf)
-        {
-            buffer = buf;
-            return true;
-        }
-
-        buffer = null!;
-        return false;
-    }
-
-    internal RGResourceHandle RegisterResourceRead(
-        RGResourceHandle handle,
-        RenderPass pass,
-        ResourceState state
-    )
-    {
-        if (!handle.IsValid)
-            return handle;
-
-        if (_passMetadata.TryGetValue(pass, out var meta))
-        {
-            meta.Reads.Add((handle, state));
-        }
-        return handle;
-    }
-
-    internal RGResourceHandle RegisterResourceWrite(
-        RGResourceHandle handle,
-        RenderPass pass,
-        ResourceState state
-    )
-    {
-        if (!handle.IsValid)
-            return handle;
-
-        if (_passMetadata.TryGetValue(pass, out var meta))
-        {
-            meta.Writes.Add((handle, state));
-        }
-        return handle;
-    }
-
-    internal ITexture? GetPhysicalTexture(RGResourceHandle handle)
-    {
-        if (handle.Id >= 0 && handle.Id < _resources.Count)
-        {
-            var res = _resources[handle.Id] as RGTexture;
-            return res?.InternalTexture;
-        }
-        return null;
-    }
-
-    internal IBuffer? GetPhysicalBuffer(RGResourceHandle handle)
-    {
-        if (handle.Id >= 0 && handle.Id < _resources.Count)
-        {
-            var res = _resources[handle.Id] as RGBuffer;
-            return res?.InternalBuffer;
-        }
-        return null;
-    }
-
-    internal ITextureView? GetPhysicalTextureView(RGResourceHandle handle, TextureViewType type)
-    {
-        if (handle.Id >= 0 && handle.Id < _resources.Count)
-        {
-            var res = _resources[handle.Id] as RGTexture;
-            if (
-                res != null
-                && res.InternalView != null
-                && res.InternalView.GetDesc().ViewType == type
-            )
-                return res.InternalView;
-
-            return res?.InternalTexture?.GetDefaultView(type);
-        }
-        return null;
-    }
-
-    internal IBufferView? GetPhysicalBufferView(RGResourceHandle handle, BufferViewType type)
-    {
-        if (handle.Id >= 0 && handle.Id < _resources.Count)
-        {
-            var res = _resources[handle.Id] as RGBuffer;
-            return res?.InternalBuffer?.GetDefaultView(type);
-        }
-        return null;
-    }
-
-    public void Reset()
-    {
-        _textureExtractionQueue.Clear();
-        _bufferExtractionQueue.Clear();
-        _passes.Clear();
-        _resources.Clear();
-        _resourceMap.Clear();
-        _markedOutputResources.Clear();
-        _compiledPasses.Clear();
-        _executionOrder.Clear();
-        _activeResourceIds.Clear();
-        _passMetadata.Clear();
-
-        foreach (var heap in _memoryHeaps)
-        {
-            heap.Reset();
-        }
-    }
+    // ── Dispose ──
 
     public void Dispose()
     {
-        foreach (var res in _resources)
+        // Wait for GPU to finish all pending work
+        if (_fence != null && _fenceValue > 0)
         {
-            if (!res.IsImported && !res.IsExternal)
-            {
-                if (res is RGTexture tex)
-                    tex.InternalTexture?.Dispose();
-                if (res is RGBuffer buf)
-                    buf.InternalBuffer?.Dispose();
-            }
+            _fence.Wait(_fenceValue);
         }
-        _resources.Clear();
-        _passes.Clear();
-        _resourceMap.Clear();
 
-        foreach (var heap in _memoryHeaps)
+        // Flush all deferred releases
+        while (_deferredReleases.Count > 0)
+        {
+            var (_, resource) = _deferredReleases.Dequeue();
+            resource.Dispose();
+        }
+
+        foreach (var (_, cached) in _textureCache)
+        {
+            cached.Dispose();
+        }
+        _textureCache.Clear();
+
+        foreach (var (_, cached) in _bufferCache)
+        {
+            cached.Dispose();
+        }
+        _bufferCache.Clear();
+
+        foreach (var heap in _heaps)
         {
             heap.Dispose();
         }
-        _memoryHeaps.Clear();
+        _heaps.Clear();
+
+        _fence?.Dispose();
+
+        // Dispose all features
+        foreach (var feature in _features)
+            feature.Dispose();
+        _features.Clear();
+
+        _resources.Clear();
+        _passes.Clear();
+        _resourceLookup.Clear();
     }
 }
