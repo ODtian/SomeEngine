@@ -10,7 +10,6 @@ namespace SomeEngine.Render.Pipelines;
 
 public class ClusterDrawPass(
     RenderContext context,
-    ClusterResourceManager clusterManager,
     string passName = "ClusterDraw"
 ) : IRenderGraphPass, IDisposable
 {
@@ -21,14 +20,17 @@ public class ClusterDrawPass(
     private IPipelineState? _drawOverdrawPSO;
     private IPipelineState? _drawDepthOnlyPSO;
     private IPipelineState? _drawVisBufferPSO;
+    private IPipelineState? _drawVisBufferTransparentPSO;
     private IShaderResourceBinding? _drawSRB;
     private IShaderResourceBinding? _drawWireframeSRB;
     private IShaderResourceBinding? _drawOverdrawSRB;
     private IShaderResourceBinding? _drawDepthOnlySRB;
     private IShaderResourceBinding? _drawVisBufferSRB;
+    private IShaderResourceBinding? _drawVisBufferTransparentSRB;
     private bool _initialized;
 
     public RenderGraphHandle HVisibleClusters = RenderGraphHandle.Invalid,
+        HVisibleClustersData = RenderGraphHandle.Invalid, // The original data buffer
         HIndirectDrawArgs = RenderGraphHandle.Invalid;
     public RenderGraphHandle HColorTarget = RenderGraphHandle.Invalid,
         HDepthTarget = RenderGraphHandle.Invalid;
@@ -41,14 +43,22 @@ public class ClusterDrawPass(
     private ClusterDebugMode _debugMode;
     private bool _wireframe,
         _overdraw,
-        _useVisBuffer;
+        _useVisBuffer,
+        _depthWrite = true;
 
-    public void SetFrameData(ClusterDebugMode debugMode, bool wireframe, bool overdraw, bool useVisBuffer = false)
+    /// <summary>
+    /// Raster bin index to draw. -1 = use non-binned DrawArgs (offset 0).
+    /// >= 0 = use BinnedDrawArgs at offset BinIndex * 16.
+    /// </summary>
+    public int BinIndex { get; set; } = -1;
+
+    public void SetFrameData(ClusterDebugMode debugMode, bool wireframe, bool overdraw, bool useVisBuffer = false, bool depthWrite = true)
     {
         _debugMode = debugMode;
         _wireframe = wireframe;
         _overdraw = overdraw;
         _useVisBuffer = useVisBuffer;
+        _depthWrite = depthWrite;
     }
 
     public void Init()
@@ -175,12 +185,21 @@ public class ClusterDrawPass(
         if (_drawVisBufferPSO != null)
             _drawVisBufferSRB = _drawVisBufferPSO.CreateShaderResourceBinding(false);
 
+        // Transparent VisBuffer PSO: depth test YES, depth write NO
+        ciVB.PSODesc.Name = "Cluster Draw VisBuffer Transparent PSO";
+        ciVB.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = false;
+        _drawVisBufferTransparentPSO = device.CreateGraphicsPipelineState(ciVB);
+        if (_drawVisBufferTransparentPSO != null)
+            _drawVisBufferTransparentSRB = _drawVisBufferTransparentPSO.CreateShaderResourceBinding(false);
+
         _initialized = true;
     }
 
     public void Setup(RenderGraphBuilder builder)
     {
         builder.Read(HVisibleClusters, ResourceState.ShaderResource);
+        if (HVisibleClustersData.IsValid)
+            builder.Read(HVisibleClustersData, ResourceState.ShaderResource);
         builder.Read(HIndirectDrawArgs, ResourceState.IndirectArgument);
         builder.Read(HDrawUniforms, ResourceState.ConstantBuffer);
         builder.Read(HGlobalTransformBuffer, ResourceState.ShaderResource);
@@ -198,17 +217,25 @@ public class ClusterDrawPass(
         builder.Write(HDepthTarget, ResourceState.DepthWrite);
     }
 
-    private void BindSRB(IShaderResourceBinding srb, IBuffer drawUniformBuffer, IBuffer visible, IBuffer? pageHeapBuffer, IBufferView? globalTransformView, IBuffer? metaBuffer)
+    private void BindSRB(IShaderResourceBinding srb, IBuffer drawUniformBuffer, IBuffer visible, IBuffer? visibleData, IBuffer? pageHeapBuffer, IBufferView? globalTransformView, IBuffer? metaBuffer)
     {
         srb.GetVariableByName(ShaderType.Vertex, "Uniforms")
             ?.Set(drawUniformBuffer, SetShaderResourceFlags.None);
         srb.GetVariableByName(ShaderType.Pixel, "Uniforms")
             ?.Set(drawUniformBuffer, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Vertex, "RequestBuffer")
+        srb.GetVariableByName(ShaderType.Vertex, "BinnedClusterIndexBuffer")
             ?.Set(
                 visible.GetDefaultView(BufferViewType.ShaderResource),
                 SetShaderResourceFlags.None
             );
+        if (visibleData != null)
+        {
+            srb.GetVariableByName(ShaderType.Vertex, "VisibleClusters")
+                ?.Set(
+                    visibleData.GetDefaultView(BufferViewType.ShaderResource),
+                    SetShaderResourceFlags.None
+                );
+        }
         srb.GetVariableByName(ShaderType.Vertex, "PageHeap")
             ?.Set(
                 pageHeapBuffer?.GetDefaultView(BufferViewType.ShaderResource),
@@ -247,27 +274,34 @@ public class ClusterDrawPass(
 
         var pageHeapBuffer = rgCtx.GetBuffer(HPageHeap);
         var metaBuffer = HVisibleClusterMeta.IsValid ? rgCtx.GetBuffer(HVisibleClusterMeta) : null;
+        var visibleDataBuffer = HVisibleClustersData.IsValid ? rgCtx.GetBuffer(HVisibleClustersData) : null;
         var globalTransformView = rgCtx.GetBufferView(
             HGlobalTransformBuffer,
             BufferViewType.ShaderResource
         );
+
+        // Compute draw args offset from BinIndex
+        ulong drawArgsOffset = BinIndex >= 0 ? (ulong)(BinIndex * 16) : 0;
 
         // VisBuffer path
         if (_useVisBuffer && HVisBufferTarget.IsValid)
         {
             var vbRtv = rgCtx.GetTextureView(HVisBufferTarget, TextureViewType.RenderTarget);
             var dsv = rgCtx.GetTextureView(HDepthTarget, TextureViewType.DepthStencil);
-            if (vbRtv != null && dsv != null && _drawVisBufferPSO != null && _drawVisBufferSRB != null)
+            // Select PSO based on depth write mode
+            var vbPso = _depthWrite ? _drawVisBufferPSO : _drawVisBufferTransparentPSO;
+            var vbSrb = _depthWrite ? _drawVisBufferSRB : _drawVisBufferTransparentSRB;
+            if (vbRtv != null && dsv != null && vbPso != null && vbSrb != null)
             {
                 ctx.SetRenderTargets([vbRtv], dsv, ResourceStateTransitionMode.Verify);
-                BindSRB(_drawVisBufferSRB, drawUniformBuffer, visible, pageHeapBuffer, globalTransformView, metaBuffer);
-                ctx.SetPipelineState(_drawVisBufferPSO);
-                ctx.CommitShaderResources(_drawVisBufferSRB, ResourceStateTransitionMode.Verify);
+                BindSRB(vbSrb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
+                ctx.SetPipelineState(vbPso);
+                ctx.CommitShaderResources(vbSrb, ResourceStateTransitionMode.Verify);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
                         AttribsBuffer = drawArgs,
-                        DrawArgsOffset = 0,
+                        DrawArgsOffset = drawArgsOffset,
                         Flags = DrawFlags.VerifyAll,
                         AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
                     }
@@ -289,14 +323,14 @@ public class ClusterDrawPass(
             // 1. Depth Only Pre-pass
             if (_drawDepthOnlyPSO != null && _drawDepthOnlySRB != null)
             {
-                BindSRB(_drawDepthOnlySRB, drawUniformBuffer, visible, pageHeapBuffer, globalTransformView, metaBuffer);
+                BindSRB(_drawDepthOnlySRB, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
                 ctx.SetPipelineState(_drawDepthOnlyPSO);
                 ctx.CommitShaderResources(_drawDepthOnlySRB, ResourceStateTransitionMode.Verify);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
                         AttribsBuffer = drawArgs,
-                        DrawArgsOffset = 0,
+                        DrawArgsOffset = drawArgsOffset,
                         Flags = DrawFlags.VerifyAll,
                         AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
                     }
@@ -306,14 +340,14 @@ public class ClusterDrawPass(
             // 2. Overdraw Additive Blending without depth testing
             if (_drawOverdrawPSO != null && _drawOverdrawSRB != null)
             {
-                BindSRB(_drawOverdrawSRB, drawUniformBuffer, visible, pageHeapBuffer, globalTransformView, metaBuffer);
+                BindSRB(_drawOverdrawSRB, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
                 ctx.SetPipelineState(_drawOverdrawPSO);
                 ctx.CommitShaderResources(_drawOverdrawSRB, ResourceStateTransitionMode.Verify);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
                         AttribsBuffer = drawArgs,
-                        DrawArgsOffset = 0,
+                        DrawArgsOffset = drawArgsOffset,
                         Flags = DrawFlags.VerifyAll,
                         AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
                     }
@@ -327,14 +361,14 @@ public class ClusterDrawPass(
 
             if (pso != null && srb != null)
             {
-                BindSRB(srb, drawUniformBuffer, visible, pageHeapBuffer, globalTransformView, metaBuffer);
+                BindSRB(srb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
                 ctx.SetPipelineState(pso);
                 ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
                         AttribsBuffer = drawArgs,
-                        DrawArgsOffset = 0,
+                        DrawArgsOffset = drawArgsOffset,
                         Flags = DrawFlags.VerifyAll,
                         AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
                     }
@@ -355,5 +389,7 @@ public class ClusterDrawPass(
         _drawOverdrawPSO?.Dispose();
         _drawVisBufferSRB?.Dispose();
         _drawVisBufferPSO?.Dispose();
+        _drawVisBufferTransparentSRB?.Dispose();
+        _drawVisBufferTransparentPSO?.Dispose();
     }
 }

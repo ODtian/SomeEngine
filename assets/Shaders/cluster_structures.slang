@@ -86,11 +86,10 @@ struct GpuInstanceHeader
     uint MetadataOffset;
     uint MetadataCount;
 
-    // Programmable rasterization reserved fields
-    uint DeformFlags;       // bit0: Skinned, bit1: WPO, bit2: Tessellation
-    float BoundsExpansion;  // Conservative AABB expansion
-    uint BoneMatrixOffset;  // Offset into BoneMatrixBuffer
-    uint BoneCount;         // Number of bones
+    uint RasterBinKey;      // Material-driven rasterization bin key
+    float BoundsExpansion;  // Conservative AABB expansion (world space)
+    uint Pad2;
+    uint Pad3;
 };
 
 struct AABB
@@ -100,5 +99,7 @@ struct AABB
     uint Color; // Packed RGBA
     uint Pad;
 };
+
+
 
 #endif

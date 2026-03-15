@@ -172,7 +172,8 @@ internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
 internal sealed class ClusterUploadInstanceDataPass(
     InstanceDataManager transformSystem,
     RenderGraphHandle globalTransform,
-    RenderGraphHandle globalInstanceHeader
+    RenderGraphHandle globalInstanceHeader,
+    RenderGraphHandle globalInstanceDataHeap
 ) : IRenderGraphPass
 {
     public string Name => "Upload Instance Data";
@@ -181,6 +182,7 @@ internal sealed class ClusterUploadInstanceDataPass(
     {
         builder.Write(globalTransform, ResourceState.CopyDest);
         builder.Write(globalInstanceHeader, ResourceState.CopyDest);
+        builder.Write(globalInstanceDataHeap, ResourceState.CopyDest);
     }
 
     public void Execute(RenderGraphContext graphContext)
@@ -190,7 +192,8 @@ internal sealed class ClusterUploadInstanceDataPass(
 
         var globalTransformBuffer = graphContext.GetBuffer(globalTransform);
         var globalInstanceHeaderBuffer = graphContext.GetBuffer(globalInstanceHeader);
-        if (globalTransformBuffer == null || globalInstanceHeaderBuffer == null)
+        var globalInstanceDataHeapBuffer = graphContext.GetBuffer(globalInstanceDataHeap);
+        if (globalTransformBuffer == null || globalInstanceHeaderBuffer == null || globalInstanceDataHeapBuffer == null)
             return;
 
         graphContext.CommandList.UpdateBuffer(
@@ -206,6 +209,16 @@ internal sealed class ClusterUploadInstanceDataPass(
             (ReadOnlySpan<GpuInstanceHeader>)transformSystem.CpuHeaders,
             ResourceStateTransitionMode.Verify
         );
+
+        if (transformSystem.MetadataByteCount > 0)
+        {
+            graphContext.CommandList.UpdateBuffer(
+                globalInstanceDataHeapBuffer,
+                0,
+                (ReadOnlySpan<byte>)transformSystem.CpuMetadata,
+                ResourceStateTransitionMode.Verify
+            );
+        }
     }
 }
 
@@ -215,80 +228,83 @@ internal sealed class ClusterClearBuffersPass(
     RenderGraphHandle candidateCount,
     RenderGraphHandle pageFaultBuffer,
     RenderGraphHandle phase2CandidateCount,
-    RenderGraphHandle phase2IndirectDrawArgs
+    RenderGraphHandle phase2IndirectDrawArgs,
+    RenderGraphHandle zeroOffsetBuffer,
+    RenderGraphHandle phase2CandidateArgs
 ) : IRenderGraphPass
 {
     public string Name => "Clear Cluster Buffers";
 
     public void Setup(RenderGraphBuilder builder)
     {
-        builder.Write(indirectDrawArgs, ResourceState.CopyDest);
-        builder.Write(candidateArgs, ResourceState.CopyDest);
-        builder.Write(candidateCount, ResourceState.CopyDest);
-        builder.Write(pageFaultBuffer, ResourceState.CopyDest);
+        if (indirectDrawArgs.IsValid) builder.Write(indirectDrawArgs, ResourceState.CopyDest);
+        if (candidateArgs.IsValid) builder.Write(candidateArgs, ResourceState.CopyDest);
+        if (candidateCount.IsValid) builder.Write(candidateCount, ResourceState.CopyDest);
+        if (pageFaultBuffer.IsValid) builder.Write(pageFaultBuffer, ResourceState.CopyDest);
 
         if (phase2CandidateCount.IsValid)
             builder.Write(phase2CandidateCount, ResourceState.CopyDest);
         if (phase2IndirectDrawArgs.IsValid)
             builder.Write(phase2IndirectDrawArgs, ResourceState.CopyDest);
+        if (zeroOffsetBuffer.IsValid)
+            builder.Write(zeroOffsetBuffer, ResourceState.CopyDest);
+        if (phase2CandidateArgs.IsValid)
+            builder.Write(phase2CandidateArgs, ResourceState.CopyDest);
+
     }
 
     public void Execute(RenderGraphContext graphContext)
     {
-        var drawArgsBuffer = graphContext.GetBuffer(indirectDrawArgs);
-        var candidateArgsBuffer = graphContext.GetBuffer(candidateArgs);
-        var candidateCountBuffer = graphContext.GetBuffer(candidateCount);
-        var pageFault = graphContext.GetBuffer(pageFaultBuffer);
-
-        if (
-            drawArgsBuffer == null
-            || candidateArgsBuffer == null
-            || candidateCountBuffer == null
-            || pageFault == null
-        )
-            return;
+        var drawArgsBuffer = indirectDrawArgs.IsValid ? graphContext.GetBuffer(indirectDrawArgs) : null;
+        var candidateArgsBuffer = candidateArgs.IsValid ? graphContext.GetBuffer(candidateArgs) : null;
+        var candidateCountBuffer = candidateCount.IsValid ? graphContext.GetBuffer(candidateCount) : null;
+        var pageFault = pageFaultBuffer.IsValid ? graphContext.GetBuffer(pageFaultBuffer) : null;
 
         Span<uint> resetDrawArgs = [372, 0, 0, 0];
-        graphContext.CommandList.UpdateBuffer(
-            drawArgsBuffer,
-            0,
-            resetDrawArgs,
-            ResourceStateTransitionMode.Verify
-        );
+        if (drawArgsBuffer != null)
+            graphContext.CommandList.UpdateBuffer(
+                drawArgsBuffer,
+                0,
+                resetDrawArgs,
+                ResourceStateTransitionMode.Verify
+            );
 
         Span<uint> resetCandidateArgs = [1, 1, 1, 0];
-        graphContext.CommandList.UpdateBuffer(
-            candidateArgsBuffer,
-            0,
-            resetCandidateArgs,
-            ResourceStateTransitionMode.Verify
-        );
+        if (candidateArgsBuffer != null)
+            graphContext.CommandList.UpdateBuffer(
+                candidateArgsBuffer,
+                0,
+                resetCandidateArgs,
+                ResourceStateTransitionMode.Verify
+            );
 
         Span<uint> zeroCount = [0u];
-        graphContext.CommandList.UpdateBuffer(
-            candidateCountBuffer,
-            0,
-            zeroCount,
-            ResourceStateTransitionMode.Verify
-        );
-        graphContext.CommandList.UpdateBuffer(
-            pageFault,
-            0,
-            zeroCount,
-            ResourceStateTransitionMode.Verify
-        );
-
-        if (!phase2CandidateCount.IsValid)
-            return;
-
-        var phase2CountBuffer = graphContext.GetBuffer(phase2CandidateCount);
-        if (phase2CountBuffer != null)
+        if (candidateCountBuffer != null)
             graphContext.CommandList.UpdateBuffer(
-                phase2CountBuffer,
+                candidateCountBuffer,
                 0,
                 zeroCount,
                 ResourceStateTransitionMode.Verify
             );
+        if (pageFault != null)
+            graphContext.CommandList.UpdateBuffer(
+                pageFault,
+                0,
+                zeroCount,
+                ResourceStateTransitionMode.Verify
+            );
+
+        if (phase2CandidateCount.IsValid)
+        {
+            var phase2CountBuffer = graphContext.GetBuffer(phase2CandidateCount);
+            if (phase2CountBuffer != null)
+                graphContext.CommandList.UpdateBuffer(
+                    phase2CountBuffer,
+                    0,
+                    zeroCount,
+                    ResourceStateTransitionMode.Verify
+                );
+        }
 
         if (phase2IndirectDrawArgs.IsValid)
         {
@@ -301,6 +317,30 @@ internal sealed class ClusterClearBuffersPass(
                     ResourceStateTransitionMode.Verify
                 );
         }
+
+        if (phase2CandidateArgs.IsValid)
+        {
+            var phase2CandArgsBuf = graphContext.GetBuffer(phase2CandidateArgs);
+            if (phase2CandArgsBuf != null)
+                graphContext.CommandList.UpdateBuffer(
+                    phase2CandArgsBuf,
+                    0,
+                    resetCandidateArgs,
+                    ResourceStateTransitionMode.Verify
+                );
+        }
+
+        if (zeroOffsetBuffer.IsValid)
+        {
+            var zeroBuf = graphContext.GetBuffer(zeroOffsetBuffer);
+            if (zeroBuf != null)
+            {
+                Span<uint> zero4 = [0u, 0u, 0u, 0u];
+                graphContext.CommandList.UpdateBuffer(
+                    zeroBuf, 0, zero4, ResourceStateTransitionMode.Verify);
+            }
+        }
+
     }
 }
 
@@ -817,11 +857,11 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
                 ctx.CopyBuffer(
                     debugSrc,
                     0,
-                    ResourceStateTransitionMode.Transition,
+                    ResourceStateTransitionMode.Verify,
                     debugDst,
                     0,
                     srcDesc.Size,
-                    ResourceStateTransitionMode.Transition
+                    ResourceStateTransitionMode.Verify
                 );
             }
         }

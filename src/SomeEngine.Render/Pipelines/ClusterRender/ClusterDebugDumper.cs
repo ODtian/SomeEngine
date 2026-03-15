@@ -196,11 +196,11 @@ internal sealed class ClusterDebugDumpPass : IRenderGraphPass
                     SrcTexture = srcTexture,
                     SrcMipLevel = mipLevel,
                     SrcSlice = 0,
-                    SrcTextureTransitionMode = ResourceStateTransitionMode.Transition,
+                    SrcTextureTransitionMode = ResourceStateTransitionMode.Verify,
                     DstTexture = staging,
                     DstMipLevel = 0,
                     DstSlice = 0,
-                    DstTextureTransitionMode = ResourceStateTransitionMode.Transition,
+                    DstTextureTransitionMode = ResourceStateTransitionMode.Verify,
                 }
             );
 

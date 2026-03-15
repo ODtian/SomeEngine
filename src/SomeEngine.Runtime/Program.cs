@@ -21,6 +21,7 @@ using SomeEngine.Core.ECS.Components;
 using SomeEngine.Core.Math;
 using SomeEngine.Render.Data;
 using SomeEngine.Render.Graph;
+using SomeEngine.Render.Materials;
 using SomeEngine.Render.Pipelines;
 using SomeEngine.Render.RHI;
 using SomeEngine.Render.Systems;
@@ -132,7 +133,7 @@ class Program
 
         RenderContext? context = null;
         ClusterResourceManager? resourceManager = null;
-        ClusterRenderFeature? clusterPipeline = null;
+        ClusterPipeline? clusterPipeline = null;
         RenderGraph? renderGraph = null;
         SimpleMeshRenderPass? simplePass = null;
         ImGuiRenderer? imguiRenderer = null;
@@ -297,11 +298,12 @@ class Program
             return NativeFileDialog.ShowOpenModelDialog("Select GLTF/GLB file", initialDirectory);
         }
 
-        void SpawnEntity(GameWorld targetWorld, uint rootIndex, Vector3 position, float scale)
+        void SpawnEntity(GameWorld targetWorld, uint rootIndex, Vector3 position, float scale, uint materialId = 0)
         {
             var e = targetWorld.EntityStore.CreateEntity();
             e.AddComponent(new TransformQvvs(position, Quaternion.Identity, scale));
-            e.AddComponent(new MeshInstance { BVHRootIndex = rootIndex });
+            e.AddComponent(new MeshInstance { BVHRootIndex = rootIndex, MaterialID = materialId });
+            Console.WriteLine($"SpawnEntity: id={e.Id} rootIndex={rootIndex} materialId={materialId} pos={position}");
         }
 
         var camera = new FreeCamera(
@@ -347,11 +349,20 @@ class Program
                             )
                             .First();
 
-                        var entity = world.EntityStore.CreateEntity();
-                        entity.AddComponent(
-                            new TransformQvvs(new Vector3(0, 0, 0), Quaternion.Identity, 1.0f)
-                        );
-                        entity.AddComponent(new MeshInstance { BVHRootIndex = firstLoaded.Value });
+                        // Spawn 3 instances with different MaterialOverrides to test per-instance data
+                        for (int i = -1; i <= 1; i++) 
+                        {
+                            var entity = world.EntityStore.CreateEntity();
+                            entity.AddComponent(
+                                new TransformQvvs(new Vector3(i * 2.0f, 0, 0), Quaternion.Identity, 1.0f)
+                            );
+                            entity.AddComponent(new MeshInstance { BVHRootIndex = firstLoaded.Value });
+                            
+                            Vector4 color = i == -1 ? new Vector4(1, 0.5f, 0.5f, 1) : 
+                                            i == 0 ? new Vector4(0.5f, 1, 0.5f, 1) : 
+                                                     new Vector4(0.5f, 0.5f, 1, 1);
+                            entity.AddComponent(new MaterialOverride { BaseColorTint = color });
+                        }
                     }
                 }
                 else
@@ -369,11 +380,19 @@ class Program
             services.AddSingleton(context);
             services.AddSingleton(instanceDataManager!);
             services.AddSingleton(resourceManager);
-            services.AddSingleton<ClusterRenderFeature>();
-            var provider = services.BuildServiceProvider();
+            services.AddSingleton<MaterialRegistry>();
 
-            clusterPipeline = provider.GetRequiredService<ClusterRenderFeature>();
+            var provider = services.BuildServiceProvider();
+            var materialRegistry = provider.GetRequiredService<MaterialRegistry>();
+
+            clusterPipeline = ClusterPipeline.Opaque(
+                context, resourceManager, instanceDataManager!, materialRegistry);
             clusterPipeline.Initialize(context);
+
+            // Create 2nd material for multi-material testing
+            var mat1 = materialRegistry.CreateMaterial<StandardPBRMaterial>(); // ID=1
+            clusterPipeline.SetupMaterialWithDefaults(mat1);
+
             renderGraph = new RenderGraph();
 
             Console.WriteLine("Controls:");
@@ -574,9 +593,12 @@ class Program
                         if (ImGui.Checkbox("Debug Spheres", ref debugSpheres))
                             clusterPipeline.DebugSpheresEnabled = debugSpheres;
 
-                        bool clusterId = clusterPipeline.DebugClusterID;
-                        if (ImGui.Checkbox("Debug Cluster ID", ref clusterId))
-                            clusterPipeline.DebugClusterID = clusterId;
+                        int debugModeIdx = Array.IndexOf(Enum.GetValues<ClusterDebugMode>(), clusterPipeline.DebugMode);
+                        string[] debugModeNames = Enum.GetNames(typeof(ClusterDebugMode));
+                        if (ImGui.Combo("Shade Debug", ref debugModeIdx, debugModeNames, debugModeNames.Length))
+                        {
+                            clusterPipeline.DebugMode = Enum.GetValues<ClusterDebugMode>()[debugModeIdx];
+                        }
 
                         int hizMode = (int)clusterPipeline.HiZMode;
                         string[] hizModeNames = Enum.GetNames(typeof(HiZDebugMode));
@@ -806,7 +828,8 @@ class Program
                                 int spawnIndex = spawnedEntityCount++;
                                 float x = (spawnIndex % 5) * 2.5f;
                                 float z = (spawnIndex / 5) * 2.5f;
-                                SpawnEntity(world, rootIndex, new Vector3(x, 0, z), 1.0f);
+                                uint matId = (uint)(spawnIndex % 2); // alternate material
+                                SpawnEntity(world, rootIndex, new Vector3(x, 0, z), 1.0f, matId);
                             }
                         }
 
@@ -829,7 +852,8 @@ class Program
                                     float y = (random.NextSingle() - 0.5f) * 10.0f;
                                     float z = (random.NextSingle() - 0.5f) * 80.0f;
                                     float scale = 0.5f + random.NextSingle() * 2.0f;
-                                    SpawnEntity(world, rootIndex, new Vector3(x, y, z), scale);
+                                    uint matId = (uint)(i % 2); // alternate material
+                                    SpawnEntity(world, rootIndex, new Vector3(x, y, z), scale, matId);
                                 }
                             }
                         }

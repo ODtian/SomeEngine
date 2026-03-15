@@ -130,8 +130,9 @@ public static class PrimitiveMeshGenerator
             indices = newIndices;
         }
 
-        // Generate Normals (equal to positions for unit sphere) and UVs
+        // Generate Normals (equal to positions for unit sphere), Tangents, and UVs
         var normals = new float[vertices.Count * 3];
+        var tangents = new float[vertices.Count * 4]; // Vec4: xyz + w (handedness)
         var uvs = new float[vertices.Count * 2];
 
         for (int i = 0; i < vertices.Count; i++)
@@ -146,11 +147,33 @@ public static class PrimitiveMeshGenerator
             float v = 0.5f - (float)(Math.Asin(p.Y) / Math.PI);
             uvs[i * 2 + 0] = u;
             uvs[i * 2 + 1] = v;
+
+            // Tangent: d(position)/d(u) for spherical mapping, normalized
+            // For a unit sphere: tangent = normalize(cross(up, normal))
+            var normal = new Vector3(p.X, p.Y, p.Z);
+            var up = Vector3.UnitY;
+            var tangent = Vector3.Cross(up, normal);
+            float tangentLen = tangent.Length();
+            if (tangentLen < 1e-6f)
+            {
+                // At poles, use a fallback tangent
+                tangent = Vector3.UnitX;
+            }
+            else
+            {
+                tangent = tangent / tangentLen;
+            }
+            tangents[i * 4 + 0] = tangent.X;
+            tangents[i * 4 + 1] = tangent.Y;
+            tangents[i * 4 + 2] = tangent.Z;
+            tangents[i * 4 + 3] = 1.0f; // handedness
         }
 
+        // Canonical SoA stream order: NORMAL → TANGENT → TEXCOORD → COLOR → ...
         var attributes = new List<RawAttribute>
         {
-            new("NORMAL", normals, 3, SomeEngine.Assets.Data.ValueType.Int8, 3, true), // Packed Normals
+            new("NORMAL", normals, 3, SomeEngine.Assets.Data.ValueType.Int8, 3, true),
+            new("TANGENT", tangents, 4, SomeEngine.Assets.Data.ValueType.Int8, 4, true),
             new("TEXCOORD_0", uvs, 2, SomeEngine.Assets.Data.ValueType.Float16, 2, false),
         };
 

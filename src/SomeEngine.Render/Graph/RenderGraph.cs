@@ -144,7 +144,7 @@ public class RenderGraph : IDisposable
         _resources.Add(new RenderGraphResource(name, ResourceKind.Texture));
         _resourceLookup[name] = index;
         _textureDescs[index] = desc;
-        return new RenderGraphHandle(index);
+        return new RenderGraphHandle(index + 1);
     }
 
     public RenderGraphHandle CreateBuffer(string name, BufferDesc desc)
@@ -153,7 +153,7 @@ public class RenderGraph : IDisposable
         _resources.Add(new RenderGraphResource(name, ResourceKind.Buffer));
         _resourceLookup[name] = index;
         _bufferDescs[index] = desc;
-        return new RenderGraphHandle(index);
+        return new RenderGraphHandle(index + 1);
     }
 
     public RenderGraphHandle Import(
@@ -169,7 +169,7 @@ public class RenderGraph : IDisposable
         _importedTextures[index] = texture;
         // Store desc from the actual texture
         _textureDescs[index] = texture.GetDesc();
-        return new RenderGraphHandle(index);
+        return new RenderGraphHandle(index + 1);
     }
 
     public RenderGraphHandle Import(
@@ -184,7 +184,7 @@ public class RenderGraph : IDisposable
         _resourceLookup[name] = index;
         _importedBuffers[index] = buffer;
         _bufferDescs[index] = buffer.GetDesc();
-        return new RenderGraphHandle(index);
+        return new RenderGraphHandle(index + 1);
     }
 
     public void AddPass(IRenderGraphPass pass)
@@ -215,7 +215,7 @@ public class RenderGraph : IDisposable
     public RenderGraphHandle GetResourceHandle(string name)
     {
         if (_resourceLookup.TryGetValue(name, out int index))
-            return new RenderGraphHandle(index);
+            return new RenderGraphHandle(index + 1);
         return RenderGraphHandle.Invalid;
     }
 
@@ -575,7 +575,7 @@ public class RenderGraph : IDisposable
         if (_fence != null)
         {
             _fenceValue++;
-            deviceContext.EnqueueSignal(_fence, _fenceValue);
+            deviceContext?.EnqueueSignal(_fence, _fenceValue);
         }
     }
 

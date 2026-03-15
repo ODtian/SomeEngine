@@ -2,11 +2,19 @@ using Diligent;
 
 namespace SomeEngine.Render.Graph;
 
-public readonly struct RenderGraphHandle(int index)
+public readonly struct RenderGraphHandle(int id)
 {
-    internal readonly int Index = index;
-    public bool IsValid => Index >= 0;
-    public static readonly RenderGraphHandle Invalid = new(-1);
+    /// <summary>
+    /// 1-based id. 0 (default) = Invalid.
+    /// </summary>
+    private readonly int _id = id;
+
+    /// <summary>0-based array index. Only valid when IsValid == true.</summary>
+    public int Index => _id - 1;
+
+    public bool IsValid => _id > 0;
+
+    public static readonly RenderGraphHandle Invalid = default;
 }
 
 public enum ResourceKind
@@ -28,7 +36,6 @@ internal class CachedTexture : IDisposable
     public ITexture? Texture;
     public int IdleFrames;
     public ulong LastUsedFence;
-    public ResourceState LastState;
     public Dictionary<string, ITextureView> Views { get; } = new();
 
     public void Dispose()
@@ -47,7 +54,6 @@ internal class CachedBuffer : IDisposable
     public IBuffer? Buffer;
     public int IdleFrames;
     public ulong LastUsedFence;
-    public ResourceState LastState;
     public Dictionary<string, IBufferView> Views { get; } = new();
 
     public void Dispose()

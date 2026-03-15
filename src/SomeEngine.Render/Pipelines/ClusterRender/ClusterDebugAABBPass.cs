@@ -111,7 +111,7 @@ internal sealed class ClusterDebugAABBPass : IRenderGraphPass, IDisposable
             [colorRtv], null, ResourceStateTransitionMode.Verify
         );
         ctx.SetPipelineState(_pso);
-        ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Transition);
+        ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Verify);
 
         // 4096 max entries × 8 vertices per rect (4 edges × 2 endpoints)
         ctx.Draw(new DrawAttribs

@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using Diligent;
 using Microsoft.Extensions.DependencyInjection;
 using Silk.NET.Maths;
@@ -8,6 +8,7 @@ using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
 using SomeEngine.Core.Math;
 using SomeEngine.Render.Graph;
+using SomeEngine.Render.Materials;
 using SomeEngine.Render.Pipelines;
 using SomeEngine.Render.RHI;
 using SomeEngine.Render.Systems;
@@ -19,7 +20,7 @@ class Program
     private static IWindow? _window;
     private static RenderContext? _renderContext;
     private static TriangleRenderPass? _trianglePass;
-    private static ClusterRenderFeature? _clusterPipeline;
+    private static ClusterPipeline? _clusterPipeline;
     private static ClusterResourceManager? _clusterManager;
     private static RenderGraph? _renderGraph;
     private static GameWorld? _gameWorld;
@@ -94,14 +95,10 @@ class Program
         _trianglePass.TransformSystem = _instanceDataManager;
         _trianglePass.InitPSO();
 
-        var services = new ServiceCollection();
-        services.AddSingleton(_renderContext);
-        services.AddSingleton(_instanceDataManager!);
-        services.AddSingleton(_clusterManager);
-        services.AddSingleton<ClusterRenderFeature>();
-        var provider = services.BuildServiceProvider();
+        var materialRegistry = new SomeEngine.Render.Materials.MaterialRegistry();
 
-        _clusterPipeline = provider.GetRequiredService<ClusterRenderFeature>();
+        _clusterPipeline = ClusterPipeline.Opaque(
+            _renderContext, _clusterManager, _instanceDataManager!, materialRegistry);
         _clusterPipeline.Initialize(_renderContext);
     }
 

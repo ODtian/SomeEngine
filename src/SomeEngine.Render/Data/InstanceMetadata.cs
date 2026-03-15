@@ -10,11 +10,10 @@ public struct GpuInstanceHeader
     public uint MetadataOffset;
     public uint MetadataCount;
 
-    // Programmable rasterization reserved fields (Phase 1-3)
-    public uint DeformFlags;      // bit0: Skinned, bit1: WPO, bit2: Tessellation
-    public float BoundsExpansion;  // Conservative AABB expansion (world space units)
-    public uint BoneMatrixOffset;  // Offset into BoneMatrixBuffer
-    public uint BoneCount;         // Number of bones
+    public uint RasterBinKey;      // Material-driven rasterization bin key
+    public float BoundsExpansion;   // Conservative AABB expansion (world space)
+    public uint Pad2;
+    public uint Pad3;
 
     public const int SizeInBytes = 32;
 }

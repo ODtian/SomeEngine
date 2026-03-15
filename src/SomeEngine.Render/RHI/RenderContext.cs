@@ -47,7 +47,7 @@ public unsafe class RenderContext : IDisposable
         Factory = factory;
         var engineCI = new EngineD3D12CreateInfo
         {
-            EnableValidation = false,
+            EnableValidation = true,
         };
         factory.CreateDeviceAndContextsD3D12(engineCI, out var device, out var contexts);
         Device = device;
@@ -89,6 +89,8 @@ public unsafe class RenderContext : IDisposable
 
     public void Present()
     {
+        // Wait for idle to test SRB mutable overwrite issue
+        ImmediateContext?.WaitForIdle();
         SwapChain?.Present(1);
     }
 

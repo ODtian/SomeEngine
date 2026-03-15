@@ -11,6 +11,7 @@ struct PixelContext
 {
     // ── Geometry ──
     uint2  pixelCoord;
+    uint   instanceID;
     float3 worldPos;
     float3 worldNormal;     // interpolated + transformed to world space
     float2 uv0;

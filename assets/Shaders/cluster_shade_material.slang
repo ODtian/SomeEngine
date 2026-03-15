@@ -35,6 +35,25 @@ Texture2D<uint> VisBuffer;
 StructuredBuffer<DrawRequest> VisibleClusters;
 ByteAddressBuffer PageHeap;
 StructuredBuffer<GpuTransform> Instances;
+StructuredBuffer<GpuInstanceHeader> InstanceHeaders;
+ByteAddressBuffer InstanceDataHeap;
+
+// Material textures (bound per-material via SRB)
+Texture2D AlbedoMap;
+Texture2D NormalMap;
+Texture2D ARMMap;
+SamplerState MaterialSampler;
+
+float4 getInstancePropertyFloat4(PixelContext ctx, uint relativeOffset, float4 defaultValue)
+{
+    uint baseOffset = InstanceHeaders[ctx.instanceID].MetadataOffset;
+    uint count = InstanceHeaders[ctx.instanceID].MetadataCount;
+    if (count > 0)
+    {
+        return asfloat(InstanceDataHeap.Load4(baseOffset + relativeOffset));
+    }
+    return defaultValue;
+}
 
 // Output
 RWTexture2D<float4> OutputColor;
@@ -63,6 +82,8 @@ bool buildPixelContext(
     uint pageOffset = req.PageOffset;
     uint clusterID = req.ClusterID;
     uint realInstanceID = req.InstanceID;
+
+    ctx.instanceID = realInstanceID;
 
     // Load cluster info
     int3 intBase;
@@ -105,9 +126,11 @@ bool buildPixelContext(
     // Interpolate world position
     ctx.worldPos = bary.x * wp0 + bary.y * wp1 + bary.z * wp2;
 
-    // SoA attribute fetch — Normal (3 bytes/vertex)
+    // SoA attribute fetch — stream order: NORMAL(3B) → TANGENT(4B) → UV(4B)
     StreamCursor cursor = { pageOffset + attrOffset, totalVertexCount };
-    uint normalBase = cursor.advance(3);
+    uint normalBase = cursor.advance(3);   // NORMAL: 3 bytes/vertex
+    cursor.advance(4);                      // TANGENT: 4 bytes/vertex (skip)
+    uint uvBase = cursor.advance(4);        // UV: 4 bytes/vertex (Float16x2)
 
     float3 n0 = FetchNormal3(PageHeap, normalBase, vStart, vi0);
     float3 n1 = FetchNormal3(PageHeap, normalBase, vStart, vi1);
@@ -121,8 +144,11 @@ bool buildPixelContext(
     float3 uuv_n = cross(qvec, uv_n);
     ctx.worldNormal = normalize(interpNormal + ((uv_n * qw) + uuv_n) * 2.0);
 
-    // UV — skip for now (no UV stream guaranteed), default to 0
-    ctx.uv0 = float2(0.0);
+    // UV interpolation
+    float2 uv0 = FetchUV(PageHeap, uvBase, vStart, vi0);
+    float2 uv1 = FetchUV(PageHeap, uvBase, vStart, vi1);
+    float2 uv2 = FetchUV(PageHeap, uvBase, vStart, vi2);
+    ctx.uv0 = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
 
     return true;
 }
@@ -155,7 +181,7 @@ void CSMaterialShade(uint3 tid : SV_DispatchThreadID)
             uint h = PCGHash(req.ClusterID);
             color = ColorFromHash(h);
         }
-        else if (Uniforms.DebugMode == 7) // MaterialID
+        else if (Uniforms.DebugMode == 7) // MaterialID (per-dispatch)
         {
             uint h = PCGHash(Uniforms.MaterialID);
             color = ColorFromHash(h);
@@ -197,6 +223,21 @@ void CSMaterialShade(uint3 tid : SV_DispatchThreadID)
             else
                 color = float3(0.0);
         }
+        else if (Uniforms.DebugMode == 10) // UV
+        {
+            PixelContext uvCtx;
+            if (buildPixelContext(pixelCoord, uvCtx))
+            {
+                // UV as color + checkerboard pattern
+                float2 uv = uvCtx.uv0;
+                float checker = step(0.5, frac(uv.x * 8.0)) != step(0.5, frac(uv.y * 8.0)) ? 0.8 : 0.2;
+                color = float3(uv.x, uv.y, checker);
+            }
+            else
+            {
+                color = float3(0.0);
+            }
+        }
         else
         {
             color = float3(1, 0, 1); // fallback magenta
@@ -210,9 +251,13 @@ void CSMaterialShade(uint3 tid : SV_DispatchThreadID)
     if (!buildPixelContext(pixelCoord, ctx))
         return;
 
-    // Create material with fixed PBR parameters
+    // Sample material textures
     StandardPBRMaterial material;
-    material.baseColor = float3(0.8, 0.8, 0.8);
+    float4 albedoSample = AlbedoMap.SampleLevel(MaterialSampler, ctx.uv0, 0.0);
+    
+    float4 tint = getInstancePropertyFloat4(ctx, 0, float4(1.0));
+    
+    material.baseColor = albedoSample.rgb * tint.rgb;
     material.metallic  = 0.0;
     material.roughness = 0.5;
     material.light.lightDir       = Uniforms.LightDir;

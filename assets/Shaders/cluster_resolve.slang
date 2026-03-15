@@ -98,9 +98,15 @@ void CSResolve(uint3 dispatchThreadID : SV_DispatchThreadID)
         float l = float(lodLevel) / 10.0;
         color = float3(l, 1.0 - l, 0.0);
     }
-    else // Normal visualization (default)
+    else if (Uniforms.DebugMode == 0) // Normal shading (face normal fallback)
     {
         color = faceNormal * 0.5 + 0.5;
+    }
+    else
+    {
+        // Debug modes >= 3 are handled by the material shade pass.
+        // Don't write here — let the shade pass handle them.
+        return;
     }
 
     OutputColor[pixelCoord] = float4(color, 1.0);

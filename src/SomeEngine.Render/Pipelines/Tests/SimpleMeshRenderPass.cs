@@ -13,7 +13,6 @@ namespace SomeEngine.Render.Pipelines;
 public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDisposable
 {
     public string Name => "Simple Mesh Render";
-    private readonly RenderContext _context = context;
     private IPipelineState? _pso;
     private IShaderResourceBinding? _srb;
     private IBuffer? _vb;
@@ -45,7 +44,7 @@ public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDi
         var (vertices, indices, _) = PrimitiveMeshGenerator.CreateIcoSphere(3);
         _indexCount = indices.Length;
 
-        var device = _context.Device;
+        var device = context.Device;
 
         var vertData = new float[vertices.Length * 3];
         for (int i = 0; i < vertices.Length; i++)
@@ -85,7 +84,7 @@ public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDi
 
     private void CreatePSO()
     {
-        var device = _context.Device!;
+        var device = context.Device!;
 
         // Import Slang shader
         string slangPath = Path.Combine(
@@ -108,8 +107,8 @@ public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDi
 
         var shaderAsset = SlangShaderImporter.Import(slangPath);
 
-        using var vs = shaderAsset.CreateShader(_context, "VSMain");
-        using var ps = shaderAsset.CreateShader(_context, "PSMain");
+        using var vs = shaderAsset.CreateShader(context, "VSMain");
+        using var ps = shaderAsset.CreateShader(context, "PSMain");
 
         var layoutElements = new[]
         {
@@ -133,7 +132,7 @@ public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDi
                 {
                     DefaultVariableType = Diligent.ShaderResourceVariableType.Mutable,
                     Variables = shaderAsset.GetResourceVariables(
-                        _context,
+                        context,
                         name =>
                         {
                             if (
@@ -151,7 +150,7 @@ public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDi
             GraphicsPipeline = new GraphicsPipelineDesc
             {
                 NumRenderTargets = 1,
-                RTVFormats = [_context.SwapChain!.GetDesc().ColorBufferFormat],
+                RTVFormats = [context.SwapChain!.GetDesc().ColorBufferFormat],
                 DSVFormat = TextureFormat.D32_Float,
                 PrimitiveTopology = PrimitiveTopology.TriangleList,
                 RasterizerDesc = new RasterizerStateDesc
@@ -192,7 +191,7 @@ public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDi
         if (ctx == null)
             return;
 
-        var swapChain = _context.SwapChain;
+        var swapChain = context.SwapChain;
         if (swapChain == null)
             return;
         var rtv = swapChain.GetCurrentBackBufferRTV();

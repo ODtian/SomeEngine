@@ -17,20 +17,17 @@ public enum ClusterCullPhase
 
 public class ClusterCullPass(
     RenderContext context,
-    ClusterResourceManager clusterManager,
     ClusterCullPhase phase = ClusterCullPhase.Legacy,
     string passName = "ClusterCull"
 ) : IRenderGraphPass, IDisposable
 {
     public string Name { get; } = passName;
-    private readonly RenderContext _context = context;
-    private readonly ClusterCullPhase _phase = phase;
     private ShaderAsset? _cullShaderAsset;
     private IPipelineState? _cullPSO;
     private IShaderResourceBinding? _cullSRB;
     private bool _initialized;
 
-    public bool UsesHiZ => _phase != ClusterCullPhase.Legacy;
+    public bool UsesHiZ => phase != ClusterCullPhase.Legacy;
 
     // RenderGraph handles set by orchestrator
     public RenderGraphHandle HCandidateClusters = RenderGraphHandle.Invalid,
@@ -51,7 +48,7 @@ public class ClusterCullPass(
     {
         if (_initialized)
             return;
-        var device = _context.Device;
+        var device = context.Device;
         if (device == null)
             return;
 
@@ -63,14 +60,14 @@ public class ClusterCullPass(
         );
         _cullShaderAsset = SlangShaderImporter.Import(shaderPath);
 
-        string cullEntryPoint = _phase switch
+        string cullEntryPoint = phase switch
         {
             ClusterCullPhase.Phase1 => "main_phase1",
             ClusterCullPhase.Phase2 => "main_phase2",
             _ => "main",
         };
 
-        using var cs = _cullShaderAsset.CreateShader(_context, cullEntryPoint);
+        using var cs = _cullShaderAsset.CreateShader(context, cullEntryPoint);
         var ci = new ComputePipelineStateCreateInfo()
         {
             PSODesc = new PipelineStateDesc
@@ -99,20 +96,24 @@ public class ClusterCullPass(
         builder.Read(HCandidateCount, ResourceState.UnorderedAccess);
         builder.Read(HCullingUniforms, ResourceState.ConstantBuffer);
         builder.Write(HVisibleClusters, ResourceState.UnorderedAccess);
-        builder.Write(HIndirectDrawArgs, ResourceState.UnorderedAccess);
+        if (phase == ClusterCullPhase.Phase2)
+            builder.ReadWrite(HIndirectDrawArgs, ResourceState.UnorderedAccess);
+        else
+            builder.Write(HIndirectDrawArgs, ResourceState.UnorderedAccess);
 
-        if (_phase != ClusterCullPhase.Legacy && HHiZTexture.IsValid)
+
+        if (phase != ClusterCullPhase.Legacy && HHiZTexture.IsValid)
         {
             builder.Read(HHiZTexture, ResourceState.ShaderResource);
         }
 
-        if (_phase == ClusterCullPhase.Phase1)
+        if (phase == ClusterCullPhase.Phase1)
         {
             builder.Write(HPhase2CandidateClusters, ResourceState.UnorderedAccess);
             builder.Write(HPhase2CandidateCount, ResourceState.UnorderedAccess);
         }
 
-        if (_phase == ClusterCullPhase.Phase2 && HPhase2IndirectDrawArgs.IsValid)
+        if (phase == ClusterCullPhase.Phase2 && HPhase2IndirectDrawArgs.IsValid)
         {
             builder.Write(HPhase2IndirectDrawArgs, ResourceState.UnorderedAccess);
         }
@@ -123,6 +124,7 @@ public class ClusterCullPass(
         }
 
         builder.Read(HGlobalTransformBuffer, ResourceState.ShaderResource);
+
         builder.Read(HPageHeap, ResourceState.ShaderResource);
     }
 
@@ -140,25 +142,25 @@ public class ClusterCullPass(
         var visible = rgCtx.GetBuffer(HVisibleClusters);
         var drawArgs = rgCtx.GetBuffer(HIndirectDrawArgs);
         var hiZTexture =
-            _phase != ClusterCullPhase.Legacy && HHiZTexture.IsValid
+            phase != ClusterCullPhase.Legacy && HHiZTexture.IsValid
                 ? rgCtx.GetTexture(HHiZTexture)
                 : null;
         var hiZSrv =
-            _phase != ClusterCullPhase.Legacy && HHiZTexture.IsValid
+            phase != ClusterCullPhase.Legacy && HHiZTexture.IsValid
                 ? rgCtx.GetTextureView(HHiZTexture, TextureViewType.ShaderResource)
                 : null;
         var phase2Candidates =
-            _phase == ClusterCullPhase.Phase1 ? rgCtx.GetBuffer(HPhase2CandidateClusters) : null;
+            phase == ClusterCullPhase.Phase1 ? rgCtx.GetBuffer(HPhase2CandidateClusters) : null;
         var phase2Count =
-            _phase == ClusterCullPhase.Phase1 ? rgCtx.GetBuffer(HPhase2CandidateCount) : null;
+            phase == ClusterCullPhase.Phase1 ? rgCtx.GetBuffer(HPhase2CandidateCount) : null;
 
         var pageHeapBuffer = rgCtx.GetBuffer(HPageHeap);
 
         if (candidates == null || visible == null || drawArgs == null)
             return;
-        if (_phase == ClusterCullPhase.Phase2 && (hiZTexture == null || hiZSrv == null))
+        if (phase == ClusterCullPhase.Phase2 && (hiZTexture == null || hiZSrv == null))
             return;
-        if (_phase == ClusterCullPhase.Phase1 && (phase2Candidates == null || phase2Count == null))
+        if (phase == ClusterCullPhase.Phase1 && (phase2Candidates == null || phase2Count == null))
             return;
 
         var cullingUniformBuffer = rgCtx.GetBuffer(HCullingUniforms);
@@ -201,14 +203,16 @@ public class ClusterCullPass(
                 SetShaderResourceFlags.None
             );
 
-        if (_phase != ClusterCullPhase.Legacy && hiZSrv != null)
+
+
+        if (phase != ClusterCullPhase.Legacy && hiZSrv != null)
         {
             _cullSRB
                 .GetVariableByName(ShaderType.Compute, "HiZTexture")
                 ?.Set(hiZSrv, SetShaderResourceFlags.None);
         }
 
-        if (_phase == ClusterCullPhase.Phase1)
+        if (phase == ClusterCullPhase.Phase1)
         {
             _cullSRB
                 .GetVariableByName(ShaderType.Compute, "Phase2CandidateClusters")
@@ -224,7 +228,7 @@ public class ClusterCullPass(
                 );
         }
 
-        if (_phase == ClusterCullPhase.Phase2 && HPhase2IndirectDrawArgs.IsValid)
+        if (phase == ClusterCullPhase.Phase2 && HPhase2IndirectDrawArgs.IsValid)
         {
             var phase2DrawArgs = rgCtx.GetBuffer(HPhase2IndirectDrawArgs);
             if (phase2DrawArgs != null)
@@ -262,6 +266,8 @@ public class ClusterCullPass(
                 .GetVariableByName(ShaderType.Compute, "Instances")
                 ?.Set(globalTransformView, SetShaderResourceFlags.None);
         }
+
+
 
         ctx.SetPipelineState(_cullPSO);
         ctx.CommitShaderResources(_cullSRB, ResourceStateTransitionMode.Verify);

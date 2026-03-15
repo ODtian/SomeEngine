@@ -122,6 +122,7 @@ bool PassesLODFilter(GPUCluster cluster, GpuTransform t)
         float maxScale = t.Scale * max(max(t.Stretch.x, t.Stretch.y), t.Stretch.z);
         float worldRadius = cluster.LODRadius * maxScale;
 
+
         float clusterDist = max(0.0, distance(worldCenter, Uniforms.CameraPos) - worldRadius);
         float lodError = DecodeClusterLODError(cluster);
         if (lodError * Uniforms.LodScale > Uniforms.LodThreshold * clusterDist)
@@ -284,6 +285,7 @@ bool IsOccludedByHiZ(GPUCluster cluster, GpuTransform t, bool usePrev)
         DecodeClusterCenter(cluster, Uniforms.QuantOrigin, Uniforms.QuantStep), t);
     float maxScale = t.Scale * max(max(t.Stretch.x, t.Stretch.y), t.Stretch.z);
     float worldRadius = DecodeClusterRadius(cluster, Uniforms.QuantStep) * maxScale;
+
 
     float2 minUv;
     float2 maxUv;

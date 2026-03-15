@@ -9,7 +9,8 @@ using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Systems;
 
-public class InstanceSyncSystem(InstanceDataManager dataManager) : QuerySystem<TransformQvvs, MeshInstance>
+public class InstanceSyncSystem(InstanceDataManager dataManager)
+    : QuerySystem<TransformQvvs, MeshInstance>
 {
     private readonly InstanceDataManager _dataManager = dataManager;
 
@@ -17,28 +18,41 @@ public class InstanceSyncSystem(InstanceDataManager dataManager) : QuerySystem<T
     {
         int count = Query.Count;
         _dataManager.EnsureCapacity(count);
+        _dataManager.ClearMetadata();
 
         int index = 0;
-        foreach (var (transforms, meshInstances, _) in Query.Chunks)
+        foreach (var entity in Query.Entities)
         {
-            var tSpan = transforms.Span;
-            var mSpan = meshInstances.Span;
-            for (int i = 0; i < tSpan.Length; i++)
+            var t = entity.GetComponent<TransformQvvs>();
+            var m = entity.GetComponent<MeshInstance>();
+
+            uint metaOffset = 0;
+            uint metaCount = 0;
+
+            if (entity.TryGetComponent<MaterialOverride>(out var overrideData))
             {
-                _dataManager.SetTransform(index, GpuTransform.FromQvvs(tSpan[i]));
-                _dataManager.SetHeader(index, new GpuInstanceHeader
-                {
-                    BVHRootIndex = mSpan[i].BVHRootIndex,
-                    MaterialID = mSpan[i].MaterialID,
-                    MetadataOffset = 0,
-                    MetadataCount = 0,
-                    DeformFlags = 0,
-                    BoundsExpansion = 0f,
-                    BoneMatrixOffset = 0,
-                    BoneCount = 0,
-                });
-                index++;
+                metaOffset = _dataManager.AppendMetadata(ref overrideData);
+                metaCount = (uint)(
+                    System.Runtime.CompilerServices.Unsafe.SizeOf<MaterialOverride>() / 4
+                );
             }
+
+            _dataManager.SetTransform(index, GpuTransform.FromQvvs(t));
+            _dataManager.SetHeader(
+                index,
+                new GpuInstanceHeader
+                {
+                    BVHRootIndex = m.BVHRootIndex,
+                    MaterialID = m.MaterialID,
+                    MetadataOffset = metaOffset,
+                    MetadataCount = metaCount,
+                    RasterBinKey = 0,
+                    BoundsExpansion = 0f,
+                    Pad2 = 0,
+                    Pad3 = 0,
+                }
+            );
+            index++;
         }
 
         _dataManager.UpdateCount(count);

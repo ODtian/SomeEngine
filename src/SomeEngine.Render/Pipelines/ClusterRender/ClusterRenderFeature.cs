@@ -2,8 +2,10 @@ using System;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Diligent;
+using SomeEngine.Assets.Importers;
 using SomeEngine.Render.Data;
 using SomeEngine.Render.Graph;
+using SomeEngine.Render.Materials;
 using SomeEngine.Render.RHI;
 using SomeEngine.Render.Systems;
 
@@ -11,9 +13,13 @@ namespace SomeEngine.Render.Pipelines;
 
 public enum ClusterDebugMode
 {
-    None,
-    ClusterID,
-    LODLevel,
+    None = 0,
+    ClusterID = 1,
+    LODLevel = 2,
+    MaterialID = 7,
+    Barycentric = 8,
+    Normal = 9,
+    UV = 10,
 }
 
 public enum HiZDebugMode
@@ -117,10 +123,12 @@ public struct CopyUniforms
         Pad2;
 }
 
+[Obsolete("Use ClusterPipeline (Level 2 preset) or individual Stage classes (Level 1) instead.")]
 public class ClusterRenderFeature(
     RenderContext context,
     InstanceDataManager instanceManager,
-    ClusterResourceManager clusterManager
+    ClusterResourceManager clusterManager,
+    MaterialRegistry registry
 ) : IRenderFeature
 {
     private ClusterBVHTraversePass? _bvhTraversePass;
@@ -144,10 +152,14 @@ public class ClusterRenderFeature(
     private ClusterShadeBinScatterPass? _shadeBinScatterPass;
     private ClusterMaterialShadePass? _materialShadePass;
     private readonly ClusterStreamer _clusterStreamer = new(clusterManager);
+    private ClusterBinningPass? _binningPass;
 
     private bool _initialized;
     internal const uint MaxDraws = 2500000;
     private uint _maxDraws = MaxDraws;
+    internal const uint MaxBins = 16;
+    internal const uint MaxClustersPerBin = MaxDraws / MaxBins;
+
 
     public string Name => "Cluster Rendering";
 
@@ -228,6 +240,26 @@ public class ClusterRenderFeature(
     public uint DebugCandidateArgsX => _debugReadbackPass?.CandidateArgs[0] ?? 0;
     public uint DebugPhase2Count => _debugReadbackPass?.Phase2CandidateCount ?? 0;
 
+    // ─── 产出 Handle（AddPasses 后有效，供外部附加自定义 Pass 使用） ───
+
+    /// <summary>最近一帧 AddPasses 产出的全局资源 Handle。</summary>
+    public ClusterGlobalResources LastGlobalResources { get; private set; }
+
+    /// <summary>最近一帧 AddPasses 产出的剔除结果。</summary>
+    public ClusterCullOutput LastCullOutput { get; private set; }
+
+    /// <summary>最近一帧 AddPasses 产出的光栅化结果（VisBuffer + Depth）。</summary>
+    public ClusterRasterOutput LastRasterOutput { get; private set; }
+
+    /// <summary>最近一帧 AddPasses 产出的 RasterBin 结果。</summary>
+    public ClusterRasterBinOutput LastRasterBinOutput { get; private set; }
+
+    /// <summary>最近一帧 AddPasses 产出的 ShadeBin 结果。</summary>
+    public ClusterShadeBinOutput LastShadeBinOutput { get; private set; }
+
+    /// <summary>最近一帧 AddPasses 产出的着色结果。</summary>
+    public ClusterShadeOutput LastShadeOutput { get; private set; }
+
     private Matrix4x4 _view = Matrix4x4.Identity;
     private Matrix4x4 _proj = Matrix4x4.Identity;
     private Vector3 _cameraPos;
@@ -295,34 +327,33 @@ public class ClusterRenderFeature(
         );
         _cullUpdateArgsPassPhase2.Init();
 
-
         _cullPassLegacy = new ClusterCullPass(
             context,
-            clusterManager,
             ClusterCullPhase.Legacy,
             "ClusterCull Legacy"
         );
         _cullPassLegacy.Init();
         _cullPassPhase1 = new ClusterCullPass(
             context,
-            clusterManager,
             ClusterCullPhase.Phase1,
             "ClusterCull Phase1"
         );
         _cullPassPhase1.Init();
         _cullPassPhase2 = new ClusterCullPass(
             context,
-            clusterManager,
             ClusterCullPhase.Phase2,
             "ClusterCull Phase2"
         );
         _cullPassPhase2.Init();
 
-        _drawPassLegacy = new ClusterDrawPass(context, clusterManager, "ClusterDraw Legacy");
+        _binningPass = new ClusterBinningPass(context, "ClusterBinning");
+        _binningPass.Init();
+
+        _drawPassLegacy = new ClusterDrawPass(context, "ClusterDraw Legacy");
         _drawPassLegacy.Init();
-        _drawPassPhase1 = new ClusterDrawPass(context, clusterManager, "ClusterDraw Phase1");
+        _drawPassPhase1 = new ClusterDrawPass(context, "ClusterDraw Phase1");
         _drawPassPhase1.Init();
-        _drawPassPhase2 = new ClusterDrawPass(context, clusterManager, "ClusterDraw Phase2");
+        _drawPassPhase2 = new ClusterDrawPass(context, "ClusterDraw Phase2");
         _drawPassPhase2.Init();
 
         _hizBuildPass = new HiZBuildPass(context);
@@ -338,21 +369,187 @@ public class ClusterRenderFeature(
         _shadeBinCountPass = new ClusterShadeBinCountPass(context, _shadeBinningResources);
         _shadeBinReservePass = new ClusterShadeBinReservePass(context, _shadeBinningResources);
         _shadeBinScatterPass = new ClusterShadeBinScatterPass(context, _shadeBinningResources);
-        _materialShadePass = new ClusterMaterialShadePass(context);
-        _materialShadePass.Init();
+        RegisterDefaultMaterials(context, registry, out _defaultTextures, out _defaultSampler);
+        _materialShadePass = new ClusterMaterialShadePass(context, registry);
 
         _initialized = true;
     }
+
+    /// <summary>
+    /// Register default material shader types + create default material instances.
+    /// PSO creation logic moved from the old ClusterMaterialShadePass.Init().
+    /// </summary>
+    internal static void RegisterDefaultMaterials(
+        RenderContext context, MaterialRegistry registry,
+        out ITexture[]? defaultTextures, out ISampler? defaultSampler)
+    {
+        var device = context.Device;
+        if (device == null)
+        {
+            defaultTextures = null;
+            defaultSampler = null;
+            return;
+        }
+
+        string path = Path.GetFullPath(
+            Path.Combine(
+                AppContext.BaseDirectory,
+                "../../../../../../assets/Shaders/cluster_shade_material.slang"
+            )
+        );
+        var shaderAsset = SlangShaderImporter.Import(path);
+
+        var layout = new PipelineResourceLayoutDesc
+        {
+            DefaultVariableType = ShaderResourceVariableType.Mutable,
+            Variables =
+            [
+                new ShaderResourceVariableDesc { Name = "Uniforms", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+                new ShaderResourceVariableDesc { Name = "VisBuffer", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+                new ShaderResourceVariableDesc { Name = "VisibleClusters", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+                new ShaderResourceVariableDesc { Name = "PageHeap", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+                new ShaderResourceVariableDesc { Name = "Instances", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+                new ShaderResourceVariableDesc { Name = "PixelCoordBuffer", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+                new ShaderResourceVariableDesc { Name = "BinOffsets", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+                new ShaderResourceVariableDesc { Name = "InstanceHeaders", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+                new ShaderResourceVariableDesc { Name = "InstanceDataHeap", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+                new ShaderResourceVariableDesc { Name = "OutputColor", ShaderStages = ShaderType.Compute, Type = ShaderResourceVariableType.Dynamic },
+            ],
+        };
+
+        using var cs = shaderAsset.CreateShader(context, "CSMaterialShade");
+        var pso = device.CreateComputePipelineState(
+            new ComputePipelineStateCreateInfo
+            {
+                PSODesc = new PipelineStateDesc
+                {
+                    Name = "Material Shade PSO",
+                    PipelineType = PipelineType.Compute,
+                    ResourceLayout = layout,
+                },
+                Cs = cs,
+            }
+        );
+        if (pso == null)
+            throw new InvalidOperationException("Failed to create Material Shade PSO.");
+
+        registry.RegisterShaderType<StandardPBRMaterial>("StandardPBR", pso);
+
+        var defaultTex = CreateDefault1x1Texture(context, "DefaultWhite", 0xFFFFFFFF);
+        var defaultNormalTex = CreateDefault1x1Texture(context, "DefaultNormal", 0xFFFF8080);
+        var defaultArmTex = CreateDefault1x1Texture(context, "DefaultARM", 0xFF00FF00);
+        var sampler = device.CreateSampler(
+            new SamplerDesc
+            {
+                MinFilter = FilterType.Linear,
+                MagFilter = FilterType.Linear,
+                MipFilter = FilterType.Linear,
+                AddressU = TextureAddressMode.Wrap,
+                AddressV = TextureAddressMode.Wrap,
+                AddressW = TextureAddressMode.Wrap,
+            }
+        );
+
+        defaultTextures = [defaultTex, defaultNormalTex, defaultArmTex];
+        defaultSampler = sampler;
+
+        // Create default material (ID=0) with default textures
+        var mat0 = registry.CreateMaterial<StandardPBRMaterial>();
+        SetupDefaultMaterialSlots(mat0, defaultTex, defaultNormalTex, defaultArmTex, sampler);
+    }
+
+    internal static void SetupDefaultMaterialSlots(
+        StandardPBRMaterial mat,
+        ITexture albedo,
+        ITexture normal,
+        ITexture arm,
+        ISampler sampler
+    )
+    {
+        mat.PBR.AlbedoMap = albedo.GetDefaultView(TextureViewType.ShaderResource)!;
+        mat.PBR.NormalMap = normal.GetDefaultView(TextureViewType.ShaderResource)!;
+        mat.PBR.ARMMap = arm.GetDefaultView(TextureViewType.ShaderResource)!;
+        mat.PBR.Sampler = sampler;
+    }
+
+    /// <summary>
+    /// Sets up a StandardPBRMaterial with default (1×1 white) textures.
+    /// Call this for newly created materials that don't have custom textures yet.
+    /// </summary>
+    public void SetupMaterialWithDefaults(StandardPBRMaterial mat)
+    {
+        if (_defaultTextures == null || _defaultSampler == null)
+            throw new InvalidOperationException(
+                "Default textures not created. Call Initialize() first."
+            );
+        SetupDefaultMaterialSlots(
+            mat,
+            _defaultTextures[0],
+            _defaultTextures[1],
+            _defaultTextures[2],
+            _defaultSampler
+        );
+    }
+
+    internal static ITexture CreateDefault1x1Texture(RenderContext context, string name, uint rgba)
+    {
+        var texDesc = new TextureDesc
+        {
+            Name = name,
+            Type = ResourceDimension.Tex2d,
+            Width = 1,
+            Height = 1,
+            Format = TextureFormat.RGBA8_UNorm,
+            Usage = Usage.Immutable,
+            BindFlags = BindFlags.ShaderResource,
+        };
+        var data = new TextureData
+        {
+            SubResources =
+            [
+                new TextureSubResData
+                {
+                    Data = System.Runtime.InteropServices.Marshal.UnsafeAddrOfPinnedArrayElement(
+                        new[] { rgba },
+                        0
+                    ),
+                    Stride = 4,
+                },
+            ],
+        };
+        var tex =
+            context.Device!.CreateTexture(texDesc, data)
+            ?? throw new InvalidOperationException($"Failed to create texture: {name}");
+
+        // Immutable textures created with data are initially in COPY_DEST state.
+        // Transition them to SHADER_RESOURCE immediately.
+        StateTransitionDesc transition = new StateTransitionDesc
+        {
+            Resource = tex,
+            OldState = ResourceState.Unknown,
+            NewState = ResourceState.ShaderResource,
+            Flags = StateTransitionFlags.UpdateState,
+        };
+        context.ImmediateContext!.TransitionResourceStates([transition]);
+
+        return tex;
+    }
+
+    // Default resources (kept alive for material slot assignment)
+    private ITexture[]? _defaultTextures;
+    private ISampler? _defaultSampler;
 
     private class UploadUniformsData
     {
         public RenderGraphHandle HCullingUB;
         public RenderGraphHandle HDrawUB;
         public RenderGraphHandle HCopyUB;
+        public RenderGraphHandle HBinningUB;
 
         public CullingUniforms CullingData;
         public DrawUniforms DrawData;
         public CopyUniforms CopyData;
+        public BinningUniforms BinningData;
     }
 
     public void AddPasses(RenderGraph graph)
@@ -445,7 +642,7 @@ public class ClusterRenderFeature(
             PrevP11 = _prevProj.M22,
             Pad8 = default,
         };
-        uint drawDebugMode = DebugClusterID ? 1u : (DebugLOD ? 2u : 0u);
+        uint drawDebugMode = (uint)DebugMode;
         uint screenWidth = context.SwapChain?.GetDesc().Width ?? 1;
         uint screenHeight = context.SwapChain?.GetDesc().Height ?? 1;
         var drawData = new DrawUniforms
@@ -460,6 +657,22 @@ public class ClusterRenderFeature(
             QuantStep = clusterManager.QuantStep,
         };
         var copyData = new CopyUniforms { SphereVertexCount = 1536 };
+        var binningData = new BinningUniforms
+        {
+            MaxBins = MaxBins,
+            MaxClustersPerBin = MaxClustersPerBin,
+        };
+        // BinningUniforms UB is needed early for the upload lambda
+        var hBinningUB = graph.CreateBuffer(
+            "BinningUniforms",
+            new BufferDesc
+            {
+                Size = (ulong)System.Runtime.InteropServices.Marshal.SizeOf<BinningUniforms>(),
+                BindFlags = BindFlags.UniformBuffer,
+                Usage = Usage.Dynamic,
+                CPUAccessFlags = CpuAccessFlags.Write,
+            }
+        );
 
         graph.AddPass<UploadUniformsData>(
             "UploadUniforms",
@@ -471,10 +684,13 @@ public class ClusterRenderFeature(
                 data.CullingData = cullingData;
                 data.DrawData = drawData;
                 data.CopyData = copyData;
+                data.HBinningUB = hBinningUB;
+                data.BinningData = binningData;
 
                 builder.Write(hCullingUB, ResourceState.ConstantBuffer);
                 builder.Write(hDrawUB, ResourceState.ConstantBuffer);
                 builder.Write(hCopyUB, ResourceState.ConstantBuffer);
+                builder.Write(hBinningUB, ResourceState.ConstantBuffer);
             },
             (rgCtx, data) =>
             {
@@ -511,6 +727,13 @@ public class ClusterRenderFeature(
                     );
                     cpSpan[0] = data.CopyData;
                     ctx.UnmapBuffer(cpBuf, MapType.Write);
+                }
+                var bBuf = rgCtx.GetBuffer(data.HBinningUB);
+                if (bBuf != null)
+                {
+                    var bSpan = ctx.MapBuffer<BinningUniforms>(bBuf, MapType.Write, MapFlags.Discard);
+                    bSpan[0] = data.BinningData;
+                    ctx.UnmapBuffer(bBuf, MapType.Write);
                 }
             }
         );
@@ -554,7 +777,10 @@ public class ClusterRenderFeature(
             new BufferDesc
             {
                 Size = 256,
-                BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
+                BindFlags =
+                    BindFlags.UnorderedAccess
+                    | BindFlags.IndirectDrawArgs
+                    | BindFlags.ShaderResource,
                 Mode = BufferMode.Raw,
             }
         );
@@ -569,10 +795,93 @@ public class ClusterRenderFeature(
             }
         );
 
+        // ─── Binning buffers ───
+        var hRasterBinMeta = graph.CreateBuffer(
+            "RasterBinMeta",
+            new BufferDesc
+            {
+                Size = MaxBins * 16, // 4 uints per bin
+                BindFlags = BindFlags.UnorderedAccess,
+                Mode = BufferMode.Raw,
+                ElementByteStride = 4,
+            }
+        );
+        var hBinnedClusterIndexBuffer = graph.CreateBuffer(
+            "BinnedClusterIndexBuffer",
+            new BufferDesc
+            {
+                Size = (ulong)(_maxDraws * 4), // 1 uint per bin
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                Mode = BufferMode.Structured,
+                ElementByteStride = 4,
+            }
+        );
+        var hBinnedDrawArgs = graph.CreateBuffer(
+            "BinnedDrawArgs",
+            new BufferDesc
+            {
+                Size = MaxBins * 16, // 4 uints DrawInstanced per bin
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
+                Mode = BufferMode.Raw,
+                ElementByteStride = 4,
+            }
+        );
+        var hBinningDispatchArgs = graph.CreateBuffer(
+            "BinningDispatchArgs",
+            new BufferDesc
+            {
+                Size = 12, // 3 uints: GroupX, GroupY, GroupZ
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
+                Mode = BufferMode.Raw,
+                ElementByteStride = 4,
+            }
+        );
+        // Small buffer always cleared to 0 — used as HVisibleClusterMeta offset=0 for binned draws
+        var hZeroOffsetBuffer = graph.CreateBuffer(
+            "ZeroOffsetBuffer",
+            new BufferDesc
+            {
+                Size = 16, // 4 uints, only [4]=0 needed
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                Mode = BufferMode.Raw,
+            }
+        );
+
+        // Phase2-specific binned buffers (independent Init→Scatter, never overlaps with Phase1)
+        var hBinnedClusterIndexBufferP2 = graph.CreateBuffer(
+            "BinnedClusterIndexBufferP2",
+            new BufferDesc
+            {
+                Size = (ulong)(_maxDraws * 4),
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                Mode = BufferMode.Structured,
+                ElementByteStride = 4,
+            }
+        );
+        var hBinnedDrawArgsP2 = graph.CreateBuffer(
+            "BinnedDrawArgsP2",
+            new BufferDesc
+            {
+                Size = MaxBins * 16,
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
+                Mode = BufferMode.Raw,
+                ElementByteStride = 4,
+            }
+        );
+        var hRasterBinMetaP2 = graph.CreateBuffer(
+            "RasterBinMetaP2",
+            new BufferDesc
+            {
+                Size = MaxBins * 16,
+                BindFlags = BindFlags.UnorderedAccess,
+                Mode = BufferMode.Raw,
+                ElementByteStride = 4,
+            }
+        );
+
         RenderGraphHandle hPhase2CandidateClusters = RenderGraphHandle.Invalid;
         RenderGraphHandle hPhase2CandidateCount = RenderGraphHandle.Invalid;
         RenderGraphHandle hPhase2CandidateArgs = RenderGraphHandle.Invalid;
-
 
         bool useHiZBuffers =
             HiZMode != HiZDebugMode.Legacy && HiZMode != HiZDebugMode.Phase1OnlyPassAll;
@@ -622,7 +931,10 @@ public class ClusterRenderFeature(
             {
                 // 20 bytes: 4 uints for DrawInstanced + 1 uint for Phase1Offset
                 Size = 256,
-                BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
+                BindFlags =
+                    BindFlags.UnorderedAccess
+                    | BindFlags.IndirectDrawArgs
+                    | BindFlags.ShaderResource,
                 Mode = BufferMode.Raw,
             }
         );
@@ -787,8 +1099,23 @@ public class ClusterRenderFeature(
                 ElementByteStride = GpuInstanceHeader.SizeInBytes,
             }
         );
+        var hInstanceDataHeap = graph.CreateBuffer(
+            "InstanceDataHeap",
+            new BufferDesc
+            {
+                Size = Math.Max((ulong)instanceManager.MetadataByteCount, 16ul),
+                BindFlags = BindFlags.ShaderResource,
+                Mode = BufferMode.Raw,
+            }
+        );
         var hGlobalBVH = graph.CreateBuffer("GlobalBVH", clusterManager.GlobalBVHDesc);
         var hPageHeap = graph.CreateBuffer("PageHeap", clusterManager.PageHeapDesc);
+
+        // Store global resources for external access
+        LastGlobalResources = new ClusterGlobalResources(
+            hGlobalBVH, hPageHeap, hGlobalTransform, hGlobalInstanceHeader,
+            hInstanceDataHeap, hCullingUB, hDrawUB, hBinningUB, hCopyUB
+        );
 
         graph.AddPass(new ClusterResourceUploadPass(clusterManager, hGlobalBVH, hPageHeap));
 
@@ -831,7 +1158,8 @@ public class ClusterRenderFeature(
                 new ClusterUploadInstanceDataPass(
                     instanceManager,
                     hGlobalTransform,
-                    hGlobalInstanceHeader
+                    hGlobalInstanceHeader,
+                    hInstanceDataHeap
                 )
             );
         }
@@ -843,7 +1171,9 @@ public class ClusterRenderFeature(
                 hCandidateCount,
                 hPageFaultBuffer,
                 useHiZ ? hPhase2CandidateCount : RenderGraphHandle.Invalid,
-                useHiZ ? hPhase2IndirectDrawArgs : RenderGraphHandle.Invalid
+                hPhase2IndirectDrawArgs,  // Always clear: binning draws need [4]=0 as offset
+                hZeroOffsetBuffer,  // Clear to 0: used as offset=0 for binned draws
+                RenderGraphHandle.Invalid
             )
         );
 
@@ -948,7 +1278,10 @@ public class ClusterRenderFeature(
                     MipLevels = 1,
                     Format = TextureFormat.R32_UInt,
                     Usage = Usage.Default,
-                    BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource | BindFlags.UnorderedAccess,
+                    BindFlags =
+                        BindFlags.RenderTarget
+                        | BindFlags.ShaderResource
+                        | BindFlags.UnorderedAccess,
                     ClearValue = new OptimizedClearValue
                     {
                         Format = TextureFormat.R32_UInt,
@@ -971,7 +1304,11 @@ public class ClusterRenderFeature(
                     if (ctx2 != null && rtv != null)
                     {
                         ctx2.SetRenderTargets([rtv], null, ResourceStateTransitionMode.Verify);
-                        ctx2.ClearRenderTarget(rtv, new Vector4(0, 0, 0, 0), ResourceStateTransitionMode.Verify);
+                        ctx2.ClearRenderTarget(
+                            rtv,
+                            new Vector4(0, 0, 0, 0),
+                            ResourceStateTransitionMode.Verify
+                        );
                     }
                 }
             );
@@ -988,7 +1325,10 @@ public class ClusterRenderFeature(
                     MipLevels = 1,
                     Format = TextureFormat.RGBA8_UNorm,
                     Usage = Usage.Default,
-                    BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource | BindFlags.RenderTarget,
+                    BindFlags =
+                        BindFlags.UnorderedAccess
+                        | BindFlags.ShaderResource
+                        | BindFlags.RenderTarget,
                 }
             );
         }
@@ -1025,31 +1365,58 @@ public class ClusterRenderFeature(
             _cullPassLegacy.HIndirectDrawArgs = hIndirectDrawArgs;
             _cullPassLegacy.HCullingUniforms = hCullingUB;
             _cullPassLegacy.HGlobalTransformBuffer = hGlobalTransform;
+
             _cullPassLegacy.HPageHeap = hPageHeap;
             _cullPassLegacy.HDebugHiZOutput = hDebugHiZOutput;
             graph.AddPass(_cullPassLegacy);
 
-            // Legacy Draw
-            _drawPassLegacy!.HVisibleClusters = hVisibleClusters;
-            _drawPassLegacy.HIndirectDrawArgs = hIndirectDrawArgs;
+            // Binning: scatter visible clusters into bins by RasterBinKey
+            AddBinningPasses(graph, _binningPass!,
+                hVisibleClusters, hGlobalInstanceHeader, hBinningUB,
+                hIndirectDrawArgs, hPhase2IndirectDrawArgs, // offset=0 (zeroed)
+                hRasterBinMeta, hBinnedClusterIndexBuffer, hBinnedDrawArgs, hBinningDispatchArgs);
+
+            // Legacy Draw — reads from BinnedClusterBuffer (bin 0) instead of VisibleClusters
+            _drawPassLegacy!.HVisibleClusters = hBinnedClusterIndexBuffer;  // binned output
+            _drawPassLegacy.HVisibleClustersData = hVisibleClusters;
+            _drawPassLegacy.HIndirectDrawArgs = hBinnedDrawArgs;       // bin 0 draw args
             _drawPassLegacy.HColorTarget = colorTarget;
             _drawPassLegacy.HDepthTarget = depthTarget;
             _drawPassLegacy.HVisBufferTarget = hVisBuffer;
             _drawPassLegacy.HDrawUniforms = hDrawUB;
             _drawPassLegacy.HGlobalTransformBuffer = hGlobalTransform;
             _drawPassLegacy.HPageHeap = hPageHeap;
-            _drawPassLegacy.HVisibleClusterMeta = hPhase2IndirectDrawArgs; // Cleared to 0 → offset=0
-            _drawPassLegacy.SetFrameData(DebugMode, WireframeEnabled, OverdrawEnabled, UseVisBuffer);
+            _drawPassLegacy.HVisibleClusterMeta = hZeroOffsetBuffer; // offset=0 for binned draw
+            _drawPassLegacy.SetFrameData(
+                DebugMode,
+                WireframeEnabled,
+                OverdrawEnabled,
+                UseVisBuffer
+            );
             graph.AddPass(_drawPassLegacy);
+
+            // Store intermediate outputs for external access
+            LastCullOutput = new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid);
+            LastRasterBinOutput = new ClusterRasterBinOutput(hBinnedClusterIndexBuffer, hBinnedDrawArgs, hRasterBinMeta, hBinningDispatchArgs);
+            LastRasterOutput = new ClusterRasterOutput(hVisBuffer, depthTarget);
 
             // Resolve / Shading pass (VisBuffer -> ResolveTarget)
             if (UseVisBuffer)
             {
                 AddShadingPasses(
-                    graph, hVisBuffer, hVisibleClusters, hPageHeap,
-                    hGlobalTransform, hGlobalInstanceHeader,
-                    hResolveTarget, colorTarget, hDrawUB,
-                    screenWidth, screenHeight, drawDebugMode
+                    graph,
+                    hVisBuffer,
+                    hVisibleClusters, // Shade uses OriginalIndex stored by binning → reads original VisibleClusters
+                    hPageHeap,
+                    hGlobalTransform,
+                    hGlobalInstanceHeader,
+                    hInstanceDataHeap,
+                    hResolveTarget,
+                    colorTarget,
+                    hDrawUB,
+                    screenWidth,
+                    screenHeight,
+                    drawDebugMode
                 );
             }
 
@@ -1095,17 +1462,29 @@ public class ClusterRenderFeature(
             _cullPassPhase1.HDebugHiZOutput = hDebugHiZOutput;
             graph.AddPass(_cullPassPhase1);
 
-            // Phase 1 Draw
-            _drawPassPhase1!.HVisibleClusters = hVisibleClusters;
-            _drawPassPhase1.HIndirectDrawArgs = hIndirectDrawArgs;
+            // Phase 1 Binning (offset=0)
+            AddBinningPasses(graph, _binningPass!,
+                hVisibleClusters, hGlobalInstanceHeader, hBinningUB,
+                hIndirectDrawArgs, hPhase2IndirectDrawArgs, // offset=0 (zeroed)
+                hRasterBinMeta, hBinnedClusterIndexBuffer, hBinnedDrawArgs, hBinningDispatchArgs);
+
+            // Phase 1 Draw — reads from BinnedClusterBuffer
+            _drawPassPhase1!.HVisibleClusters = hBinnedClusterIndexBuffer;
+            _drawPassPhase1.HVisibleClustersData = hVisibleClusters;
+            _drawPassPhase1.HIndirectDrawArgs = hBinnedDrawArgs;
             _drawPassPhase1.HColorTarget = colorTarget;
             _drawPassPhase1.HDepthTarget = depthTarget;
             _drawPassPhase1.HVisBufferTarget = hVisBuffer;
             _drawPassPhase1.HDrawUniforms = hDrawUB;
             _drawPassPhase1.HGlobalTransformBuffer = hGlobalTransform;
             _drawPassPhase1.HPageHeap = hPageHeap;
-            _drawPassPhase1.HVisibleClusterMeta = hPhase2IndirectDrawArgs; // Cleared to 0 → offset=0 for Phase 1
-            _drawPassPhase1.SetFrameData(DebugMode, WireframeEnabled, OverdrawEnabled, UseVisBuffer);
+            _drawPassPhase1.HVisibleClusterMeta = hZeroOffsetBuffer; // offset=0 for binned draw
+            _drawPassPhase1.SetFrameData(
+                DebugMode,
+                WireframeEnabled,
+                OverdrawEnabled,
+                UseVisBuffer
+            );
             graph.AddPass(_drawPassPhase1);
 
             if (HiZMode == HiZDebugMode.Phase1ThenHiZ || HiZMode == HiZDebugMode.Full2Phase)
@@ -1131,7 +1510,7 @@ public class ClusterRenderFeature(
                 _cullPassPhase2.HCandidateArgs = hPhase2CandidateArgs;
                 _cullPassPhase2.HCandidateCount = hPhase2CandidateCount;
                 _cullPassPhase2.HVisibleClusters = hVisibleClusters;
-                _cullPassPhase2.HIndirectDrawArgs = hIndirectDrawArgs;       // Phase1's DrawArgs (read N1)
+                _cullPassPhase2.HIndirectDrawArgs = hIndirectDrawArgs; // Phase1's DrawArgs (read N1)
                 _cullPassPhase2.HPhase2IndirectDrawArgs = hPhase2IndirectDrawArgs; // Phase2's own DrawArgs (atomic N2)
                 _cullPassPhase2.HHiZTexture = hCurrHiZ;
                 _cullPassPhase2.HCullingUniforms = hCullingUB;
@@ -1140,17 +1519,29 @@ public class ClusterRenderFeature(
                 _cullPassPhase2.HDebugHiZOutput = hDebugHiZOutput;
                 graph.AddPass(_cullPassPhase2);
 
-                // Phase 2 Draw — indirect from Phase2DrawArgs, offset from Phase1's DrawArgs[4]
-                _drawPassPhase2!.HVisibleClusters = hVisibleClusters;
-                _drawPassPhase2.HIndirectDrawArgs = hPhase2IndirectDrawArgs;      // Phase2's DrawArgs (InstanceCount=N2)
-                _drawPassPhase2.HVisibleClusterMeta = hIndirectDrawArgs;          // Phase1's DrawArgs (byte 4 = N1 offset)
+                // Phase 2 Binning (independent Init→Scatter into P2 buffers)
+                AddBinningPasses(graph, _binningPass!,
+                    hVisibleClusters, hGlobalInstanceHeader, hBinningUB,
+                    hPhase2IndirectDrawArgs, hIndirectDrawArgs, // DrawArgs=[4]=N2, offset=[4]=N1
+                    hRasterBinMetaP2, hBinnedClusterIndexBufferP2, hBinnedDrawArgsP2, hBinningDispatchArgs);
+
+                // Phase 2 Draw — reads from Phase2’s own BinnedClusterBuffer
+                _drawPassPhase2!.HVisibleClusters = hBinnedClusterIndexBufferP2;
+                _drawPassPhase2.HVisibleClustersData = hVisibleClusters;
+                _drawPassPhase2.HIndirectDrawArgs = hBinnedDrawArgsP2;
+                _drawPassPhase2.HVisibleClusterMeta = hZeroOffsetBuffer; // offset=0
                 _drawPassPhase2.HColorTarget = colorTarget;
                 _drawPassPhase2.HDepthTarget = depthTarget;
                 _drawPassPhase2.HVisBufferTarget = hVisBuffer;
                 _drawPassPhase2.HDrawUniforms = hDrawUB;
                 _drawPassPhase2.HGlobalTransformBuffer = hGlobalTransform;
                 _drawPassPhase2.HPageHeap = hPageHeap;
-                _drawPassPhase2.SetFrameData(DebugMode, WireframeEnabled, OverdrawEnabled, UseVisBuffer);
+                _drawPassPhase2.SetFrameData(
+                    DebugMode,
+                    WireframeEnabled,
+                    OverdrawEnabled,
+                    UseVisBuffer
+                );
                 graph.AddPass(_drawPassPhase2);
 
                 // Full HiZ Build (overwrite hCurrHiZ with complete Phase 1+2 depth for next frame's Phase 1)
@@ -1160,14 +1551,28 @@ public class ClusterRenderFeature(
                     graph.AddPass(new HiZDownsamplePass(_hizBuildPass!, hCurrHiZ, mip));
                 }
 
+                // Store intermediate outputs for external access
+                LastCullOutput = new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, hPhase2IndirectDrawArgs, hCurrHiZ, hPhase2CandidateCount, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid);
+                LastRasterBinOutput = new ClusterRasterBinOutput(hBinnedClusterIndexBufferP2, hBinnedDrawArgsP2, hRasterBinMetaP2, hBinningDispatchArgs);
+                LastRasterOutput = new ClusterRasterOutput(hVisBuffer, depthTarget);
+
                 // Resolve / Shading pass (VisBuffer -> ResolveTarget) after all draws complete
                 if (UseVisBuffer)
                 {
                     AddShadingPasses(
-                        graph, hVisBuffer, hVisibleClusters, hPageHeap,
-                        hGlobalTransform, hGlobalInstanceHeader,
-                        hResolveTarget, colorTarget, hDrawUB,
-                        screenWidth, screenHeight, drawDebugMode
+                        graph,
+                        hVisBuffer,
+                        hVisibleClusters, // Shade uses OriginalIndex stored by binning → reads original VisibleClusters
+                        hPageHeap,
+                        hGlobalTransform,
+                        hGlobalInstanceHeader,
+                        hInstanceDataHeap,
+                        hResolveTarget,
+                        colorTarget,
+                        hDrawUB,
+                        screenWidth,
+                        screenHeight,
+                        drawDebugMode
                     );
                 }
             }
@@ -1351,6 +1756,42 @@ public class ClusterRenderFeature(
     }
 
     /// <summary>
+    /// Adds 2 RG passes (Init + Scatter) for raster binning.
+    /// Splitting into 2 passes ensures proper UAV barriers between init writes and scatter atomics.
+    /// </summary>
+    private static void AddBinningPasses(
+        RenderGraph graph, ClusterBinningPass parent,
+        RenderGraphHandle hVisibleClusters, RenderGraphHandle hInstanceHeaders,
+        RenderGraphHandle hBinningUB, RenderGraphHandle hDrawArgs, RenderGraphHandle hClusterReadOffsetArgs,
+        RenderGraphHandle hRasterBinMeta, RenderGraphHandle hBinnedClusterBuffer,
+        RenderGraphHandle hBinnedDrawArgs, RenderGraphHandle hBinningDispatchArgs)
+    {
+        var initPass = new ClusterBinningInitPass(parent)
+        {
+            HBinningUniforms = hBinningUB,
+            HDrawArgs = hDrawArgs,
+            HBinningDispatchArgs = hBinningDispatchArgs,
+            HRasterBinMeta = hRasterBinMeta,
+            HBinnedDrawArgs = hBinnedDrawArgs,
+        };
+        graph.AddPass(initPass);
+
+        var scatterPass = new ClusterBinningScatterPass(parent)
+        {
+            HBinningUniforms = hBinningUB,
+            HVisibleClusters = hVisibleClusters,
+            HInstanceHeaders = hInstanceHeaders,
+            HDrawArgs = hDrawArgs,
+            HClusterReadOffsetArgs = hClusterReadOffsetArgs,
+            HBinningDispatchArgs = hBinningDispatchArgs,
+            HRasterBinMeta = hRasterBinMeta,
+            HBinnedDrawArgs = hBinnedDrawArgs,
+            HBinnedClusterBuffer = hBinnedClusterBuffer,
+        };
+        graph.AddPass(scatterPass);
+    }
+
+    /// <summary>
     /// Adds shading passes (Binning + Material Shade) or falls back to debug Resolve.
     /// Shared between Legacy and 2-Phase paths.
     /// </summary>
@@ -1361,15 +1802,19 @@ public class ClusterRenderFeature(
         RenderGraphHandle hPageHeap,
         RenderGraphHandle hGlobalTransform,
         RenderGraphHandle hGlobalInstanceHeader,
+        RenderGraphHandle hInstanceDataHeap,
         RenderGraphHandle hResolveTarget,
         RenderGraphHandle colorTarget,
         RenderGraphHandle hDrawUB,
         uint screenWidth,
         uint screenHeight,
-        uint drawDebugMode)
+        uint drawDebugMode
+    )
     {
-        // For debug modes, use the existing resolve pass
-        if (drawDebugMode != 0 && _resolvePass != null)
+        // For resolve-only debug modes (ClusterID=1, LOD=2), use the existing resolve pass.
+        // Shade-specific debug modes (7-10) fall through to the full shade pipeline.
+        bool isResolveOnlyDebug = drawDebugMode == 1 || drawDebugMode == 2;
+        if (isResolveOnlyDebug && _resolvePass != null)
         {
             _resolvePass.HVisBuffer = hVisBuffer;
             _resolvePass.HDepthTarget = graph.GetResourceHandle("DepthTarget");
@@ -1394,13 +1839,15 @@ public class ClusterRenderFeature(
                     if (src != null && dst != null)
                     {
                         var ctx2 = rgCtx.RenderContext.ImmediateContext;
-                        ctx2?.CopyTexture(new CopyTextureAttribs
-                        {
-                            SrcTexture = src,
-                            DstTexture = dst,
-                            SrcTextureTransitionMode = ResourceStateTransitionMode.Verify,
-                            DstTextureTransitionMode = ResourceStateTransitionMode.Verify,
-                        });
+                        ctx2?.CopyTexture(
+                            new CopyTextureAttribs
+                            {
+                                SrcTexture = src,
+                                DstTexture = dst,
+                                SrcTextureTransitionMode = ResourceStateTransitionMode.Verify,
+                                DstTextureTransitionMode = ResourceStateTransitionMode.Verify,
+                            }
+                        );
                     }
                 }
             );
@@ -1409,58 +1856,82 @@ public class ClusterRenderFeature(
 
         // --- Multi-material shading pipeline ---
         const int MaxMaterials = 256;
-        uint activeMaterialCount = 1; // TODO: track actual unique material count (was incorrectly using instanceManager.Count)
+        uint activeMaterialCount = Math.Max(registry.MaterialCount, 1u);
 
         // Create shading buffers
-        var hBinUniforms = graph.CreateBuffer("ShadeBinUniforms", new BufferDesc
-        {
-            Size = (ulong)Marshal.SizeOf<ShadeBinUniforms>(),
-            Usage = Usage.Dynamic,
-            BindFlags = BindFlags.UniformBuffer,
-            CPUAccessFlags = CpuAccessFlags.Write,
-        });
-        var hShadeUniforms = graph.CreateBuffer("ShadeUniforms", new BufferDesc
-        {
-            Size = 256, // padded to 256 for constant buffer alignment
-            Usage = Usage.Dynamic,
-            BindFlags = BindFlags.UniformBuffer,
-            CPUAccessFlags = CpuAccessFlags.Write,
-        });
-        var hBinCounts = graph.CreateBuffer("BinCounts", new BufferDesc
-        {
-            Size = (ulong)(MaxMaterials * 4),
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-            Mode = BufferMode.Structured,
-            ElementByteStride = 4,
-        });
-        var hBinOffsets = graph.CreateBuffer("BinOffsets", new BufferDesc
-        {
-            Size = (ulong)(MaxMaterials * 4),
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-            Mode = BufferMode.Structured,
-            ElementByteStride = 4,
-        });
-        var hBinScatterCount = graph.CreateBuffer("BinScatterCount", new BufferDesc
-        {
-            Size = (ulong)(MaxMaterials * 4),
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-            Mode = BufferMode.Structured,
-            ElementByteStride = 4,
-        });
-        var hPixelCoordBuffer = graph.CreateBuffer("PixelCoordBuffer", new BufferDesc
-        {
-            Size = (ulong)(screenWidth * screenHeight * 4),
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-            Mode = BufferMode.Structured,
-            ElementByteStride = 4,
-        });
-        var hBinIndirectArgs = graph.CreateBuffer("BinIndirectArgs", new BufferDesc
-        {
-            Size = (ulong)(MaxMaterials * 12),
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
-            Mode = BufferMode.Raw,
-            ElementByteStride = 4,
-        });
+        var hBinUniforms = graph.CreateBuffer(
+            "ShadeBinUniforms",
+            new BufferDesc
+            {
+                Size = (ulong)Marshal.SizeOf<ShadeBinUniforms>(),
+                Usage = Usage.Dynamic,
+                BindFlags = BindFlags.UniformBuffer,
+                CPUAccessFlags = CpuAccessFlags.Write,
+            }
+        );
+        var hShadeUniforms = graph.CreateBuffer(
+            "ShadeUniforms",
+            new BufferDesc
+            {
+                Size = 256, // padded to 256 for constant buffer alignment
+                Usage = Usage.Dynamic,
+                BindFlags = BindFlags.UniformBuffer,
+                CPUAccessFlags = CpuAccessFlags.Write,
+            }
+        );
+        var hBinCounts = graph.CreateBuffer(
+            "BinCounts",
+            new BufferDesc
+            {
+                Size = (ulong)(MaxMaterials * 4),
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                Mode = BufferMode.Structured,
+                ElementByteStride = 4,
+            }
+        );
+        var hBinOffsets = graph.CreateBuffer(
+            "BinOffsets",
+            new BufferDesc
+            {
+                Size = (ulong)(MaxMaterials * 4),
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                Mode = BufferMode.Structured,
+                ElementByteStride = 4,
+            }
+        );
+        var hBinScatterCount = graph.CreateBuffer(
+            "BinScatterCount",
+            new BufferDesc
+            {
+                Size = (ulong)(MaxMaterials * 4),
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                Mode = BufferMode.Structured,
+                ElementByteStride = 4,
+            }
+        );
+        var hPixelCoordBuffer = graph.CreateBuffer(
+            "PixelCoordBuffer",
+            new BufferDesc
+            {
+                Size = (ulong)(screenWidth * screenHeight * 4),
+                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+                Mode = BufferMode.Structured,
+                ElementByteStride = 4,
+            }
+        );
+        var hBinIndirectArgs = graph.CreateBuffer(
+            "BinIndirectArgs",
+            new BufferDesc
+            {
+                Size = (ulong)(MaxMaterials * 12),
+                BindFlags =
+                    BindFlags.UnorderedAccess
+                    | BindFlags.IndirectDrawArgs
+                    | BindFlags.ShaderResource,
+                Mode = BufferMode.Raw,
+                ElementByteStride = 4,
+            }
+        );
 
         // Upload shade bin uniforms
         var binUniformData = new ShadeBinUniforms
@@ -1481,7 +1952,11 @@ public class ClusterRenderFeature(
                 var buf = rgCtx.GetBuffer(hBinUniforms);
                 if (ctx2 != null && buf != null)
                 {
-                    var mapped = ctx2.MapBuffer<ShadeBinUniforms>(buf, MapType.Write, MapFlags.Discard);
+                    var mapped = ctx2.MapBuffer<ShadeBinUniforms>(
+                        buf,
+                        MapType.Write,
+                        MapFlags.Discard
+                    );
                     mapped[0] = binUniformData;
                     ctx2.UnmapBuffer(buf, MapType.Write);
                 }
@@ -1520,7 +1995,11 @@ public class ClusterRenderFeature(
                 var buf = rgCtx.GetBuffer(hShadeUniforms);
                 if (ctx2 != null && buf != null)
                 {
-                    var mapped = ctx2.MapBuffer<ShadeUniforms>(buf, MapType.Write, MapFlags.Discard);
+                    var mapped = ctx2.MapBuffer<ShadeUniforms>(
+                        buf,
+                        MapType.Write,
+                        MapFlags.Discard
+                    );
                     mapped[0] = shadeUniformData;
                     ctx2.UnmapBuffer(buf, MapType.Write);
                 }
@@ -1542,7 +2021,12 @@ public class ClusterRenderFeature(
                 {
                     Span<byte> zeros = stackalloc byte[MaxMaterials * 4];
                     zeros.Clear();
-                    ctx2.UpdateBuffer(buf, 0, (ReadOnlySpan<byte>)zeros, ResourceStateTransitionMode.Verify);
+                    ctx2.UpdateBuffer(
+                        buf,
+                        0,
+                        (ReadOnlySpan<byte>)zeros,
+                        ResourceStateTransitionMode.Verify
+                    );
                 }
             }
         );
@@ -1573,6 +2057,9 @@ public class ClusterRenderFeature(
         _shadeBinScatterPass.HPixelCoordBuffer = hPixelCoordBuffer;
         graph.AddPass(_shadeBinScatterPass);
 
+        // Store shade bin outputs for external access
+        LastShadeBinOutput = new ClusterShadeBinOutput(hPixelCoordBuffer, hBinOffsets, hBinCounts, hBinIndirectArgs);
+
         // Clear resolve target before shading
         graph.AddPass<object>(
             "ClearResolveTarget",
@@ -1590,7 +2077,11 @@ public class ClusterRenderFeature(
                     if (rtv != null)
                     {
                         ctx2.SetRenderTargets([rtv], null, ResourceStateTransitionMode.Verify);
-                        ctx2.ClearRenderTarget(rtv, new System.Numerics.Vector4(0, 0, 0, 0), ResourceStateTransitionMode.Verify);
+                        ctx2.ClearRenderTarget(
+                            rtv,
+                            new System.Numerics.Vector4(0, 0, 0, 0),
+                            ResourceStateTransitionMode.Verify
+                        );
                     }
                 }
             }
@@ -1601,14 +2092,19 @@ public class ClusterRenderFeature(
         _materialShadePass.HVisibleClusters = hVisibleClusters;
         _materialShadePass.HPageHeap = hPageHeap;
         _materialShadePass.HInstances = hGlobalTransform;
+        _materialShadePass.HInstanceHeaders = hGlobalInstanceHeader;
+        _materialShadePass.HInstanceDataHeap = hInstanceDataHeap;
         _materialShadePass.HShadeUniforms = hShadeUniforms;
         _materialShadePass.HPixelCoordBuffer = hPixelCoordBuffer;
         _materialShadePass.HBinOffsets = hBinOffsets;
         _materialShadePass.HBinIndirectArgs = hBinIndirectArgs;
         _materialShadePass.HOutputColor = hResolveTarget;
         _materialShadePass.ShadeUniformData = shadeUniformData;
-        _materialShadePass.ActiveMaterialCount = activeMaterialCount;
+        // ActiveMaterialCount driven by MaterialRegistry
         graph.AddPass(_materialShadePass);
+
+        // Store shade output for external access
+        LastShadeOutput = new ClusterShadeOutput(hResolveTarget);
 
         // Copy shade result to back buffer
         graph.AddPass<object>(
@@ -1625,13 +2121,15 @@ public class ClusterRenderFeature(
                 if (src != null && dst != null)
                 {
                     var ctx2 = rgCtx.RenderContext.ImmediateContext;
-                    ctx2?.CopyTexture(new CopyTextureAttribs
-                    {
-                        SrcTexture = src,
-                        DstTexture = dst,
-                        SrcTextureTransitionMode = ResourceStateTransitionMode.Verify,
-                        DstTextureTransitionMode = ResourceStateTransitionMode.Verify,
-                    });
+                    ctx2?.CopyTexture(
+                        new CopyTextureAttribs
+                        {
+                            SrcTexture = src,
+                            DstTexture = dst,
+                            SrcTextureTransitionMode = ResourceStateTransitionMode.Verify,
+                            DstTextureTransitionMode = ResourceStateTransitionMode.Verify,
+                        }
+                    );
                 }
             }
         );
@@ -1655,7 +2153,8 @@ public class ClusterRenderFeature(
         _debugPass?.Dispose();
         _debugAABBPass?.Dispose();
         _resolvePass?.Dispose();
+        _binningPass?.Dispose();
         _shadeBinningResources?.Dispose();
-        _materialShadePass?.Dispose();
+        registry.Dispose();
     }
 }

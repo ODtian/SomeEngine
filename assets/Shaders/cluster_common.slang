@@ -250,10 +250,13 @@ float4 FetchTangent(ByteAddressBuffer pageHeap, uint streamBase, uint vStart, ui
     return DecodeSnorm8x4(LoadStreamDword(pageHeap, streamBase, vStart, localVi));
 }
 
-/// Fetch UV (Float16x2, 4 bytes/vertex).
+/// Fetch UV (Float16x2, 4 bytes/vertex). Uses unaligned load because
+/// preceding streams may cause non-4-byte-aligned streamBase.
 float2 FetchUV(ByteAddressBuffer pageHeap, uint streamBase, uint vStart, uint localVi)
 {
-    return DecodeFloat16x2(LoadStreamDword(pageHeap, streamBase, vStart, localVi));
+    uint byteAddr = streamBase + (vStart + localVi) * 4;
+    uint raw = LoadStreamBytes(pageHeap, byteAddr, 4);
+    return DecodeFloat16x2(raw);
 }
 
 /// Fetch vertex color (UInt8x4 UNORM, 4 bytes/vertex).

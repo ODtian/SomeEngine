@@ -37,15 +37,9 @@ ByteAddressBuffer PageHeap;
 // Debug/Impostor Instances if needed
 StructuredBuffer<GpuTransform> Instances;
 
-struct DrawRequest
-{
-    uint PageOffset;
-    uint ClusterID;
-    uint InstanceID;
-    uint Pad;
-};
-
-StructuredBuffer<DrawRequest> RequestBuffer;
+// Points to original VisibleClusters index
+StructuredBuffer<uint> BinnedClusterIndexBuffer;
+StructuredBuffer<uint4> VisibleClusters;  // {PageOffset, ClusterID, InstanceID, Pad}
 
 // Phase1 binds a zeroed buffer; Phase2 binds Phase2DrawArgs (offset at byte 16)
 ByteAddressBuffer VisibleClusterMeta;
@@ -92,12 +86,15 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
 {
     PSInput output;
 
-    // 1. Decode Page and Cluster from RequestBuffer
+    // 1. Decode Page and Cluster from Binned Index
     uint clusterOffset = VisibleClusterMeta.Load(4);  // InstanceCount field of Phase1's DrawArgs
-    DrawRequest req = RequestBuffer[instanceID + clusterOffset];
-    uint pageOffset = req.PageOffset;
-    uint clusterID = req.ClusterID;
-    uint realInstanceID = req.InstanceID;
+    uint binnedIndex = clusterOffset + instanceID;
+    uint originalIndex = BinnedClusterIndexBuffer[binnedIndex];
+
+    uint4 req = VisibleClusters[originalIndex];
+    uint pageOffset = req.x;
+    uint clusterID = req.y;
+    uint realInstanceID = req.z;
 
     // 3. Load Header (To get stream offsets)
     // Header: clusters(16), pos(20), attr(24), idx(28)
@@ -258,10 +255,13 @@ PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_Ins
     PSVisBufferInput output;
 
     uint clusterOffset = VisibleClusterMeta.Load(4);  // InstanceCount field of Phase1's DrawArgs
-    DrawRequest req = RequestBuffer[instanceID + clusterOffset];
-    uint pageOffset = req.PageOffset;
-    uint clusterID = req.ClusterID;
-    uint realInstanceID = req.InstanceID;
+    uint binnedIndex = clusterOffset + instanceID;
+    uint originalIndex = BinnedClusterIndexBuffer[binnedIndex];
+
+    uint4 req = VisibleClusters[originalIndex];
+    uint pageOffset = req.x;
+    uint clusterID = req.y;
+    uint realInstanceID = req.z;
 
     // Load header
     uint4 header1 = PageHeap.Load4(pageOffset + 16);
@@ -277,7 +277,7 @@ PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_Ins
 
     uint triCount = (packedCounts >> 8) & 0xFF;
 
-    output.VisibleClusterIndex = instanceID + clusterOffset;  // Global index into VisibleClusters
+    output.VisibleClusterIndex = originalIndex;
     output.TriangleID = vertexID / 3;
 
     if (vertexID >= triCount * 3)

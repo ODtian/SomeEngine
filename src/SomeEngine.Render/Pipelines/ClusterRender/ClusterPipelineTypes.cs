@@ -1,0 +1,310 @@
+using System.Numerics;
+using Diligent;
+using SomeEngine.Render.Graph;
+using SomeEngine.Render.Systems;
+
+namespace SomeEngine.Render.Pipelines;
+
+// ────────────────────────────────────────────────────────────
+//  Output types (Stage 产出 — positional records 支持解构)
+// ────────────────────────────────────────────────────────────
+
+/// <summary>
+/// Upload Stage 产出：全局共享的 GPU 资源 Handle。
+/// 所有 View/Pass 共享同一份。
+/// </summary>
+public readonly record struct ClusterGlobalResources(
+    RenderGraphHandle GlobalBVH,
+    RenderGraphHandle PageHeap,
+    RenderGraphHandle GlobalTransform,
+    RenderGraphHandle GlobalInstanceHeader,
+    RenderGraphHandle InstanceDataHeap,
+    RenderGraphHandle CullingUniforms,
+    RenderGraphHandle DrawUniforms,
+    RenderGraphHandle BinningUniforms,
+    RenderGraphHandle CopyUniforms
+);
+
+/// <summary>
+/// BVH Traverse Stage 产出：候选 Cluster 列表。
+/// </summary>
+public readonly record struct ClusterTraverseOutput(
+    RenderGraphHandle CandidateClusters,
+    RenderGraphHandle CandidateArgs,
+    RenderGraphHandle CandidateCount,
+    RenderGraphHandle Phase2IndirectDrawArgs,
+    RenderGraphHandle ZeroOffsetBuffer
+);
+
+/// <summary>
+/// Cull Stage 产出：可见 Cluster 列表 + 间接绘制参数。
+/// </summary>
+public readonly record struct ClusterCullOutput(
+    RenderGraphHandle VisibleClusters,
+    RenderGraphHandle DrawArgs,
+    RenderGraphHandle Phase2DrawArgs,
+    RenderGraphHandle HiZ,
+    RenderGraphHandle Phase2CandidateCount,
+    RenderGraphHandle Phase2CandidateClusters,
+    RenderGraphHandle Phase2CandidateArgs,
+    RenderGraphHandle DebugHiZOutput
+);
+
+/// <summary>
+/// Raster Binning Stage 产出：按 RasterBinKey 分组的 Cluster 索引。
+/// </summary>
+public readonly record struct ClusterRasterBinOutput(
+    RenderGraphHandle BinnedClusterIndex,
+    RenderGraphHandle BinnedDrawArgs,
+    RenderGraphHandle RasterBinMeta,
+    RenderGraphHandle BinningDispatchArgs
+);
+
+/// <summary>
+/// Draw/Rasterize Stage 产出：VisBuffer 和深度。
+/// </summary>
+public readonly record struct ClusterRasterOutput(
+    RenderGraphHandle VisBuffer,
+    RenderGraphHandle DepthTarget
+);
+
+/// <summary>
+/// Shade Binning Stage 产出：按 MaterialID 分组的像素坐标。
+/// </summary>
+public readonly record struct ClusterShadeBinOutput(
+    RenderGraphHandle PixelCoordBuffer,
+    RenderGraphHandle BinOffsets,
+    RenderGraphHandle BinCounts,
+    RenderGraphHandle BinIndirectArgs
+);
+
+/// <summary>
+/// Material Shade Stage 产出：着色后颜色。
+/// </summary>
+public readonly record struct ClusterShadeOutput(
+    RenderGraphHandle OutputColor
+);
+
+// ────────────────────────────────────────────────────────────
+//  Config types (init 属性 + 预设工厂 + with 支持)
+// ────────────────────────────────────────────────────────────
+
+/// <summary>
+/// Upload Stage 配置。
+/// </summary>
+public readonly record struct ClusterUploadConfig
+{
+    public Matrix4x4 View { get; init; }
+    public Matrix4x4 Proj { get; init; }
+    public Vector3 CameraPos { get; init; }
+    public float LodThreshold { get; init; }
+    public float LodScale { get; init; }
+    public int ForcedLODLevel { get; init; }
+    public bool BypassCulling { get; init; }
+    public uint DebugMode { get; init; }
+    public uint ScreenWidth { get; init; }
+    public uint ScreenHeight { get; init; }
+
+    /// <summary>HiZ 相关参数（由 CullStage 跨帧状态提供）。</summary>
+    public Matrix4x4 PrevViewProj { get; init; }
+    public Matrix4x4 PrevView { get; init; }
+    public Matrix4x4 PrevProj { get; init; }
+    public bool HasPrevHistory { get; init; }
+    public uint HiZMipCount { get; init; }
+    public Vector2 HiZInvSize { get; init; }
+
+    /// <summary>是否 dump 当前帧调试数据。</summary>
+    public bool DumpNextFrame { get; init; }
+    public bool DebugShowHiZAABBs { get; init; }
+
+    public static ClusterUploadConfig Default(
+        Matrix4x4 view, Matrix4x4 proj, Vector3 cameraPos,
+        uint screenWidth, uint screenHeight
+    ) => new()
+    {
+        View = view,
+        Proj = proj,
+        CameraPos = cameraPos,
+        LodThreshold = 1.0f,
+        LodScale = 500.0f,
+        ForcedLODLevel = -1,
+        ScreenWidth = screenWidth,
+        ScreenHeight = screenHeight,
+        PrevViewProj = Matrix4x4.Identity,
+        PrevView = Matrix4x4.Identity,
+        PrevProj = Matrix4x4.Identity,
+    };
+}
+
+/// <summary>
+/// BVH Traverse Stage 配置。
+/// </summary>
+public readonly record struct ClusterTraverseConfig
+{
+    /// <summary>BVH 最大遍历深度。</summary>
+    public int MaxDepth { get; init; }
+
+    /// <summary>自定义输出 Handle。Invalid = 自动创建。</summary>
+    public RenderGraphHandle OutputCandidateClusters { get; init; }
+    public RenderGraphHandle OutputCandidateArgs { get; init; }
+    public RenderGraphHandle OutputCandidateCount { get; init; }
+
+    public static ClusterTraverseConfig Default() => new()
+    {
+        MaxDepth = 12,
+    };
+}
+
+/// <summary>
+/// Cull Stage 配置。
+/// </summary>
+public readonly record struct ClusterCullConfig
+{
+    public HiZDebugMode HiZMode { get; init; }
+
+    /// <summary>自定义输出 Handle。Invalid = 自动创建。</summary>
+    public RenderGraphHandle OutputVisibleClusters { get; init; }
+    public RenderGraphHandle OutputDrawArgs { get; init; }
+
+    public static ClusterCullConfig Default() => new()
+    {
+        HiZMode = HiZDebugMode.Full2Phase,
+    };
+}
+
+/// <summary>
+/// Raster Binning Stage 配置。
+/// </summary>
+public readonly record struct ClusterRasterBinConfig
+{
+    public uint MaxBins { get; init; }
+    public uint MaxClustersPerBin { get; init; }
+
+    /// <summary>自定义输出 Handle。Invalid = 自动创建。</summary>
+    public RenderGraphHandle OutputBinnedClusterIndex { get; init; }
+    public RenderGraphHandle OutputBinnedDrawArgs { get; init; }
+
+    public static ClusterRasterBinConfig Default() => new()
+    {
+        MaxBins = 16,
+#pragma warning disable CS0618 // Legacy shared capacity constant is still the current canonical limit
+        MaxClustersPerBin = ClusterRenderFeature.MaxDraws / 16,
+#pragma warning restore CS0618
+    };
+}
+
+/// <summary>
+/// Draw/Rasterize Stage 配置。
+/// </summary>
+public readonly record struct ClusterDrawConfig
+{
+    /// <summary>写入哪个 VisBuffer。Invalid = 自动创建。</summary>
+    public RenderGraphHandle OutputVisBuffer { get; init; }
+
+    /// <summary>写入哪个 Depth。Invalid = 自动创建。</summary>
+    public RenderGraphHandle OutputDepth { get; init; }
+
+    /// <summary>
+    /// Draw request 元数据缓冲。当前架构下用于传入可见 cluster 读取基址等扩展信息。
+    /// Invalid = Stage 内部回退为 0 偏移缓冲。
+    /// </summary>
+    public RenderGraphHandle VisibleClusterMeta { get; init; }
+
+    /// <summary>是否写深度。false = 透明模式（只读深度测试）。</summary>
+    public bool DepthWrite { get; init; }
+
+    /// <summary>Draw 前是否 clear 目标。</summary>
+    public bool ClearTargets { get; init; }
+
+    /// <summary>
+    /// 绘制哪个 Raster Bin。-1 = 所有 bin（使用未 binned 的 DrawArgs），≥0 = 特定 bin。
+    /// </summary>
+    public int BinIndex { get; init; }
+
+    /// <summary>是否使用 VisBuffer 模式（R32_UInt）。false = forward shading color RT。</summary>
+    public bool UseVisBuffer { get; init; }
+
+    /// <summary>Debug 模式标志。</summary>
+    public bool Wireframe { get; init; }
+    public bool Overdraw { get; init; }
+    public ClusterDebugMode DebugMode { get; init; }
+
+    /// <summary>资源命名前缀（用于区分多个 Draw 实例的 RG 资源名）。</summary>
+    public string? Tag { get; init; }
+
+    public static ClusterDrawConfig Opaque() => new()
+    {
+        DepthWrite = true,
+        ClearTargets = true,
+        BinIndex = -1,
+        UseVisBuffer = true,
+    };
+
+    public static ClusterDrawConfig Transparent(RenderGraphHandle opaqueDepth) => new()
+    {
+        OutputDepth = opaqueDepth,
+        DepthWrite = false,
+        ClearTargets = true,
+        BinIndex = -1,
+        UseVisBuffer = true,
+        Tag = "Transparent",
+    };
+
+    public static ClusterDrawConfig DepthOnly() => new()
+    {
+        DepthWrite = true,
+        ClearTargets = true,
+        BinIndex = -1,
+        UseVisBuffer = false,
+    };
+}
+
+/// <summary>
+/// Shade Binning Stage 配置。
+/// </summary>
+public readonly record struct ClusterShadeBinConfig
+{
+    /// <summary>自定义输出 Handle。Invalid = 自动创建。</summary>
+    public RenderGraphHandle OutputPixelCoordBuffer { get; init; }
+
+    public static ClusterShadeBinConfig Default() => new();
+}
+
+/// <summary>
+/// Material Shade Stage 配置。
+/// </summary>
+public readonly record struct ClusterShadeConfig
+{
+    /// <summary>输出目标。Invalid = 自动创建 ResolveTarget。</summary>
+    public RenderGraphHandle OutputColor { get; init; }
+
+    /// <summary>是否将结果 copy 到 BackBuffer。</summary>
+    public bool CopyToBackBuffer { get; init; }
+
+    /// <summary>BackBuffer handle（仅 CopyToBackBuffer=true 时使用）。</summary>
+    public RenderGraphHandle BackBuffer { get; init; }
+
+    /// <summary>是否为 resolve-only debug 模式（ClusterID/LOD 可视化）。</summary>
+    public bool UseResolveDebug { get; init; }
+    public uint DebugMode { get; init; }
+
+    // ─── Shade Uniform 参数 ───
+    public Matrix4x4 ViewProj { get; init; }
+    public Matrix4x4 View { get; init; }
+    public uint PageTableSize { get; init; }
+    public Vector3 QuantOrigin { get; init; }
+    public float QuantStep { get; init; }
+    public Vector3 LightDir { get; init; }
+    public float LightIntensity { get; init; }
+    public Vector3 AmbientColor { get; init; }
+    public Vector3 CameraPos { get; init; }
+
+    public static ClusterShadeConfig Default(RenderGraphHandle backBuffer) => new()
+    {
+        CopyToBackBuffer = true,
+        BackBuffer = backBuffer,
+        LightDir = Vector3.Normalize(new Vector3(0.5f, 1.0f, 0.3f)),
+        LightIntensity = 1.0f,
+        AmbientColor = new Vector3(0.15f, 0.15f, 0.15f),
+    };
+}
