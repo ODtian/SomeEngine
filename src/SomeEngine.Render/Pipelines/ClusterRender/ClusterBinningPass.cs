@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using Diligent;
 using SomeEngine.Assets.Importers;
@@ -18,89 +19,91 @@ public struct BinningUniforms
 }
 
 /// <summary>
-/// Owns PSOs/SRBs for 3 binning kernels: CSBinningPrepare, CSBinningInit, CSBinning.
-/// Must be split into 2 separate RG passes (via sub-pass wrappers) for proper UAV barriers:
-///   InitPass: CSBinningPrepare + CSBinningInit
-///   ScatterPass: CSBinning (DispatchComputeIndirect)
+/// Binning PSO/SRB 的 static 缓存容器。
+/// PSO 编译一次，SRB 通过 ConcurrentBag pool 管理。
 /// </summary>
-public class ClusterBinningPass(
-    RenderContext context,
-    string passName = "ClusterBinning"
-) : IDisposable
+public static class ClusterBinningPSOs
 {
-    public string PassName { get; } = passName;
-    private ShaderAsset? _shaderAsset;
-    internal IPipelineState? PreparePSO;
-    internal IShaderResourceBinding? PrepareSRB;
-    internal IPipelineState? InitPSO;
-    internal IShaderResourceBinding? InitSRB;
-    internal IPipelineState? BinPSO;
-    internal IShaderResourceBinding? BinSRB;
-    internal RenderContext Context => context;
-    private bool _initialized;
+    internal static IPipelineState? PreparePSO;
+    internal static IPipelineState? InitPSO;
+    internal static IPipelineState? BinPSO;
 
-    public void Init()
+    internal static readonly ConcurrentBag<IShaderResourceBinding> PrepareSRBPool = [];
+    internal static readonly ConcurrentBag<IShaderResourceBinding> InitSRBPool = [];
+    internal static readonly ConcurrentBag<IShaderResourceBinding> BinSRBPool = [];
+
+    private static bool s_initialized;
+    private static readonly Lock s_initLock = new();
+
+    internal static void EnsureInitialized(RenderContext context)
     {
-        if (_initialized) return;
-        var device = context.Device;
-        if (device == null) return;
-
-        string path = Path.GetFullPath(
-            Path.Combine(
-                AppContext.BaseDirectory,
-                "../../../../../../assets/Shaders/cluster_binning.slang"
-            )
-        );
-        _shaderAsset = SlangShaderImporter.Import(path);
-
-        var layoutDesc = new PipelineResourceLayoutDesc
+        if (s_initialized) return;
+        lock (s_initLock)
         {
-            DefaultVariableType = ShaderResourceVariableType.Dynamic,
-        };
+            if (s_initialized) return;
+            var device = context.Device;
+            if (device == null) return;
 
-        using var csPrepare = _shaderAsset.CreateShader(context, "CSBinningPrepare");
-        PreparePSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
-        {
-            PSODesc = new PipelineStateDesc
+            string path = Path.GetFullPath(
+                Path.Combine(
+                    AppContext.BaseDirectory,
+                    "../../../../../../assets/Shaders/cluster_binning.slang"
+                )
+            );
+            var shaderAsset = SlangShaderImporter.Import(path);
+
+            var layoutDesc = new PipelineResourceLayoutDesc
             {
-                Name = "Cluster Binning Prepare PSO",
-                PipelineType = PipelineType.Compute,
-                ResourceLayout = layoutDesc,
-            },
-            Cs = csPrepare,
-        });
-        if (PreparePSO != null) PrepareSRB = PreparePSO.CreateShaderResourceBinding(false);
+                DefaultVariableType = ShaderResourceVariableType.Dynamic,
+            };
 
-        using var csInit = _shaderAsset.CreateShader(context, "CSBinningInit");
-        InitPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
-        {
-            PSODesc = new PipelineStateDesc
+            using var csPrepare = shaderAsset.CreateShader(context, "CSBinningPrepare");
+            PreparePSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
-                Name = "Cluster Binning Init PSO",
-                PipelineType = PipelineType.Compute,
-                ResourceLayout = layoutDesc,
-            },
-            Cs = csInit,
-        });
-        if (InitPSO != null) InitSRB = InitPSO.CreateShaderResourceBinding(false);
+                PSODesc = new PipelineStateDesc
+                {
+                    Name = "Cluster Binning Prepare PSO",
+                    PipelineType = PipelineType.Compute,
+                    ResourceLayout = layoutDesc,
+                },
+                Cs = csPrepare,
+            });
 
-        using var csBin = _shaderAsset.CreateShader(context, "CSBinning");
-        BinPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
-        {
-            PSODesc = new PipelineStateDesc
+            using var csInit = shaderAsset.CreateShader(context, "CSBinningInit");
+            InitPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
-                Name = "Cluster Binning Scatter PSO",
-                PipelineType = PipelineType.Compute,
-                ResourceLayout = layoutDesc,
-            },
-            Cs = csBin,
-        });
-        if (BinPSO != null) BinSRB = BinPSO.CreateShaderResourceBinding(false);
+                PSODesc = new PipelineStateDesc
+                {
+                    Name = "Cluster Binning Init PSO",
+                    PipelineType = PipelineType.Compute,
+                    ResourceLayout = layoutDesc,
+                },
+                Cs = csInit,
+            });
 
-        _initialized = true;
+            using var csBin = shaderAsset.CreateShader(context, "CSBinning");
+            BinPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
+            {
+                PSODesc = new PipelineStateDesc
+                {
+                    Name = "Cluster Binning Scatter PSO",
+                    PipelineType = PipelineType.Compute,
+                    ResourceLayout = layoutDesc,
+                },
+                Cs = csBin,
+            });
+
+            s_initialized = true;
+        }
     }
 
-    internal void BindSRB(
+    internal static IShaderResourceBinding RentSRB(IPipelineState pso, ConcurrentBag<IShaderResourceBinding> pool)
+        => pool.TryTake(out var srb) ? srb : pso.CreateShaderResourceBinding(false);
+
+    internal static void ReturnSRB(IShaderResourceBinding srb, ConcurrentBag<IShaderResourceBinding> pool)
+        => pool.Add(srb);
+
+    internal static void BindSRB(
         IShaderResourceBinding srb,
         IBuffer? uniforms, IBuffer? visible, IBuffer? headers, IBuffer? drawArgs, IBuffer? offsetArgs,
         IBuffer? meta, IBuffer? binned, IBuffer? binnedDraw, IBuffer? dispatchArgs)
@@ -133,30 +136,18 @@ public class ClusterBinningPass(
             srb.GetVariableByName(ShaderType.Compute, "BinningDispatchArgs")
                 ?.Set(dispatchArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
     }
-
-    public void Dispose()
-    {
-        PrepareSRB?.Dispose();
-        PreparePSO?.Dispose();
-        InitSRB?.Dispose();
-        InitPSO?.Dispose();
-        BinSRB?.Dispose();
-        BinPSO?.Dispose();
-    }
 }
 
 /// <summary>
 /// RG Pass 1: CSBinningPrepare (writes DispatchArgs) + CSBinningInit (clears bin metadata).
+/// Lightweight — PSO/SRB from static cache.
 /// </summary>
-internal sealed class ClusterBinningInitPass(ClusterBinningPass parent) : IRenderGraphPass
+internal sealed class ClusterBinningInitPass(RenderContext context) : IRenderGraphPass
 {
-    public string Name { get; } = parent.PassName + " Init";
+    public string Name => "ClusterBinning Init";
 
-    // Input
     public RenderGraphHandle HBinningUniforms = RenderGraphHandle.Invalid;
     public RenderGraphHandle HDrawArgs = RenderGraphHandle.Invalid;
-
-    // Output (written by Prepare + Init)
     public RenderGraphHandle HBinningDispatchArgs = RenderGraphHandle.Invalid;
     public RenderGraphHandle HRasterBinMeta = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinnedDrawArgs = RenderGraphHandle.Invalid;
@@ -172,65 +163,57 @@ internal sealed class ClusterBinningInitPass(ClusterBinningPass parent) : IRende
 
     public void Execute(RenderGraphContext rgCtx)
     {
-        var ctx = parent.Context.ImmediateContext;
+        ClusterBinningPSOs.EnsureInitialized(context);
+        var ctx = context.ImmediateContext;
         if (ctx == null) return;
 
         var uniformBuf = rgCtx.GetBuffer(HBinningUniforms);
         var drawArgsBuf = rgCtx.GetBuffer(HDrawArgs);
         var dispatchArgsBuf = rgCtx.GetBuffer(HBinningDispatchArgs);
+        if (uniformBuf == null || drawArgsBuf == null || dispatchArgsBuf == null) return;
 
-        if (uniformBuf == null || drawArgsBuf == null || dispatchArgsBuf == null)
-            return;
-
-        // CSBinningPrepare: compute DispatchIndirect args (always runs)
-        parent.BindSRB(parent.PrepareSRB!,
+        // CSBinningPrepare
+        var prepareSRB = ClusterBinningPSOs.RentSRB(ClusterBinningPSOs.PreparePSO!, ClusterBinningPSOs.PrepareSRBPool);
+        ClusterBinningPSOs.BindSRB(prepareSRB,
             uniformBuf, null, null, drawArgsBuf, null,
             null, null, null, dispatchArgsBuf);
-        ctx.SetPipelineState(parent.PreparePSO!);
-        ctx.CommitShaderResources(parent.PrepareSRB!, ResourceStateTransitionMode.Verify);
-        ctx.DispatchCompute(new DispatchComputeAttribs
-        {
-            ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1,
-        });
+        ctx.SetPipelineState(ClusterBinningPSOs.PreparePSO!);
+        ctx.CommitShaderResources(prepareSRB, ResourceStateTransitionMode.Verify);
+        ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
+        ClusterBinningPSOs.ReturnSRB(prepareSRB, ClusterBinningPSOs.PrepareSRBPool);
 
-        // CSBinningInit: clear per-bin metadata + draw args
+        // CSBinningInit
         var metaBuf = rgCtx.GetBuffer(HRasterBinMeta);
         var binnedDrawBuf = rgCtx.GetBuffer(HBinnedDrawArgs);
         if (metaBuf == null || binnedDrawBuf == null) return;
 
-        parent.BindSRB(parent.InitSRB!,
+        var initSRB = ClusterBinningPSOs.RentSRB(ClusterBinningPSOs.InitPSO!, ClusterBinningPSOs.InitSRBPool);
+        ClusterBinningPSOs.BindSRB(initSRB,
             uniformBuf, null, null, null, null,
             metaBuf, null, binnedDrawBuf, null);
-        ctx.SetPipelineState(parent.InitPSO!);
-        ctx.CommitShaderResources(parent.InitSRB!, ResourceStateTransitionMode.Verify);
-        ctx.DispatchCompute(new DispatchComputeAttribs
-        {
-            ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1,
-        });
+        ctx.SetPipelineState(ClusterBinningPSOs.InitPSO!);
+        ctx.CommitShaderResources(initSRB, ResourceStateTransitionMode.Verify);
+        ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
+        ClusterBinningPSOs.ReturnSRB(initSRB, ClusterBinningPSOs.InitSRBPool);
     }
 }
 
 /// <summary>
 /// RG Pass 2: CSBinning (DispatchComputeIndirect).
-/// RenderGraph inserts UAV barriers (BinningDispatchArgs→IndirectArg, BinMeta/BinnedDrawArgs UAV→UAV).
+/// Lightweight — PSO/SRB from static cache.
 /// </summary>
-internal sealed class ClusterBinningScatterPass(ClusterBinningPass parent) : IRenderGraphPass
+internal sealed class ClusterBinningScatterPass(RenderContext context) : IRenderGraphPass
 {
-    public string Name { get; } = parent.PassName + " Scatter";
+    public string Name => "ClusterBinning Scatter";
 
-    // Input
     public RenderGraphHandle HBinningUniforms = RenderGraphHandle.Invalid;
     public RenderGraphHandle HVisibleClusters = RenderGraphHandle.Invalid;
     public RenderGraphHandle HInstanceHeaders = RenderGraphHandle.Invalid;
     public RenderGraphHandle HDrawArgs = RenderGraphHandle.Invalid;
     public RenderGraphHandle HClusterReadOffsetArgs = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinningDispatchArgs = RenderGraphHandle.Invalid;
-
-    // Read+Write (atomics)
     public RenderGraphHandle HRasterBinMeta = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinnedDrawArgs = RenderGraphHandle.Invalid;
-
-    // Output
     public RenderGraphHandle HBinnedClusterBuffer = RenderGraphHandle.Invalid;
 
     public void Setup(RenderGraphBuilder builder)
@@ -249,8 +232,9 @@ internal sealed class ClusterBinningScatterPass(ClusterBinningPass parent) : IRe
 
     public void Execute(RenderGraphContext rgCtx)
     {
-        var ctx = parent.Context.ImmediateContext;
-        if (ctx == null || parent.BinPSO == null || parent.BinSRB == null) return;
+        ClusterBinningPSOs.EnsureInitialized(context);
+        var ctx = context.ImmediateContext;
+        if (ctx == null || ClusterBinningPSOs.BinPSO == null) return;
 
         var uniformBuf = rgCtx.GetBuffer(HBinningUniforms);
         var visibleBuf = rgCtx.GetBuffer(HVisibleClusters);
@@ -267,15 +251,17 @@ internal sealed class ClusterBinningScatterPass(ClusterBinningPass parent) : IRe
             || metaBuf == null || binnedDrawBuf == null || binnedBuf == null)
             return;
 
-        parent.BindSRB(parent.BinSRB,
+        var binSRB = ClusterBinningPSOs.RentSRB(ClusterBinningPSOs.BinPSO, ClusterBinningPSOs.BinSRBPool);
+        ClusterBinningPSOs.BindSRB(binSRB,
             uniformBuf, visibleBuf, headerBuf, drawArgsBuf, offsetArgsBuf,
             metaBuf, binnedBuf, binnedDrawBuf, null);
-        ctx.SetPipelineState(parent.BinPSO);
-        ctx.CommitShaderResources(parent.BinSRB, ResourceStateTransitionMode.Verify);
+        ctx.SetPipelineState(ClusterBinningPSOs.BinPSO);
+        ctx.CommitShaderResources(binSRB, ResourceStateTransitionMode.Verify);
         ctx.DispatchComputeIndirect(new DispatchComputeIndirectAttribs
         {
             AttribsBuffer = dispatchArgsBuf,
             AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
         });
+        ClusterBinningPSOs.ReturnSRB(binSRB, ClusterBinningPSOs.BinSRBPool);
     }
 }

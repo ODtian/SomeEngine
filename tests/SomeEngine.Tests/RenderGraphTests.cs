@@ -493,11 +493,11 @@ public class RenderGraphTests
         );
         var placements = placementsField!.GetValue(graph) as System.Array;
 
-        var indexField = typeof(RenderGraphHandle).GetField(
+        var indexProp = typeof(RenderGraphHandle).GetProperty(
             "Index",
             BindingFlags.NonPublic | BindingFlags.Instance
         );
-        int index = (int)indexField!.GetValue(handle)!;
+        int index = (int)indexProp!.GetValue(handle)!;
 
         if (placements == null || index >= placements.Length)
             return ulong.MaxValue;

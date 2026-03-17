@@ -1,4 +1,7 @@
 using System;
+using System.IO;
+using System.Collections.Concurrent;
+using System.Threading;
 using Diligent;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Assets.Schema;
@@ -7,13 +10,54 @@ using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Pipelines;
 
-public class ClusterResolvePass(RenderContext context) : IRenderGraphPass, IDisposable
+internal static class ClusterResolvePSOs
+{
+    internal static IPipelineState? PSO;
+    internal static readonly ConcurrentBag<IShaderResourceBinding> SRBPool = [];
+    private static bool s_initialized;
+    private static readonly Lock s_initLock = new();
+
+    internal static void EnsureInitialized(RenderContext context)
+    {
+        if (s_initialized) return;
+        lock (s_initLock)
+        {
+            if (s_initialized) return;
+            var device = context.Device;
+            if (device == null) return;
+
+            string path = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/cluster_resolve.slang"));
+            var shaderAsset = SlangShaderImporter.Import(path);
+            using var cs = shaderAsset.CreateShader(context, "CSResolve");
+
+            PSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
+            {
+                PSODesc = new PipelineStateDesc
+                {
+                    Name = "Cluster Resolve PSO",
+                    PipelineType = PipelineType.Compute,
+                    ResourceLayout = new PipelineResourceLayoutDesc { DefaultVariableType = ShaderResourceVariableType.Dynamic },
+                },
+                Cs = cs,
+            });
+
+            s_initialized = true;
+        }
+    }
+
+    internal static IShaderResourceBinding RentSRB()
+    {
+        if (PSO == null) throw new InvalidOperationException("PSO is not initialized.");
+        return SRBPool.TryTake(out var srb) ? srb : PSO.CreateShaderResourceBinding(false);
+    }
+
+    internal static void ReturnSRB(IShaderResourceBinding srb) => SRBPool.Add(srb);
+}
+
+public class ClusterResolvePass : IRenderGraphPass, IDisposable
 {
     public string Name => "Cluster Resolve";
-    private ShaderAsset? _shaderAsset;
-    private IPipelineState? _pso;
-    private IShaderResourceBinding? _srb;
-    private bool _initialized;
+    private readonly RenderContext _context;
 
     public RenderGraphHandle HVisBuffer = RenderGraphHandle.Invalid;
     public RenderGraphHandle HDepthTarget = RenderGraphHandle.Invalid;
@@ -23,43 +67,13 @@ public class ClusterResolvePass(RenderContext context) : IRenderGraphPass, IDisp
     public RenderGraphHandle HDrawUniforms = RenderGraphHandle.Invalid;
     public RenderGraphHandle HColorTarget = RenderGraphHandle.Invalid;
 
-    public void Init()
+    public ClusterResolvePass(RenderContext context)
     {
-        if (_initialized)
-            return;
-        var device = context.Device;
-        if (device == null)
-            return;
-
-        string path = Path.GetFullPath(
-            Path.Combine(
-                AppContext.BaseDirectory,
-                "../../../../../../assets/Shaders/cluster_resolve.slang"
-            )
-        );
-        _shaderAsset = SlangShaderImporter.Import(path);
-        using var cs = _shaderAsset.CreateShader(context, "CSResolve");
-
-        var ci = new ComputePipelineStateCreateInfo()
-        {
-            PSODesc = new PipelineStateDesc()
-            {
-                Name = "Cluster Resolve PSO",
-                PipelineType = PipelineType.Compute,
-                ResourceLayout = new PipelineResourceLayoutDesc()
-                {
-                    DefaultVariableType = ShaderResourceVariableType.Dynamic,
-                },
-            },
-            Cs = cs,
-        };
-
-        _pso = device.CreateComputePipelineState(ci);
-        if (_pso != null)
-            _srb = _pso.CreateShaderResourceBinding(false);
-
-        _initialized = true;
+        _context = context;
+        ClusterResolvePSOs.EnsureInitialized(context);
     }
+
+    public void Init() => ClusterResolvePSOs.EnsureInitialized(_context);
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -74,11 +88,9 @@ public class ClusterResolvePass(RenderContext context) : IRenderGraphPass, IDisp
 
     public void Execute(RenderGraphContext rgCtx)
     {
-        if (_pso == null || _srb == null)
-            return;
-        var ctx = context.ImmediateContext;
-        if (ctx == null)
-            return;
+        if (ClusterResolvePSOs.PSO == null) return;
+        var ctx = _context.ImmediateContext;
+        if (ctx == null) return;
 
         var visBuffer = rgCtx.GetTexture(HVisBuffer);
         var depthTex = rgCtx.GetTexture(HDepthTarget);
@@ -87,67 +99,47 @@ public class ClusterResolvePass(RenderContext context) : IRenderGraphPass, IDisp
         var drawUniforms = rgCtx.GetBuffer(HDrawUniforms);
         var colorTarget = rgCtx.GetTexture(HColorTarget);
 
-        if (visBuffer == null || visibleClusters == null || pageHeap == null || drawUniforms == null || colorTarget == null)
-            return;
+        if (visBuffer == null || visibleClusters == null || pageHeap == null || drawUniforms == null || colorTarget == null) return;
 
         var visBufferSRV = rgCtx.GetTextureView(HVisBuffer, TextureViewType.ShaderResource);
         var depthSRV = rgCtx.GetTextureView(HDepthTarget, TextureViewType.ShaderResource);
         var colorUAV = rgCtx.GetTextureView(HColorTarget, TextureViewType.UnorderedAccess);
 
-        if (visBufferSRV == null || colorUAV == null)
-            return;
+        if (visBufferSRV == null || colorUAV == null) return;
 
-        var globalTransformView = rgCtx.GetBufferView(
-            HGlobalTransformBuffer,
-            BufferViewType.ShaderResource
-        );
+        var globalTransformView = rgCtx.GetBufferView(HGlobalTransformBuffer, BufferViewType.ShaderResource);
 
-        _srb.GetVariableByName(ShaderType.Compute, "Uniforms")
-            ?.Set(drawUniforms, SetShaderResourceFlags.None);
-        _srb.GetVariableByName(ShaderType.Compute, "VisBuffer")
-            ?.Set(visBufferSRV, SetShaderResourceFlags.None);
+        var srb = ClusterResolvePSOs.RentSRB();
+
+        srb.GetVariableByName(ShaderType.Compute, "Uniforms")?.Set(drawUniforms, SetShaderResourceFlags.None);
+        srb.GetVariableByName(ShaderType.Compute, "VisBuffer")?.Set(visBufferSRV, SetShaderResourceFlags.None);
         if (depthSRV != null)
         {
-            _srb.GetVariableByName(ShaderType.Compute, "DepthBuffer")
-                ?.Set(depthSRV, SetShaderResourceFlags.None);
+            srb.GetVariableByName(ShaderType.Compute, "DepthBuffer")?.Set(depthSRV, SetShaderResourceFlags.None);
         }
-        _srb.GetVariableByName(ShaderType.Compute, "VisibleClusters")
-            ?.Set(
-                visibleClusters.GetDefaultView(BufferViewType.ShaderResource),
-                SetShaderResourceFlags.None
-            );
-        _srb.GetVariableByName(ShaderType.Compute, "PageHeap")
-            ?.Set(
-                pageHeap.GetDefaultView(BufferViewType.ShaderResource),
-                SetShaderResourceFlags.None
-            );
+        srb.GetVariableByName(ShaderType.Compute, "VisibleClusters")?.Set(visibleClusters.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        srb.GetVariableByName(ShaderType.Compute, "PageHeap")?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
         if (globalTransformView != null)
         {
-            _srb.GetVariableByName(ShaderType.Compute, "Instances")
-                ?.Set(globalTransformView, SetShaderResourceFlags.None);
+            srb.GetVariableByName(ShaderType.Compute, "Instances")?.Set(globalTransformView, SetShaderResourceFlags.None);
         }
-        _srb.GetVariableByName(ShaderType.Compute, "OutputColor")
-            ?.Set(colorUAV, SetShaderResourceFlags.None);
+        srb.GetVariableByName(ShaderType.Compute, "OutputColor")?.Set(colorUAV, SetShaderResourceFlags.None);
 
         var desc = colorTarget.GetDesc();
         uint width = desc.Width;
         uint height = desc.Height;
 
-        ctx.SetPipelineState(_pso);
-        ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Verify);
-        ctx.DispatchCompute(
-            new DispatchComputeAttribs
-            {
-                ThreadGroupCountX = (width + 7) / 8,
-                ThreadGroupCountY = (height + 7) / 8,
-                ThreadGroupCountZ = 1,
-            }
-        );
+        ctx.SetPipelineState(ClusterResolvePSOs.PSO);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.DispatchCompute(new DispatchComputeAttribs
+        {
+            ThreadGroupCountX = (width + 7) / 8,
+            ThreadGroupCountY = (height + 7) / 8,
+            ThreadGroupCountZ = 1,
+        });
+
+        ClusterResolvePSOs.ReturnSRB(srb);
     }
 
-    public void Dispose()
-    {
-        _srb?.Dispose();
-        _pso?.Dispose();
-    }
+    public void Dispose() { }
 }

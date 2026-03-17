@@ -18,11 +18,7 @@ public class ClusterPipeline : IRenderFeature
     private readonly ClusterUploadStage _uploadStage;
     private readonly ClusterTraverseStage _traverseStage;
     private readonly ClusterCullStage _cullStage;
-    private readonly ClusterRasterBinStage _rasterBinStage;
-    private readonly ClusterRasterBinStage _rasterBinStageP2;
-    private readonly ClusterDrawStage _drawStageP1;
-    private readonly ClusterDrawStage? _drawStageP2;
-    private readonly ClusterDrawStage? _drawStageTransparent;
+
     private readonly ClusterShadeBinStage _shadeBinStage;
     private readonly ClusterShadeStage _shadeStage;
 
@@ -33,6 +29,8 @@ public class ClusterPipeline : IRenderFeature
 
     // Internal passes owned by Pipeline
     private readonly ClusterStreamer _clusterStreamer;
+    private readonly PingPongHandle _hizPingPong;
+    private HiZDebugMode _prevHiZMode = HiZDebugMode.Full2Phase;
     internal ClusterDebugReadbackPass? _debugReadbackPass;
 
     // ─── Configuration ───
@@ -150,19 +148,14 @@ public class ClusterPipeline : IRenderFeature
         _registry = registry;
         IncludeTransparentPass = includeTransparent;
         _clusterStreamer = new ClusterStreamer(clusterMgr);
+        _hizPingPong = new PingPongHandle();
 
         _uploadStage = new ClusterUploadStage(context, clusterMgr, instanceMgr);
         _traverseStage = new ClusterTraverseStage(context, clusterMgr, instanceMgr);
         _cullStage = new ClusterCullStage(context);
-        _rasterBinStage = new ClusterRasterBinStage(context);
-        _rasterBinStageP2 = new ClusterRasterBinStage(context);
-        _drawStageP1 = new ClusterDrawStage(context, "DrawPhase1");
-        _drawStageP2 = new ClusterDrawStage(context, "DrawPhase2");
+
         _shadeBinStage = new ClusterShadeBinStage(context);
         _shadeStage = new ClusterShadeStage(context, registry);
-
-        if (includeTransparent)
-            _drawStageTransparent = new ClusterDrawStage(context, "DrawTransparent");
     }
 
     // ─── Factory methods ───
@@ -208,11 +201,7 @@ public class ClusterPipeline : IRenderFeature
         _uploadStage.Init();
         _traverseStage.Init();
         _cullStage.Init();
-        _rasterBinStage.Init();
-        _rasterBinStageP2.Init();
-        _drawStageP1.Init();
-        _drawStageP2?.Init();
-        _drawStageTransparent?.Init();
+
         _shadeBinStage.Init();
         _shadeStage.Init();
         _debugReadbackPass = new ClusterDebugReadbackPass(context);
@@ -234,7 +223,37 @@ public class ClusterPipeline : IRenderFeature
         uint screenWidth = _context.SwapChain?.GetDesc().Width ?? 1;
         uint screenHeight = _context.SwapChain?.GetDesc().Height ?? 1;
 
-        _cullStage.UpdateHiZState(screenWidth, screenHeight);
+        // ─── HiZ state (managed by Pipeline via PingPongHandle) ───
+        uint hizWidth = Math.Max(screenWidth, 1);
+        uint hizHeight = Math.Max(screenHeight, 1);
+        uint hizMipCount = ClusterCullStage.CalculateMipCount(hizWidth, hizHeight);
+        var hizInvSize = new Vector2(1.0f / hizWidth, 1.0f / hizHeight);
+
+        // Reset ping-pong history when HiZ mode changes
+        if (HiZMode != _prevHiZMode)
+        {
+            _hizPingPong.Reset();
+            _prevHiZMode = HiZMode;
+        }
+
+        var hCurrHiZ = RenderGraphHandle.Invalid;
+        var hPrevHiZ = RenderGraphHandle.Invalid;
+        bool useHiZ = HiZMode != HiZDebugMode.Legacy && HiZMode != HiZDebugMode.Phase1OnlyPassAll;
+
+        if (useHiZ)
+        {
+            var hizDesc = new TextureDesc
+            {
+                Type = ResourceDimension.Tex2d,
+                Width = hizWidth,
+                Height = hizHeight,
+                MipLevels = hizMipCount,
+                Format = TextureFormat.R32_Float,
+                Usage = Usage.Default,
+                BindFlags = BindFlags.ShaderResource | BindFlags.UnorderedAccess,
+            };
+            _hizPingPong.Prepare(graph, "HiZ", hizDesc, out hCurrHiZ, out hPrevHiZ);
+        }
 
         // Choose active camera (frozen or live)
         var activeView = _freezeCullingCamera ? _frozenView : _view;
@@ -257,37 +276,47 @@ public class ClusterPipeline : IRenderFeature
             PrevViewProj = Matrix4x4.Transpose(_prevViewProjT),
             PrevView = _prevView,
             PrevProj = _prevProj,
-            HasPrevHistory = _cullStage.HasPrevHistory,
-            HiZMipCount = _cullStage.HiZMipCount,
-            HiZInvSize = (_cullStage.HiZWidth > 0 && _cullStage.HiZHeight > 0)
-                ? new Vector2(1.0f / _cullStage.HiZWidth, 1.0f / _cullStage.HiZHeight)
-                : Vector2.Zero,
+            HasPrevHistory = _hizPingPong.HasHistory,
+            HiZMipCount = hizMipCount,
+            HiZInvSize = hizInvSize,
         };
         var globals = _uploadStage.AddPasses(graph, uploadConfig);
         LastGlobalResources = globals;
 
         // ─── Traverse ───
-        _traverseStage.SetFrameData(
-            activeView, activeProj, activeCamPos, activeLodThreshold, activeLodScale, activeForcedLOD,
-            BypassCulling, _prevViewProjT, _cullStage.HasPrevHistory,
-            _cullStage.HiZMipCount,
-            (_cullStage.HiZWidth > 0 && _cullStage.HiZHeight > 0)
-                ? new Vector2(1.0f / _cullStage.HiZWidth, 1.0f / _cullStage.HiZHeight)
-                : Vector2.Zero
-        );
-        var traverseOut = _traverseStage.AddPasses(graph, globals, ClusterTraverseConfig.Default());
+        var traverseOut = _traverseStage.AddPasses(graph, globals, ClusterTraverseConfig.Default(), uploadConfig);
+
+        // ─── Phase2 + utility buffers (owned by Pipeline, not Traverse) ───
+        var hPhase2IndirectDrawArgs = graph.CreateBuffer("Phase2IndirectDrawArgs", new BufferDesc
+        {
+            Size = 256,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
+            Mode = BufferMode.Raw,
+        });
+        var hZeroOffsetBuffer = graph.CreateBuffer("ZeroOffsetBuffer", new BufferDesc
+        {
+            Size = 16,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+            Mode = BufferMode.Raw,
+        });
+        // Clear Phase2 draw args + zero-offset buffer
+        graph.AddPass(new ClusterClearBuffersPass(
+            RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid,
+            RenderGraphHandle.Invalid, RenderGraphHandle.Invalid,
+            hPhase2IndirectDrawArgs, hZeroOffsetBuffer, RenderGraphHandle.Invalid
+        ));
 
         // ─── Cull ───
         var cullConfig = ClusterCullConfig.Default() with { HiZMode = HiZMode };
-        var cullOut = _cullStage.AddPasses(graph, traverseOut, globals, cullConfig, colorTarget, depthTarget, DebugShowHiZAABBs);
+        var cullOut = _cullStage.AddPasses(graph, traverseOut, globals, cullConfig, hCurrHiZ, hPrevHiZ, _hizPingPong.HasHistory, hPhase2IndirectDrawArgs, DebugShowHiZAABBs);
         LastCullOutput = cullOut;
 
         graph.MarkOutput(colorTarget);
-        if (cullOut.HiZ.IsValid)
-            graph.MarkOutput(cullOut.HiZ);
+        if (hCurrHiZ.IsValid)
+            graph.MarkOutput(hCurrHiZ);
 
         // ─── RasterBin Phase1 ───
-        var rasterBinP1 = _rasterBinStage.AddPasses(graph, cullOut, globals,
+        var rasterBinP1 = ClusterRasterBin.AddPasses(graph, _context, cullOut, globals,
             ClusterRasterBinConfig.Default(), cullOut.DrawArgs, cullOut.Phase2DrawArgs);
 
         // ─── Draw Phase1 ───
@@ -296,24 +325,24 @@ public class ClusterPipeline : IRenderFeature
             DebugMode = DebugMode,
             Wireframe = WireframeEnabled,
             Overdraw = OverdrawEnabled,
-            VisibleClusterMeta = traverseOut.ZeroOffsetBuffer,
+            VisibleClusterMeta = hZeroOffsetBuffer,
         };
-        var rasterP1 = _drawStageP1.AddPasses(graph, rasterBinP1, cullOut, globals, drawConfigP1, depthTarget, screenWidth, screenHeight);
+        var rasterP1 = ClusterDraw.AddPasses(graph, _context, rasterBinP1, cullOut, globals, drawConfigP1, depthTarget, screenWidth, screenHeight);
 
         // ─── Phase1 HiZ Build (AFTER Phase1 Draw so depth has real geometry) ───
         if ((HiZMode == HiZDebugMode.Phase1ThenHiZ || HiZMode == HiZDebugMode.Full2Phase)
-            && cullOut.HiZ.IsValid)
+            && hCurrHiZ.IsValid)
         {
-            _cullStage.AddFinalHiZBuild(graph, depthTarget, cullOut.HiZ);
+            _cullStage.AddFinalHiZBuild(graph, depthTarget, hCurrHiZ, hizMipCount);
         }
 
-        if (HiZMode == HiZDebugMode.Full2Phase && cullOut.HiZ.IsValid)
+        if (HiZMode == HiZDebugMode.Full2Phase && hCurrHiZ.IsValid)
         {
             // ─── Phase2 Cull (uses Phase1's HiZ built from real depth) ───
-            _cullStage.AddPhase2Passes(graph, cullOut, globals);
+            _cullStage.AddPhase2Passes(graph, cullOut, globals, hCurrHiZ);
 
             // ─── RasterBin Phase2 ───
-            var rasterBinP2 = _rasterBinStageP2.AddPasses(graph, cullOut, globals,
+            var rasterBinP2 = ClusterRasterBin.AddPasses(graph, _context, cullOut, globals,
                 ClusterRasterBinConfig.Default(), cullOut.Phase2DrawArgs, cullOut.DrawArgs, tag: "P2");
 
             // ─── Draw Phase2 ───
@@ -326,12 +355,12 @@ public class ClusterPipeline : IRenderFeature
                 Wireframe = WireframeEnabled,
                 Overdraw = OverdrawEnabled,
                 Tag = "P2",
-                VisibleClusterMeta = traverseOut.ZeroOffsetBuffer,
+                VisibleClusterMeta = hZeroOffsetBuffer,
             };
-            var rasterP2 = _drawStageP2!.AddPasses(graph, rasterBinP2, cullOut, globals, drawConfigP2, depthTarget, screenWidth, screenHeight);
+            var rasterP2 = ClusterDraw.AddPasses(graph, _context, rasterBinP2, cullOut, globals, drawConfigP2, depthTarget, screenWidth, screenHeight);
 
             // ─── Final HiZ Build (from Phase1+Phase2 depth, for next frame's Phase1) ───
-            _cullStage.AddFinalHiZBuild(graph, depthTarget, cullOut.HiZ);
+            _cullStage.AddFinalHiZBuild(graph, depthTarget, hCurrHiZ, hizMipCount);
 
             LastOpaqueRasterOutput = rasterP2;
         }
@@ -343,15 +372,15 @@ public class ClusterPipeline : IRenderFeature
         LastRasterBinOutput = rasterBinP1;
 
         // ─── Transparent pass (optional) ───
-        if (IncludeTransparentPass && _drawStageTransparent != null)
+        if (IncludeTransparentPass)
         {
             var transparentConfig = ClusterDrawConfig.Transparent(LastOpaqueRasterOutput.DepthTarget) with
             {
                 DebugMode = DebugMode,
-                VisibleClusterMeta = traverseOut.ZeroOffsetBuffer,
+                VisibleClusterMeta = hZeroOffsetBuffer,
             };
-            var transparentRaster = _drawStageTransparent.AddPasses(
-                graph, rasterBinP1, cullOut, globals, transparentConfig,
+            var transparentRaster = ClusterDraw.AddPasses(
+                graph, _context, rasterBinP1, cullOut, globals, transparentConfig,
                 depthTarget, screenWidth, screenHeight);
             LastTransparentRasterOutput = transparentRaster;
         }
@@ -415,6 +444,9 @@ public class ClusterPipeline : IRenderFeature
         _prevView = activeView;
         _prevProj = activeProj;
 
+        if (useHiZ)
+            _hizPingPong.EndFrame();
+
         if (DumpNextFrame) DumpNextFrame = false;
     }
 
@@ -423,11 +455,8 @@ public class ClusterPipeline : IRenderFeature
         _uploadStage.Dispose();
         _traverseStage.Dispose();
         _cullStage.Dispose();
-        _rasterBinStage.Dispose();
-        _rasterBinStageP2.Dispose();
-        _drawStageP1.Dispose();
-        _drawStageP2?.Dispose();
-        _drawStageTransparent?.Dispose();
+
+
         _shadeBinStage.Dispose();
         _shadeStage.Dispose();
         _defaultSampler?.Dispose();

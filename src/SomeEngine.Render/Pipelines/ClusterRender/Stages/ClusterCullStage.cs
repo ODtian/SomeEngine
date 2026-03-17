@@ -17,13 +17,6 @@ public class ClusterCullStage : IDisposable
     private ClusterCullPass? _cullPassPhase1;
     private ClusterCullPass? _cullPassPhase2;
     private ClusterCullUpdateArgsPass? _cullUpdateArgsPassPhase2;
-    private HiZBuildPass? _hizBuildPass;
-
-    // HiZ ping-pong state
-    private bool _pingPong;
-    private bool _hasPrevHistory;
-    private HiZDebugMode _prevHiZMode = HiZDebugMode.Full2Phase;
-    private uint _hizWidth, _hizHeight, _hizMipCount;
 
     private bool _initialized;
 
@@ -44,32 +37,19 @@ public class ClusterCullStage : IDisposable
         _cullPassPhase2.Init();
         _cullUpdateArgsPassPhase2 = new ClusterCullUpdateArgsPass(_context, "CullUpdateArgsPhase2");
         _cullUpdateArgsPassPhase2.Init();
-        _hizBuildPass = new HiZBuildPass(_context);
-        _hizBuildPass.Init();
+
 
         _initialized = true;
     }
 
-    /// <summary>
-    /// 更新 HiZ 尺寸（应在 AddPasses 前调用）。
-    /// </summary>
-    public void UpdateHiZState(uint screenWidth, uint screenHeight)
+    /// <summary>计算纹理的完整 mip 链层数。</summary>
+    public static uint CalculateMipCount(uint width, uint height)
     {
-        if (screenWidth == 0 || screenHeight == 0)
-        {
-            _hizWidth = 1; _hizHeight = 1; _hizMipCount = 1;
-            return;
-        }
-        _hizWidth = screenWidth;
-        _hizHeight = screenHeight;
-        _hizMipCount = CalculateMipCount(screenWidth, screenHeight);
+        uint levels = 1;
+        uint size = Math.Max(width, height);
+        while (size > 1) { size >>= 1; levels++; }
+        return levels;
     }
-
-    /// <summary>HiZ mip 数，供 UploadConfig 引用。</summary>
-    public uint HiZMipCount => _hizMipCount;
-    public uint HiZWidth => _hizWidth;
-    public uint HiZHeight => _hizHeight;
-    public bool HasPrevHistory => _hasPrevHistory;
 
     /// <summary>
     /// 向 RenderGraph 添加 Cull 相关 pass。
@@ -81,14 +61,16 @@ public class ClusterCullStage : IDisposable
         in ClusterTraverseOutput traverse,
         in ClusterGlobalResources globals,
         in ClusterCullConfig config,
-        RenderGraphHandle colorTarget,
-        RenderGraphHandle depthTarget,
+        RenderGraphHandle hCurrHiZ,
+        RenderGraphHandle hPrevHiZ,
+        bool hasPrevHistory,
+        RenderGraphHandle hPhase2IndirectDrawArgs,
         bool debugShowHiZAABBs = false
     )
     {
         if (!_initialized) Init();
 
-        uint maxDraws = ClusterRenderFeature.MaxDraws;
+        uint maxDraws = ClusterLimits.MaxDraws;
 
         // ─── Create cull output buffers ───
         var hVisibleClusters = config.OutputVisibleClusters.IsValid
@@ -110,18 +92,11 @@ public class ClusterCullStage : IDisposable
                 Mode = BufferMode.Raw,
             });
 
-        // Phase2IndirectDrawArgs and ZeroOffsetBuffer are created and cleared by TraverseStage
-        var hPhase2IndirectDrawArgs = traverse.Phase2IndirectDrawArgs;
 
         // ─── HiZ mode management ───
         bool useHiZBuffers = config.HiZMode != HiZDebugMode.Legacy && config.HiZMode != HiZDebugMode.Phase1OnlyPassAll;
         bool useHiZ = useHiZBuffers;
-
-        if (config.HiZMode != _prevHiZMode)
-        {
-            _hasPrevHistory = false;
-            _prevHiZMode = config.HiZMode;
-        }
+        bool hasPrevHistoryValid = useHiZ && hasPrevHistory && hPrevHiZ.IsValid;
 
         // Phase 2 candidate buffers
         var hPhase2CandidateClusters = RenderGraphHandle.Invalid;
@@ -153,33 +128,6 @@ public class ClusterCullStage : IDisposable
             });
         }
 
-        // ─── HiZ textures (always create for RG cache tracking) ───
-        var hCurrHiZ = RenderGraphHandle.Invalid;
-        var hPrevHiZ = RenderGraphHandle.Invalid;
-        bool hasPrevHistoryValid = false;
-
-        if (_hizWidth > 0 && _hizHeight > 0 && _hizMipCount > 0)
-        {
-            var hizDesc = new TextureDesc
-            {
-                Type = ResourceDimension.Tex2d,
-                Width = _hizWidth,
-                Height = _hizHeight,
-                MipLevels = _hizMipCount,
-                Format = TextureFormat.R32_Float,
-                Usage = Usage.Default,
-                BindFlags = BindFlags.ShaderResource | BindFlags.UnorderedAccess,
-            };
-
-            string currName = _pingPong ? "HiZ_A" : "HiZ_B";
-            string prevName = _pingPong ? "HiZ_B" : "HiZ_A";
-            hCurrHiZ = graph.CreateTexture(currName, hizDesc with { Name = currName });
-            hPrevHiZ = graph.CreateTexture(prevName, hizDesc with { Name = prevName });
-            hasPrevHistoryValid = useHiZ && _hasPrevHistory && hPrevHiZ.IsValid;
-
-            if (useHiZ) _pingPong = !_pingPong;
-        }
-
         // ─── Debug HiZ output buffer ───
         var hDebugHiZOutput = graph.CreateBuffer(
             debugShowHiZAABBs ? "DebugHiZOutput" : "DebugHiZOutputDummy",
@@ -192,7 +140,7 @@ public class ClusterCullStage : IDisposable
             }
         );
 
-        var hZeroOffsetBuffer = traverse.ZeroOffsetBuffer;
+
 
         // ─── Clear Phase2 candidate buffers only (Phase2IndirectDrawArgs already cleared by TraverseStage) ───
         if (useHiZBuffers)
@@ -239,9 +187,7 @@ public class ClusterCullStage : IDisposable
             _cullPassLegacy.HDebugHiZOutput = hDebugHiZOutput;
             graph.AddPass(_cullPassLegacy);
 
-            _hasPrevHistory = false;
-
-            return new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, hPhase2IndirectDrawArgs, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, hDebugHiZOutput);
+            return new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, hPhase2IndirectDrawArgs, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, hDebugHiZOutput);
         }
 
         // Phase1 Cull
@@ -259,16 +205,10 @@ public class ClusterCullStage : IDisposable
         _cullPassPhase1.HDebugHiZOutput = hDebugHiZOutput;
         graph.AddPass(_cullPassPhase1);
 
-        // Update history
-        if (config.HiZMode == HiZDebugMode.Phase1Only)
-            _hasPrevHistory = false;
-        else
-            _hasPrevHistory = true;
-
         // NOTE: Phase1 HiZ Build and Phase2 Cull are NOT added here.
         // They must be added by the pipeline AFTER Phase1 Draw so that
         // the HiZ is built from real depth, not the cleared depth buffer.
-        return new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, hPhase2IndirectDrawArgs, hCurrHiZ, hPhase2CandidateCount, hPhase2CandidateClusters, hPhase2CandidateArgs, hDebugHiZOutput);
+        return new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, hPhase2IndirectDrawArgs, hPhase2CandidateCount, hPhase2CandidateClusters, hPhase2CandidateArgs, hDebugHiZOutput);
     }
 
     /// <summary>
@@ -277,7 +217,8 @@ public class ClusterCullStage : IDisposable
     public void AddPhase2Passes(
         RenderGraph graph,
         in ClusterCullOutput cullOut,
-        in ClusterGlobalResources globals)
+        in ClusterGlobalResources globals,
+        RenderGraphHandle hHiZ)
     {
         if (!_initialized) return;
 
@@ -293,7 +234,7 @@ public class ClusterCullStage : IDisposable
         _cullPassPhase2.HVisibleClusters = cullOut.VisibleClusters;
         _cullPassPhase2.HIndirectDrawArgs = cullOut.DrawArgs;
         _cullPassPhase2.HPhase2IndirectDrawArgs = cullOut.Phase2DrawArgs;
-        _cullPassPhase2.HHiZTexture = cullOut.HiZ;
+        _cullPassPhase2.HHiZTexture = hHiZ;
         _cullPassPhase2.HCullingUniforms = globals.CullingUniforms;
         _cullPassPhase2.HGlobalTransformBuffer = globals.GlobalTransform;
         _cullPassPhase2.HPageHeap = globals.PageHeap;
@@ -304,20 +245,13 @@ public class ClusterCullStage : IDisposable
     /// <summary>
     /// 全 HiZ 重建（在 Phase2 Draw 后调用，为下帧 Phase1 准备完整深度）。
     /// </summary>
-    public void AddFinalHiZBuild(RenderGraph graph, RenderGraphHandle depthTarget, RenderGraphHandle hCurrHiZ)
+    public void AddFinalHiZBuild(RenderGraph graph, RenderGraphHandle depthTarget, RenderGraphHandle hCurrHiZ, uint hizMipCount)
     {
-        if (!_initialized || _hizBuildPass == null) return;
-        graph.AddPass(new HiZMip0Pass(_hizBuildPass, depthTarget, hCurrHiZ));
-        for (uint mip = 1; mip < _hizMipCount; mip++)
-            graph.AddPass(new HiZDownsamplePass(_hizBuildPass, hCurrHiZ, mip));
-    }
-
-    private static uint CalculateMipCount(uint width, uint height)
-    {
-        uint levels = 1;
-        uint size = Math.Max(width, height);
-        while (size > 1) { size >>= 1; levels++; }
-        return levels;
+        if (!_initialized) return;
+        HiZBuildPSOs.EnsureInitialized(_context);
+        graph.AddPass(new HiZMip0Pass(_context, depthTarget, hCurrHiZ));
+        for (uint mip = 1; mip < hizMipCount; mip++)
+            graph.AddPass(new HiZDownsamplePass(_context, hCurrHiZ, mip));
     }
 
     public void Dispose()
@@ -326,6 +260,5 @@ public class ClusterCullStage : IDisposable
         _cullPassPhase1?.Dispose();
         _cullPassPhase2?.Dispose();
         _cullUpdateArgsPassPhase2?.Dispose();
-        _hizBuildPass?.Dispose();
     }
 }

@@ -74,3 +74,6 @@ external/lib/
 
 samples/
 *.exe
+
+tools/eos/
+external/dxc/

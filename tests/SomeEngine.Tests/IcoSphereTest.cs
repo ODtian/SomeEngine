@@ -34,6 +34,18 @@ public class IcoSphereTest
         Assert.That(meshAsset.Payload, Is.Not.Null);
         Assert.That(meshAsset.Payload.Value.Length, Is.GreaterThan(0));
 
+        // Verify attribute streams
+        Assert.That(meshAsset.Attributes, Is.Not.Null);
+        Assert.That(meshAsset.Attributes!.Count, Is.EqualTo(3), "Expected 3 attributes: NORMAL, TANGENT, TEXCOORD_0");
+        for (int i = 0; i < meshAsset.Attributes.Count; i++)
+        {
+            var a = meshAsset.Attributes[i];
+            TestContext.Out.WriteLine($"  Attr[{i}] name={a.Name} type={a.Type} comp={a.Components} norm={a.Normalized} streamIdx={a.Offset}");
+        }
+        Assert.That(meshAsset.Attributes[0].Name, Is.EqualTo("NORMAL"));
+        Assert.That(meshAsset.Attributes[1].Name, Is.EqualTo("TANGENT"));
+        Assert.That(meshAsset.Attributes[2].Name, Is.EqualTo("TEXCOORD_0"));
+
         // Save to disk for engine to use
         string outputPath = Path.Combine(
             Directory.GetCurrentDirectory(),

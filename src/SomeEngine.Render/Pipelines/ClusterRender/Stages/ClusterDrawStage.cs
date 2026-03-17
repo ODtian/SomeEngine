@@ -5,35 +5,17 @@ using SomeEngine.Render.RHI;
 namespace SomeEngine.Render.Pipelines;
 
 /// <summary>
-/// Level 1 Stage: Draw/Rasterize — 管理 DrawPass + VisBuffer/Depth 创建。
+/// 无状态 Draw/Rasterize 工具函数。
+/// 每次调用创建轻量 ClusterDrawPass 实例（PSO 在 Pass 内 static 缓存）。
 /// </summary>
-public class ClusterDrawStage : IDisposable
+public static class ClusterDraw
 {
-    private readonly RenderContext _context;
-    private ClusterDrawPass? _drawPass;
-    private bool _initialized;
-
-    public ClusterDrawStage(RenderContext context, string name = "ClusterDraw")
-    {
-        _context = context;
-        _name = name;
-    }
-
-    private readonly string _name;
-
-    public void Init()
-    {
-        if (_initialized) return;
-        _drawPass = new ClusterDrawPass(_context, _name);
-        _drawPass.Init();
-        _initialized = true;
-    }
-
     /// <summary>
     /// 添加 Draw pass，返回 VisBuffer 和 Depth。
     /// </summary>
-    public ClusterRasterOutput AddPasses(
+    public static ClusterRasterOutput AddPasses(
         RenderGraph graph,
+        RenderContext context,
         in ClusterRasterBinOutput rasterBin,
         in ClusterCullOutput cull,
         in ClusterGlobalResources globals,
@@ -43,8 +25,6 @@ public class ClusterDrawStage : IDisposable
         uint screenHeight
     )
     {
-        if (!_initialized) Init();
-
         string tag = config.Tag ?? "";
 
         // ─── Create or reuse output targets ───
@@ -93,8 +73,7 @@ public class ClusterDrawStage : IDisposable
             );
         }
 
-        // ─── Wire DrawPass ───
-        // Fallback: if caller does not provide visible-cluster metadata, use a local zero-offset buffer.
+        // ─── Fallback: create zero-offset buffer if caller didn't provide ───
         if (!hVisibleClusterMeta.IsValid)
         {
             hVisibleClusterMeta = graph.CreateBuffer($"{tag}ZeroOffset", new BufferDesc
@@ -121,30 +100,27 @@ public class ClusterDrawStage : IDisposable
             );
         }
 
-        _drawPass!.HVisibleClusters = rasterBin.BinnedClusterIndex;
-        _drawPass.HVisibleClustersData = cull.VisibleClusters;
-        _drawPass.HIndirectDrawArgs = rasterBin.BinnedDrawArgs;
-        _drawPass.HVisBufferTarget = hVisBuffer;
-        _drawPass.HDepthTarget = hDepth;
-        _drawPass.HDrawUniforms = globals.DrawUniforms;
-        _drawPass.HGlobalTransformBuffer = globals.GlobalTransform;
-        _drawPass.HPageHeap = globals.PageHeap;
-        _drawPass.HVisibleClusterMeta = hVisibleClusterMeta;
-        _drawPass.BinIndex = config.BinIndex;
-        _drawPass.SetFrameData(
+        // ─── Create lightweight pass instance (PSO is static-cached inside) ───
+        var drawPass = new ClusterDrawPass(context, $"{tag}ClusterDraw");
+        drawPass.HVisibleClusters = rasterBin.BinnedClusterIndex;
+        drawPass.HVisibleClustersData = cull.VisibleClusters;
+        drawPass.HIndirectDrawArgs = rasterBin.BinnedDrawArgs;
+        drawPass.HVisBufferTarget = hVisBuffer;
+        drawPass.HDepthTarget = hDepth;
+        drawPass.HDrawUniforms = globals.DrawUniforms;
+        drawPass.HGlobalTransformBuffer = globals.GlobalTransform;
+        drawPass.HPageHeap = globals.PageHeap;
+        drawPass.HVisibleClusterMeta = hVisibleClusterMeta;
+        drawPass.BinIndex = config.BinIndex;
+        drawPass.SetFrameData(
             config.DebugMode,
             config.Wireframe,
             config.Overdraw,
             config.UseVisBuffer,
             config.DepthWrite
         );
-        graph.AddPass(_drawPass);
+        graph.AddPass(drawPass);
 
         return new ClusterRasterOutput(hVisBuffer, hDepth);
-    }
-
-    public void Dispose()
-    {
-        _drawPass?.Dispose();
     }
 }

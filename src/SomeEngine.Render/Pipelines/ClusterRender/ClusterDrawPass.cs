@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using Diligent;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Assets.Schema;
@@ -14,23 +15,163 @@ public class ClusterDrawPass(
 ) : IRenderGraphPass, IDisposable
 {
     public string Name { get; } = passName;
-    private ShaderAsset? _drawAsset;
-    private IPipelineState? _drawPSO;
-    private IPipelineState? _drawWireframePSO;
-    private IPipelineState? _drawOverdrawPSO;
-    private IPipelineState? _drawDepthOnlyPSO;
-    private IPipelineState? _drawVisBufferPSO;
-    private IPipelineState? _drawVisBufferTransparentPSO;
-    private IShaderResourceBinding? _drawSRB;
-    private IShaderResourceBinding? _drawWireframeSRB;
-    private IShaderResourceBinding? _drawOverdrawSRB;
-    private IShaderResourceBinding? _drawDepthOnlySRB;
-    private IShaderResourceBinding? _drawVisBufferSRB;
-    private IShaderResourceBinding? _drawVisBufferTransparentSRB;
-    private bool _initialized;
 
+    // ═══════════════════════════════════════════════════════════════
+    //  Static: PSO（编译一次） + SRB Pool（per-PSO，支持未来多线程）
+    // ═══════════════════════════════════════════════════════════════
+    private static IPipelineState? s_drawPSO;
+    private static IPipelineState? s_drawWireframePSO;
+    private static IPipelineState? s_drawOverdrawPSO;
+    private static IPipelineState? s_drawDepthOnlyPSO;
+    private static IPipelineState? s_drawVisBufferPSO;
+    private static IPipelineState? s_drawVisBufferTransparentPSO;
+
+    private static readonly ConcurrentBag<IShaderResourceBinding> s_drawSRBPool = [];
+    private static readonly ConcurrentBag<IShaderResourceBinding> s_wireframeSRBPool = [];
+    private static readonly ConcurrentBag<IShaderResourceBinding> s_overdrawSRBPool = [];
+    private static readonly ConcurrentBag<IShaderResourceBinding> s_depthOnlySRBPool = [];
+    private static readonly ConcurrentBag<IShaderResourceBinding> s_visBufferSRBPool = [];
+    private static readonly ConcurrentBag<IShaderResourceBinding> s_visBufferTransparentSRBPool = [];
+
+    private static bool s_initialized;
+    private static readonly Lock s_initLock = new();
+
+    private static IShaderResourceBinding RentSRB(IPipelineState pso, ConcurrentBag<IShaderResourceBinding> pool)
+        => pool.TryTake(out var srb) ? srb : pso.CreateShaderResourceBinding(false);
+
+    private static void ReturnSRB(IShaderResourceBinding srb, ConcurrentBag<IShaderResourceBinding> pool)
+        => pool.Add(srb);
+
+    private static void EnsureInitialized(RenderContext context)
+    {
+        if (s_initialized) return;
+        lock (s_initLock)
+        {
+            if (s_initialized) return;
+
+            var device = context.Device;
+            if (device == null) return;
+
+            string path = Path.GetFullPath(
+                Path.Combine(
+                    AppContext.BaseDirectory,
+                    "../../../../../../assets/Shaders/cluster_draw.slang"
+                )
+            );
+            var drawAsset = SlangShaderImporter.Import(path);
+            using var vs = drawAsset.CreateShader(context, "VSMain");
+            using var ps = drawAsset.CreateShader(context, "PSMain");
+
+            var ci = new GraphicsPipelineStateCreateInfo()
+            {
+                PSODesc = new PipelineStateDesc()
+                {
+                    Name = "Cluster Draw PSO",
+                    PipelineType = PipelineType.Graphics,
+                    ResourceLayout = new PipelineResourceLayoutDesc()
+                    {
+                        DefaultVariableType = ShaderResourceVariableType.Dynamic,
+                    },
+                },
+                GraphicsPipeline = new GraphicsPipelineDesc()
+                {
+                    NumRenderTargets = 1,
+                    RTVFormats = [TextureFormat.RGBA8_UNorm],
+                    DSVFormat = TextureFormat.D32_Float,
+                    InputLayout = new InputLayoutDesc() { LayoutElements = [] },
+                    PrimitiveTopology = PrimitiveTopology.TriangleList,
+                    RasterizerDesc = new RasterizerStateDesc()
+                    {
+                        CullMode = CullMode.Back,
+                        FrontCounterClockwise = true,
+                    },
+                    DepthStencilDesc = new DepthStencilStateDesc()
+                    {
+                        DepthEnable = true,
+                        DepthWriteEnable = true,
+                    },
+                },
+                Vs = vs,
+                Ps = ps,
+            };
+
+            s_drawPSO = device.CreateGraphicsPipelineState(ci);
+
+            ci.PSODesc.Name = "Cluster Draw Wireframe PSO";
+            ci.GraphicsPipeline.RasterizerDesc.FillMode = FillMode.Wireframe;
+            ci.GraphicsPipeline.RasterizerDesc.CullMode = CullMode.None;
+            s_drawWireframePSO = device.CreateGraphicsPipelineState(ci);
+
+            ci.PSODesc.Name = "Cluster Draw Depth Only PSO";
+            ci.GraphicsPipeline.RasterizerDesc.FillMode = FillMode.Solid;
+            ci.GraphicsPipeline.RasterizerDesc.CullMode = CullMode.Back;
+            ci.GraphicsPipeline.DepthStencilDesc.DepthEnable = true;
+            ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = true;
+            ci.GraphicsPipeline.BlendDesc.RenderTargets[0].RenderTargetWriteMask = ColorMask.None;
+            s_drawDepthOnlyPSO = device.CreateGraphicsPipelineState(ci);
+
+            ci.PSODesc.Name = "Cluster Draw Overdraw PSO";
+            ci.GraphicsPipeline.DepthStencilDesc.DepthEnable = false;
+            ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = false;
+            ci.GraphicsPipeline.BlendDesc.RenderTargets[0].RenderTargetWriteMask = ColorMask.All;
+            ci.GraphicsPipeline.BlendDesc.RenderTargets[0].BlendEnable = true;
+            ci.GraphicsPipeline.BlendDesc.RenderTargets[0].SrcBlend = BlendFactor.One;
+            ci.GraphicsPipeline.BlendDesc.RenderTargets[0].DestBlend = BlendFactor.One;
+            using var psOD = drawAsset.CreateShader(context, "PSOverdraw");
+            ci.Ps = psOD;
+            s_drawOverdrawPSO = device.CreateGraphicsPipelineState(ci);
+
+            // VisBuffer PSO: R32_UINT render target, depth write, no blending
+            using var vsVB = drawAsset.CreateShader(context, "VSVisBuffer");
+            using var psVB = drawAsset.CreateShader(context, "PSVisBuffer");
+            var ciVB = new GraphicsPipelineStateCreateInfo()
+            {
+                PSODesc = new PipelineStateDesc()
+                {
+                    Name = "Cluster Draw VisBuffer PSO",
+                    PipelineType = PipelineType.Graphics,
+                    ResourceLayout = new PipelineResourceLayoutDesc()
+                    {
+                        DefaultVariableType = ShaderResourceVariableType.Dynamic,
+                    },
+                },
+                GraphicsPipeline = new GraphicsPipelineDesc()
+                {
+                    NumRenderTargets = 1,
+                    RTVFormats = [TextureFormat.R32_UInt],
+                    DSVFormat = TextureFormat.D32_Float,
+                    InputLayout = new InputLayoutDesc() { LayoutElements = [] },
+                    PrimitiveTopology = PrimitiveTopology.TriangleList,
+                    RasterizerDesc = new RasterizerStateDesc()
+                    {
+                        CullMode = CullMode.Back,
+                        FrontCounterClockwise = true,
+                    },
+                    DepthStencilDesc = new DepthStencilStateDesc()
+                    {
+                        DepthEnable = true,
+                        DepthWriteEnable = true,
+                    },
+                },
+                Vs = vsVB,
+                Ps = psVB,
+            };
+            s_drawVisBufferPSO = device.CreateGraphicsPipelineState(ciVB);
+
+            // Transparent VisBuffer PSO: depth test YES, depth write NO
+            ciVB.PSODesc.Name = "Cluster Draw VisBuffer Transparent PSO";
+            ciVB.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = false;
+            s_drawVisBufferTransparentPSO = device.CreateGraphicsPipelineState(ciVB);
+
+            s_initialized = true;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Instance: 只有 handle + config（轻量，每帧 new）
+    // ═══════════════════════════════════════════════════════════════
     public RenderGraphHandle HVisibleClusters = RenderGraphHandle.Invalid,
-        HVisibleClustersData = RenderGraphHandle.Invalid, // The original data buffer
+        HVisibleClustersData = RenderGraphHandle.Invalid,
         HIndirectDrawArgs = RenderGraphHandle.Invalid;
     public RenderGraphHandle HColorTarget = RenderGraphHandle.Invalid,
         HDepthTarget = RenderGraphHandle.Invalid;
@@ -38,7 +179,7 @@ public class ClusterDrawPass(
     public RenderGraphHandle HDrawUniforms = RenderGraphHandle.Invalid;
     public RenderGraphHandle HGlobalTransformBuffer = RenderGraphHandle.Invalid;
     public RenderGraphHandle HPageHeap = RenderGraphHandle.Invalid;
-    public RenderGraphHandle HVisibleClusterMeta = RenderGraphHandle.Invalid; // Phase2DrawArgs buffer (offset at byte 16)
+    public RenderGraphHandle HVisibleClusterMeta = RenderGraphHandle.Invalid;
 
     private ClusterDebugMode _debugMode;
     private bool _wireframe,
@@ -63,136 +204,7 @@ public class ClusterDrawPass(
 
     public void Init()
     {
-        if (_initialized)
-            return;
-        var device = context.Device;
-        if (device == null)
-            return;
-
-        string path = Path.GetFullPath(
-            Path.Combine(
-                AppContext.BaseDirectory,
-                "../../../../../../assets/Shaders/cluster_draw.slang"
-            )
-        );
-        _drawAsset = SlangShaderImporter.Import(path);
-        using var vs = _drawAsset.CreateShader(context, "VSMain");
-        using var ps = _drawAsset.CreateShader(context, "PSMain");
-
-        var ci = new GraphicsPipelineStateCreateInfo()
-        {
-            PSODesc = new PipelineStateDesc()
-            {
-                Name = "Cluster Draw PSO",
-                PipelineType = PipelineType.Graphics,
-                ResourceLayout = new PipelineResourceLayoutDesc()
-                {
-                    DefaultVariableType = ShaderResourceVariableType.Dynamic,
-                },
-            },
-            GraphicsPipeline = new GraphicsPipelineDesc()
-            {
-                NumRenderTargets = 1,
-                RTVFormats = [TextureFormat.RGBA8_UNorm],
-                DSVFormat = TextureFormat.D32_Float,
-                InputLayout = new InputLayoutDesc() { LayoutElements = [] },
-                PrimitiveTopology = PrimitiveTopology.TriangleList,
-                RasterizerDesc = new RasterizerStateDesc()
-                {
-                    CullMode = CullMode.Back,
-                    FrontCounterClockwise = true,
-                },
-                DepthStencilDesc = new DepthStencilStateDesc()
-                {
-                    DepthEnable = true,
-                    DepthWriteEnable = true,
-                },
-            },
-            Vs = vs,
-            Ps = ps,
-        };
-
-        _drawPSO = device.CreateGraphicsPipelineState(ci);
-        if (_drawPSO != null)
-            _drawSRB = _drawPSO.CreateShaderResourceBinding(false);
-
-        ci.PSODesc.Name = "Cluster Draw Wireframe PSO";
-        ci.GraphicsPipeline.RasterizerDesc.FillMode = FillMode.Wireframe;
-        ci.GraphicsPipeline.RasterizerDesc.CullMode = CullMode.None;
-        _drawWireframePSO = device.CreateGraphicsPipelineState(ci);
-        if (_drawWireframePSO != null)
-            _drawWireframeSRB = _drawWireframePSO.CreateShaderResourceBinding(false);
-
-        ci.PSODesc.Name = "Cluster Draw Depth Only PSO";
-        ci.GraphicsPipeline.RasterizerDesc.FillMode = FillMode.Solid;
-        ci.GraphicsPipeline.RasterizerDesc.CullMode = CullMode.Back;
-        ci.GraphicsPipeline.DepthStencilDesc.DepthEnable = true;
-        ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = true;
-        ci.GraphicsPipeline.BlendDesc.RenderTargets[0].RenderTargetWriteMask = ColorMask.None;
-        _drawDepthOnlyPSO = device.CreateGraphicsPipelineState(ci);
-        if (_drawDepthOnlyPSO != null)
-            _drawDepthOnlySRB = _drawDepthOnlyPSO.CreateShaderResourceBinding(false);
-
-        ci.PSODesc.Name = "Cluster Draw Overdraw PSO";
-        ci.GraphicsPipeline.DepthStencilDesc.DepthEnable = false;
-        ci.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = false;
-        ci.GraphicsPipeline.BlendDesc.RenderTargets[0].RenderTargetWriteMask = ColorMask.All;
-        ci.GraphicsPipeline.BlendDesc.RenderTargets[0].BlendEnable = true;
-        ci.GraphicsPipeline.BlendDesc.RenderTargets[0].SrcBlend = BlendFactor.One;
-        ci.GraphicsPipeline.BlendDesc.RenderTargets[0].DestBlend = BlendFactor.One;
-        using var psOD = _drawAsset.CreateShader(context, "PSOverdraw");
-        ci.Ps = psOD;
-        _drawOverdrawPSO = device.CreateGraphicsPipelineState(ci);
-        if (_drawOverdrawPSO != null)
-            _drawOverdrawSRB = _drawOverdrawPSO.CreateShaderResourceBinding(false);
-
-        // VisBuffer PSO: R32_UINT render target, depth write, no blending
-        using var vsVB = _drawAsset.CreateShader(context, "VSVisBuffer");
-        using var psVB = _drawAsset.CreateShader(context, "PSVisBuffer");
-        var ciVB = new GraphicsPipelineStateCreateInfo()
-        {
-            PSODesc = new PipelineStateDesc()
-            {
-                Name = "Cluster Draw VisBuffer PSO",
-                PipelineType = PipelineType.Graphics,
-                ResourceLayout = new PipelineResourceLayoutDesc()
-                {
-                    DefaultVariableType = ShaderResourceVariableType.Dynamic,
-                },
-            },
-            GraphicsPipeline = new GraphicsPipelineDesc()
-            {
-                NumRenderTargets = 1,
-                RTVFormats = [TextureFormat.R32_UInt],
-                DSVFormat = TextureFormat.D32_Float,
-                InputLayout = new InputLayoutDesc() { LayoutElements = [] },
-                PrimitiveTopology = PrimitiveTopology.TriangleList,
-                RasterizerDesc = new RasterizerStateDesc()
-                {
-                    CullMode = CullMode.Back,
-                    FrontCounterClockwise = true,
-                },
-                DepthStencilDesc = new DepthStencilStateDesc()
-                {
-                    DepthEnable = true,
-                    DepthWriteEnable = true,
-                },
-            },
-            Vs = vsVB,
-            Ps = psVB,
-        };
-        _drawVisBufferPSO = device.CreateGraphicsPipelineState(ciVB);
-        if (_drawVisBufferPSO != null)
-            _drawVisBufferSRB = _drawVisBufferPSO.CreateShaderResourceBinding(false);
-
-        // Transparent VisBuffer PSO: depth test YES, depth write NO
-        ciVB.PSODesc.Name = "Cluster Draw VisBuffer Transparent PSO";
-        ciVB.GraphicsPipeline.DepthStencilDesc.DepthWriteEnable = false;
-        _drawVisBufferTransparentPSO = device.CreateGraphicsPipelineState(ciVB);
-        if (_drawVisBufferTransparentPSO != null)
-            _drawVisBufferTransparentSRB = _drawVisBufferTransparentPSO.CreateShaderResourceBinding(false);
-
-        _initialized = true;
+        EnsureInitialized(context);
     }
 
     public void Setup(RenderGraphBuilder builder)
@@ -217,7 +229,7 @@ public class ClusterDrawPass(
         builder.Write(HDepthTarget, ResourceState.DepthWrite);
     }
 
-    private void BindSRB(IShaderResourceBinding srb, IBuffer drawUniformBuffer, IBuffer visible, IBuffer? visibleData, IBuffer? pageHeapBuffer, IBufferView? globalTransformView, IBuffer? metaBuffer)
+    private static void BindSRB(IShaderResourceBinding srb, IBuffer drawUniformBuffer, IBuffer visible, IBuffer? visibleData, IBuffer? pageHeapBuffer, IBufferView? globalTransformView, IBuffer? metaBuffer)
     {
         srb.GetVariableByName(ShaderType.Vertex, "Uniforms")
             ?.Set(drawUniformBuffer, SetShaderResourceFlags.None);
@@ -259,6 +271,8 @@ public class ClusterDrawPass(
 
     public void Execute(RenderGraphContext rgCtx)
     {
+        EnsureInitialized(context);
+
         var ctx = context.ImmediateContext;
         if (ctx == null)
             return;
@@ -288,15 +302,15 @@ public class ClusterDrawPass(
         {
             var vbRtv = rgCtx.GetTextureView(HVisBufferTarget, TextureViewType.RenderTarget);
             var dsv = rgCtx.GetTextureView(HDepthTarget, TextureViewType.DepthStencil);
-            // Select PSO based on depth write mode
-            var vbPso = _depthWrite ? _drawVisBufferPSO : _drawVisBufferTransparentPSO;
-            var vbSrb = _depthWrite ? _drawVisBufferSRB : _drawVisBufferTransparentSRB;
-            if (vbRtv != null && dsv != null && vbPso != null && vbSrb != null)
+            var vbPso = _depthWrite ? s_drawVisBufferPSO : s_drawVisBufferTransparentPSO;
+            var vbPool = _depthWrite ? s_visBufferSRBPool : s_visBufferTransparentSRBPool;
+            if (vbRtv != null && dsv != null && vbPso != null)
             {
+                var srb = RentSRB(vbPso, vbPool);
                 ctx.SetRenderTargets([vbRtv], dsv, ResourceStateTransitionMode.Verify);
-                BindSRB(vbSrb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
+                BindSRB(srb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
                 ctx.SetPipelineState(vbPso);
-                ctx.CommitShaderResources(vbSrb, ResourceStateTransitionMode.Verify);
+                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
@@ -306,6 +320,7 @@ public class ClusterDrawPass(
                         AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
                     }
                 );
+                ReturnSRB(srb, vbPool);
             }
             return;
         }
@@ -321,11 +336,12 @@ public class ClusterDrawPass(
         if (_overdraw)
         {
             // 1. Depth Only Pre-pass
-            if (_drawDepthOnlyPSO != null && _drawDepthOnlySRB != null)
+            if (s_drawDepthOnlyPSO != null)
             {
-                BindSRB(_drawDepthOnlySRB, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
-                ctx.SetPipelineState(_drawDepthOnlyPSO);
-                ctx.CommitShaderResources(_drawDepthOnlySRB, ResourceStateTransitionMode.Verify);
+                var srb = RentSRB(s_drawDepthOnlyPSO, s_depthOnlySRBPool);
+                BindSRB(srb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
+                ctx.SetPipelineState(s_drawDepthOnlyPSO);
+                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
@@ -335,14 +351,16 @@ public class ClusterDrawPass(
                         AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
                     }
                 );
+                ReturnSRB(srb, s_depthOnlySRBPool);
             }
 
             // 2. Overdraw Additive Blending without depth testing
-            if (_drawOverdrawPSO != null && _drawOverdrawSRB != null)
+            if (s_drawOverdrawPSO != null)
             {
-                BindSRB(_drawOverdrawSRB, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
-                ctx.SetPipelineState(_drawOverdrawPSO);
-                ctx.CommitShaderResources(_drawOverdrawSRB, ResourceStateTransitionMode.Verify);
+                var srb = RentSRB(s_drawOverdrawPSO, s_overdrawSRBPool);
+                BindSRB(srb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
+                ctx.SetPipelineState(s_drawOverdrawPSO);
+                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
@@ -352,15 +370,17 @@ public class ClusterDrawPass(
                         AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
                     }
                 );
+                ReturnSRB(srb, s_overdrawSRBPool);
             }
         }
         else
         {
-            IPipelineState? pso = _wireframe ? _drawWireframePSO : _drawPSO;
-            IShaderResourceBinding? srb = _wireframe ? _drawWireframeSRB : _drawSRB;
+            IPipelineState? pso = _wireframe ? s_drawWireframePSO : s_drawPSO;
+            var pool = _wireframe ? s_wireframeSRBPool : s_drawSRBPool;
 
-            if (pso != null && srb != null)
+            if (pso != null)
             {
+                var srb = RentSRB(pso, pool);
                 BindSRB(srb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
                 ctx.SetPipelineState(pso);
                 ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
@@ -373,23 +393,10 @@ public class ClusterDrawPass(
                         AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
                     }
                 );
+                ReturnSRB(srb, pool);
             }
         }
     }
-
-    public void Dispose()
-    {
-        _drawSRB?.Dispose();
-        _drawPSO?.Dispose();
-        _drawWireframeSRB?.Dispose();
-        _drawWireframePSO?.Dispose();
-        _drawDepthOnlySRB?.Dispose();
-        _drawDepthOnlyPSO?.Dispose();
-        _drawOverdrawSRB?.Dispose();
-        _drawOverdrawPSO?.Dispose();
-        _drawVisBufferSRB?.Dispose();
-        _drawVisBufferPSO?.Dispose();
-        _drawVisBufferTransparentSRB?.Dispose();
-        _drawVisBufferTransparentPSO?.Dispose();
-    }
+    /// <summary>No-op: PSO/SRB are static-cached, instance holds no GPU resources.</summary>
+    public void Dispose() { }
 }

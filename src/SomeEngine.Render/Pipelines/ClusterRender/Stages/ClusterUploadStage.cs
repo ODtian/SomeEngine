@@ -90,7 +90,7 @@ public class ClusterUploadStage(
             LodThreshold = config.LodThreshold,
             LodScale = config.LodScale,
             MaxQueueNodes = 4 * 1024 * 1024u,
-            MaxCandidates = ClusterRenderFeature.MaxDraws,
+            MaxCandidates = ClusterLimits.MaxDraws,
             ForcedLODLevel = config.ForcedLODLevel,
             InstanceCount = (uint)instanceMgr.Count,
             DebugMode = config.BypassCulling ? 1u : 0u,
@@ -126,8 +126,8 @@ public class ClusterUploadStage(
         var copyData = new CopyUniforms { SphereVertexCount = 1536 };
         var binningData = new BinningUniforms
         {
-            MaxBins = ClusterRenderFeature.MaxBins,
-            MaxClustersPerBin = ClusterRenderFeature.MaxClustersPerBin,
+            MaxBins = ClusterLimits.MaxBins,
+            MaxClustersPerBin = ClusterLimits.MaxClustersPerBin,
         };
 
         // ─── Upload Uniforms pass ───

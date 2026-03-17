@@ -5,32 +5,17 @@ using SomeEngine.Render.RHI;
 namespace SomeEngine.Render.Pipelines;
 
 /// <summary>
-/// Level 1 Stage: Raster Binning — 按 RasterBinKey 分组可见 Cluster。
+/// 无状态 Raster Binning 工具函数。
+/// PSO/SRB 在 ClusterBinningPSOs 中 static 缓存。
 /// </summary>
-public class ClusterRasterBinStage : IDisposable
+public static class ClusterRasterBin
 {
-    private readonly RenderContext _context;
-    private ClusterBinningPass? _binningPass;
-    private bool _initialized;
-
-    public ClusterRasterBinStage(RenderContext context)
-    {
-        _context = context;
-    }
-
-    public void Init()
-    {
-        if (_initialized) return;
-        _binningPass = new ClusterBinningPass(_context);
-        _binningPass.Init();
-        _initialized = true;
-    }
-
     /// <summary>
     /// 添加 Raster Binning pass（Init + Scatter），返回 binned 结果。
     /// </summary>
-    public ClusterRasterBinOutput AddPasses(
+    public static ClusterRasterBinOutput AddPasses(
         RenderGraph graph,
+        RenderContext context,
         in ClusterCullOutput cull,
         in ClusterGlobalResources globals,
         in ClusterRasterBinConfig config,
@@ -39,7 +24,7 @@ public class ClusterRasterBinStage : IDisposable
         string? tag = null
     )
     {
-        if (!_initialized) Init();
+        ClusterBinningPSOs.EnsureInitialized(context);
 
         string prefix = tag != null ? $"{tag}_" : "";
 
@@ -54,7 +39,7 @@ public class ClusterRasterBinStage : IDisposable
             ? config.OutputBinnedClusterIndex
             : graph.CreateBuffer($"{prefix}BinnedClusterIndexBuffer", new BufferDesc
             {
-                Size = (ulong)(ClusterRenderFeature.MaxDraws * 4),
+                Size = (ulong)(ClusterLimits.MaxDraws * 4),
                 BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
                 Mode = BufferMode.Structured,
                 ElementByteStride = 4,
@@ -76,18 +61,16 @@ public class ClusterRasterBinStage : IDisposable
             ElementByteStride = 4,
         });
 
-        // AddBinningPasses: Init + Scatter
-        var initPass = new ClusterBinningInitPass(_binningPass!)
+        graph.AddPass(new ClusterBinningInitPass(context)
         {
             HBinningUniforms = globals.BinningUniforms,
             HDrawArgs = hDrawArgs,
             HBinningDispatchArgs = hBinningDispatchArgs,
             HRasterBinMeta = hRasterBinMeta,
             HBinnedDrawArgs = hBinnedDrawArgs,
-        };
-        graph.AddPass(initPass);
+        });
 
-        var scatterPass = new ClusterBinningScatterPass(_binningPass!)
+        graph.AddPass(new ClusterBinningScatterPass(context)
         {
             HBinningUniforms = globals.BinningUniforms,
             HVisibleClusters = cull.VisibleClusters,
@@ -98,14 +81,8 @@ public class ClusterRasterBinStage : IDisposable
             HRasterBinMeta = hRasterBinMeta,
             HBinnedDrawArgs = hBinnedDrawArgs,
             HBinnedClusterBuffer = hBinnedClusterIndex,
-        };
-        graph.AddPass(scatterPass);
+        });
 
         return new ClusterRasterBinOutput(hBinnedClusterIndex, hBinnedDrawArgs, hRasterBinMeta, hBinningDispatchArgs);
-    }
-
-    public void Dispose()
-    {
-        _binningPass?.Dispose();
     }
 }

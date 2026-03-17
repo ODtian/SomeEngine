@@ -44,13 +44,23 @@ public class ClusterTraverseStage : IDisposable
     public ClusterTraverseOutput AddPasses(
         RenderGraph graph,
         in ClusterGlobalResources globals,
-        in ClusterTraverseConfig config
+        in ClusterTraverseConfig config,
+        in ClusterUploadConfig frameData
     )
     {
         if (!_initialized) Init();
 
+        // Forward frame data to internal BVH pass
+        _bvhTraversePass!.SetFrameData(
+            frameData.View, frameData.Proj, frameData.CameraPos,
+            frameData.LodThreshold, frameData.LodScale, frameData.ForcedLODLevel,
+            frameData.BypassCulling,
+            System.Numerics.Matrix4x4.Transpose(frameData.PrevViewProj), // UploadConfig stores non-transposed
+            frameData.HasPrevHistory, frameData.HiZMipCount, frameData.HiZInvSize
+        );
+
         // ─── Create candidate/queue buffers ───
-        uint maxDraws = ClusterRenderFeature.MaxDraws;
+        uint maxDraws = ClusterLimits.MaxDraws;
 
         var hCandidateClusters = config.OutputCandidateClusters.IsValid
             ? config.OutputCandidateClusters
@@ -128,31 +138,17 @@ public class ClusterTraverseStage : IDisposable
         var hPageFaultBuffer = graph.CreateBuffer("PageFaultBuffer", _clusterMgr.PageFaultDesc);
         var hPageFaultReadback = graph.CreateBuffer("PageFaultReadback", _clusterMgr.PageFaultReadbackDesc);
 
-        // Phase2 buffers — created here so they can be cleared together with Phase1 buffers
-        var hPhase2IndirectDrawArgs = graph.CreateBuffer("Phase2IndirectDrawArgs", new BufferDesc
-        {
-            Size = 256,
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
-            Mode = BufferMode.Raw,
-        });
-        var hZeroOffsetBuffer = graph.CreateBuffer("ZeroOffsetBuffer", new BufferDesc
-        {
-            Size = 16,
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-            Mode = BufferMode.Raw,
-        });
-
-        // ─── Clear buffers (Phase1 + Phase2 together, matching old single-pass clearing) ───
+        // ─── Clear buffers ───
         graph.AddPass(
             new ClusterClearBuffersPass(
                 hIndirectDrawArgs,
                 hCandidateArgs,
                 hCandidateCount,
                 hPageFaultBuffer,
-                RenderGraphHandle.Invalid,  // Phase2 count cleared by CullStage if needed
-                hPhase2IndirectDrawArgs,     // Always clear: binning draws need [4]=0 as offset
-                hZeroOffsetBuffer,           // Clear to 0: used as offset=0 for binned draws
-                RenderGraphHandle.Invalid    // Phase2 CandidateArgs cleared by CullStage if needed
+                RenderGraphHandle.Invalid,
+                RenderGraphHandle.Invalid,
+                RenderGraphHandle.Invalid,
+                RenderGraphHandle.Invalid
             )
         );
 
@@ -207,33 +203,7 @@ public class ClusterTraverseStage : IDisposable
         graph.AddPass(_cullUpdateArgsPass);
 
         return new ClusterTraverseOutput(
-            hCandidateClusters, hCandidateArgs, hCandidateCount,
-            hPhase2IndirectDrawArgs, hZeroOffsetBuffer
-        );
-    }
-
-    /// <summary>
-    /// 设置遍历帧参数（用于兼容已有 BVHTraversePass.SetFrameData）。
-    /// 应在 AddPasses 前调用。
-    /// </summary>
-    public void SetFrameData(
-        in System.Numerics.Matrix4x4 view,
-        in System.Numerics.Matrix4x4 proj,
-        System.Numerics.Vector3 cameraPos,
-        float lodThreshold,
-        float lodScale,
-        int forcedLOD,
-        bool bypassCulling,
-        in System.Numerics.Matrix4x4 prevViewProjT,
-        bool hasPrevHistory,
-        uint hizMipCount,
-        System.Numerics.Vector2 hizInvSize
-    )
-    {
-        if (!_initialized) Init();
-        _bvhTraversePass!.SetFrameData(
-            view, proj, cameraPos, lodThreshold, lodScale, forcedLOD,
-            bypassCulling, prevViewProjT, hasPrevHistory, hizMipCount, hizInvSize
+            hCandidateClusters, hCandidateArgs, hCandidateCount
         );
     }
 

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using Diligent;
 using SomeEngine.Assets.Importers;
@@ -37,9 +38,11 @@ internal sealed class ClusterResourceUploadPass(
 
 internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
 {
-    private IPipelineState? _patchPSO;
-    private IShaderResourceBinding? _patchSRB;
-    private bool _initialized = false;
+    private static IPipelineState? s_patchPSO;
+    private static readonly ConcurrentBag<IShaderResourceBinding> s_srbPool = [];
+    private static bool s_initialized;
+    private static readonly Lock s_initLock = new();
+
     private readonly RenderContext _context;
 
     public IReadOnlyList<ClusterResourceManager.BVHPatchData>? Patches;
@@ -52,36 +55,43 @@ internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
     public ClusterBVHPatchPass(RenderContext context)
     {
         _context = context;
+        EnsureInitialized(context);
     }
 
-    public void Init()
+    private static void EnsureInitialized(RenderContext context)
     {
-        if (_initialized || _context.Device == null)
-            return;
-
-        string path = System.IO.Path.GetFullPath(
-            System.IO.Path.Combine(
-                AppContext.BaseDirectory,
-                "../../../../../../assets/Shaders/bvh_patch.slang"
-            )
-        );
-        var patchShaderAsset = SlangShaderImporter.Import(path);
-
-        var ci = new ComputePipelineStateCreateInfo();
-        ci.PSODesc.Name = "BVH Patch PSO";
-        ci.PSODesc.PipelineType = PipelineType.Compute;
-        using var cs = patchShaderAsset.CreateShader(_context, "main");
-        ci.Cs = cs;
-        ci.PSODesc.ResourceLayout.DefaultVariableType = ShaderResourceVariableType.Dynamic;
-
-        _patchPSO = _context.Device.CreateComputePipelineState(ci);
-        if (_patchPSO != null)
+        if (s_initialized) return;
+        lock (s_initLock)
         {
-            _patchSRB = _patchPSO.CreateShaderResourceBinding(false);
-        }
+            if (s_initialized) return;
+            var device = context.Device;
+            if (device == null) return;
 
-        _initialized = true;
+            string path = System.IO.Path.GetFullPath(
+                System.IO.Path.Combine(AppContext.BaseDirectory,
+                    "../../../../../../assets/Shaders/bvh_patch.slang"));
+            var patchShaderAsset = SlangShaderImporter.Import(path);
+
+            using var cs = patchShaderAsset.CreateShader(context, "main");
+            s_patchPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
+            {
+                PSODesc = new PipelineStateDesc
+                {
+                    Name = "BVH Patch PSO",
+                    PipelineType = PipelineType.Compute,
+                    ResourceLayout = new PipelineResourceLayoutDesc
+                    {
+                        DefaultVariableType = ShaderResourceVariableType.Dynamic,
+                    },
+                },
+                Cs = cs,
+            });
+
+            s_initialized = true;
+        }
     }
+
+    public void Init() => EnsureInitialized(_context);
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -93,80 +103,60 @@ internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
     public struct PatchUniforms
     {
         public uint PatchCount;
-        public uint Pad0,
-            Pad1,
-            Pad2;
+        public uint Pad0, Pad1, Pad2;
     }
 
     public void Execute(RenderGraphContext graphContext)
     {
-        if (Patches == null || Patches.Count == 0)
-            return;
+        if (Patches == null || Patches.Count == 0) return;
         var ctx = graphContext.RenderContext.ImmediateContext;
-        if (ctx == null || _patchPSO == null || _patchSRB == null)
-            return;
+        if (ctx == null || s_patchPSO == null) return;
 
         var bvhBuffer = graphContext.GetBuffer(HGlobalBVH);
         var patchBuffer = graphContext.GetBuffer(HPatchBuffer);
         var uniformsBuffer = graphContext.GetBuffer(HPatchUniforms);
 
-        if (bvhBuffer == null || patchBuffer == null || uniformsBuffer == null)
-            return;
+        if (bvhBuffer == null || patchBuffer == null || uniformsBuffer == null) return;
 
         var uniforms = new PatchUniforms
         {
             PatchCount = (uint)Patches.Count,
-            Pad0 = 0,
-            Pad1 = 0,
-            Pad2 = 0,
+            Pad0 = 0, Pad1 = 0, Pad2 = 0,
         };
         var uSpan = ctx.MapBuffer<PatchUniforms>(uniformsBuffer, MapType.Write, MapFlags.Discard);
         uSpan[0] = uniforms;
         ctx.UnmapBuffer(uniformsBuffer, MapType.Write);
 
         var pSpan = ctx.MapBuffer<ClusterResourceManager.BVHPatchData>(
-            patchBuffer,
-            MapType.Write,
-            MapFlags.Discard
-        );
+            patchBuffer, MapType.Write, MapFlags.Discard);
         for (int i = 0; i < Patches.Count; i++)
             pSpan[i] = Patches[i];
         ctx.UnmapBuffer(patchBuffer, MapType.Write);
 
-        _patchSRB
-            .GetVariableByName(ShaderType.Compute, "GlobalBVH")
-            ?.Set(
-                bvhBuffer.GetDefaultView(BufferViewType.UnorderedAccess),
-                SetShaderResourceFlags.None
-            );
-        _patchSRB
-            .GetVariableByName(ShaderType.Compute, "Uniforms")
+        var srb = s_srbPool.TryTake(out var s) ? s : s_patchPSO.CreateShaderResourceBinding(false);
+
+        srb.GetVariableByName(ShaderType.Compute, "GlobalBVH")
+            ?.Set(bvhBuffer.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByName(ShaderType.Compute, "Uniforms")
             ?.Set(uniformsBuffer, SetShaderResourceFlags.None);
-        _patchSRB
-            .GetVariableByName(ShaderType.Compute, "Patches")
-            ?.Set(
-                patchBuffer.GetDefaultView(BufferViewType.ShaderResource),
-                SetShaderResourceFlags.None
-            );
+        srb.GetVariableByName(ShaderType.Compute, "Patches")
+            ?.Set(patchBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
 
-        ctx.SetPipelineState(_patchPSO);
-        ctx.CommitShaderResources(_patchSRB, ResourceStateTransitionMode.Verify);
+        ctx.SetPipelineState(s_patchPSO);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        
         uint groups = ((uint)Patches.Count + 63) / 64;
-        ctx.DispatchCompute(
-            new DispatchComputeAttribs
-            {
-                ThreadGroupCountX = groups,
-                ThreadGroupCountY = 1,
-                ThreadGroupCountZ = 1,
-            }
-        );
+        ctx.DispatchCompute(new DispatchComputeAttribs
+        {
+            ThreadGroupCountX = groups,
+            ThreadGroupCountY = 1,
+            ThreadGroupCountZ = 1,
+        });
+
+        s_srbPool.Add(srb);
     }
 
-    public void Dispose()
-    {
-        _patchPSO?.Dispose();
-        _patchSRB?.Dispose();
-    }
+    public void Dispose() { }
 }
 
 internal sealed class ClusterUploadInstanceDataPass(
@@ -454,40 +444,8 @@ internal sealed class ClusterBVHPageFaultCopyPass(
     }
 }
 
-internal sealed class HiZMip0Pass(
-    HiZBuildPass hizPass,
-    RenderGraphHandle hDepth,
-    RenderGraphHandle hHiZ
-) : IRenderGraphPass
-{
-    public string Name => "HiZ Build Mip0";
 
-    public void Setup(RenderGraphBuilder builder)
-    {
-        hizPass.SetupMip0(builder, hDepth, hHiZ);
-    }
 
-    public void Execute(RenderGraphContext graphContext)
-    {
-        hizPass.ExecuteMip0(graphContext, hDepth, hHiZ);
-    }
-}
-
-internal sealed class HiZDownsamplePass(HiZBuildPass hizPass, RenderGraphHandle hHiZ, uint mip)
-    : IRenderGraphPass
-{
-    public string Name { get; } = $"HiZ Downsample Mip{mip}";
-
-    public void Setup(RenderGraphBuilder builder)
-    {
-        hizPass.SetupDownsample(builder, hHiZ, mip);
-    }
-
-    public void Execute(RenderGraphContext graphContext)
-    {
-        hizPass.ExecuteDownsample(graphContext, hHiZ, mip);
-    }
-}
 
 internal sealed class ClusterDebugSphereCopyPass(
     ClusterDebugPass debugPass,
@@ -556,9 +514,11 @@ internal sealed class ClusterDebugSphereDrawPass(
 internal sealed class ClusterCullUpdateArgsPass : IRenderGraphPass, IDisposable
 {
     private readonly RenderContext _context;
-    private IPipelineState? _pso;
-    private IShaderResourceBinding? _srb;
-    private bool _initialized;
+
+    private static IPipelineState? s_pso;
+    private static readonly ConcurrentBag<IShaderResourceBinding> s_srbPool = [];
+    private static bool s_initialized;
+    private static readonly Lock s_initLock = new();
 
     public string Name { get; }
 
@@ -570,46 +530,43 @@ internal sealed class ClusterCullUpdateArgsPass : IRenderGraphPass, IDisposable
     {
         _context = context;
         Name = passName;
+        EnsureInitialized(context);
     }
 
-    public void Init()
+    private static void EnsureInitialized(RenderContext context)
     {
-        if (_initialized)
-            return;
-
-        var device = _context.Device;
-        if (device == null)
-            return;
-
-        string shaderPath = Path.GetFullPath(
-            Path.Combine(
-                AppContext.BaseDirectory,
-                "../../../../../../assets/Shaders/cluster_cull.slang"
-            )
-        );
-        var shaderAsset = SlangShaderImporter.Import(shaderPath);
-
-        using var cs = shaderAsset.CreateShader(_context, "UpdateIndirectArgs");
-        var ci = new ComputePipelineStateCreateInfo
+        if (s_initialized) return;
+        lock (s_initLock)
         {
-            PSODesc = new PipelineStateDesc
+            if (s_initialized) return;
+            var device = context.Device;
+            if (device == null) return;
+
+            string shaderPath = Path.GetFullPath(
+                Path.Combine(AppContext.BaseDirectory,
+                    "../../../../../../assets/Shaders/cluster_cull.slang"));
+            var shaderAsset = SlangShaderImporter.Import(shaderPath);
+
+            using var cs = shaderAsset.CreateShader(context, "UpdateIndirectArgs");
+            s_pso = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
-                Name = "Cull Update Args PSO",
-                PipelineType = PipelineType.Compute,
-                ResourceLayout = new PipelineResourceLayoutDesc
+                PSODesc = new PipelineStateDesc
                 {
-                    DefaultVariableType = ShaderResourceVariableType.Dynamic,
+                    Name = "Cull Update Args PSO",
+                    PipelineType = PipelineType.Compute,
+                    ResourceLayout = new PipelineResourceLayoutDesc
+                    {
+                        DefaultVariableType = ShaderResourceVariableType.Dynamic,
+                    },
                 },
-            },
-            Cs = cs,
-        };
+                Cs = cs,
+            });
 
-        _pso = device.CreateComputePipelineState(ci);
-        if (_pso != null)
-            _srb = _pso.CreateShaderResourceBinding(false);
-
-        _initialized = true;
+            s_initialized = true;
+        }
     }
+
+    public void Init() => EnsureInitialized(_context);
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -621,56 +578,41 @@ internal sealed class ClusterCullUpdateArgsPass : IRenderGraphPass, IDisposable
 
     public void Execute(RenderGraphContext graphContext)
     {
-        if (_pso == null || _srb == null)
-            return;
-
+        if (s_pso == null) return;
         var ctx = graphContext.RenderContext.ImmediateContext;
-        if (ctx == null)
-            return;
+        if (ctx == null) return;
 
         var count = graphContext.GetBuffer(HCandidateCount);
         var args = graphContext.GetBuffer(HCandidateArgs);
-        if (count == null || args == null)
-            return;
+        if (count == null || args == null) return;
 
-        _srb.GetVariableByName(ShaderType.Compute, "CandidateCount")
-            ?.Set(
-                count.GetDefaultView(BufferViewType.UnorderedAccess),
-                SetShaderResourceFlags.None
-            );
-        _srb.GetVariableByName(ShaderType.Compute, "CandidateArgs")
+        var srb = s_srbPool.TryTake(out var s) ? s : s_pso.CreateShaderResourceBinding(false);
+
+        srb.GetVariableByName(ShaderType.Compute, "CandidateCount")
+            ?.Set(count.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByName(ShaderType.Compute, "CandidateArgs")
             ?.Set(args.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         if (HDebugCullDrawArgs.IsValid)
         {
             var debugArgs = graphContext.GetBuffer(HDebugCullDrawArgs);
             if (debugArgs != null)
-            {
-                _srb.GetVariableByName(ShaderType.Compute, "DebugCullDrawArgs")
-                    ?.Set(
-                        debugArgs.GetDefaultView(BufferViewType.UnorderedAccess),
-                        SetShaderResourceFlags.None
-                    );
-            }
+                srb.GetVariableByName(ShaderType.Compute, "DebugCullDrawArgs")
+                    ?.Set(debugArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
         }
 
-        ctx.SetPipelineState(_pso);
-        ctx.CommitShaderResources(_srb, ResourceStateTransitionMode.Verify);
-        ctx.DispatchCompute(
-            new DispatchComputeAttribs
-            {
-                ThreadGroupCountX = 1,
-                ThreadGroupCountY = 1,
-                ThreadGroupCountZ = 1,
-            }
-        );
+        ctx.SetPipelineState(s_pso);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.DispatchCompute(new DispatchComputeAttribs
+        {
+            ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1,
+        });
+
+        s_srbPool.Add(srb);
     }
 
-    public void Dispose()
-    {
-        _srb?.Dispose();
-        _pso?.Dispose();
-    }
+    /// <summary>No-op: PSO/SRB are static-cached.</summary>
+    public void Dispose() { }
 }
 
 internal sealed class ClusterDebugReadbackPass : IRenderGraphPass

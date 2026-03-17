@@ -141,7 +141,7 @@ public class ClusterRenderFeature(
     private ClusterDrawPass? _drawPassLegacy;
     private ClusterDrawPass? _drawPassPhase1;
     private ClusterDrawPass? _drawPassPhase2;
-    private HiZBuildPass? _hizBuildPass;
+
     private ClusterDebugPass? _debugPass;
     internal ClusterDebugReadbackPass? _debugReadbackPass;
     private ClusterDebugAABBPass? _debugAABBPass;
@@ -152,7 +152,7 @@ public class ClusterRenderFeature(
     private ClusterShadeBinScatterPass? _shadeBinScatterPass;
     private ClusterMaterialShadePass? _materialShadePass;
     private readonly ClusterStreamer _clusterStreamer = new(clusterManager);
-    private ClusterBinningPass? _binningPass;
+
 
     private bool _initialized;
     internal const uint MaxDraws = 2500000;
@@ -346,8 +346,7 @@ public class ClusterRenderFeature(
         );
         _cullPassPhase2.Init();
 
-        _binningPass = new ClusterBinningPass(context, "ClusterBinning");
-        _binningPass.Init();
+
 
         _drawPassLegacy = new ClusterDrawPass(context, "ClusterDraw Legacy");
         _drawPassLegacy.Init();
@@ -356,8 +355,7 @@ public class ClusterRenderFeature(
         _drawPassPhase2 = new ClusterDrawPass(context, "ClusterDraw Phase2");
         _drawPassPhase2.Init();
 
-        _hizBuildPass = new HiZBuildPass(context);
-        _hizBuildPass.Init();
+
         _debugPass = new ClusterDebugPass(context);
         _debugPass.Init();
         _debugReadbackPass = new ClusterDebugReadbackPass(context);
@@ -1371,7 +1369,7 @@ public class ClusterRenderFeature(
             graph.AddPass(_cullPassLegacy);
 
             // Binning: scatter visible clusters into bins by RasterBinKey
-            AddBinningPasses(graph, _binningPass!,
+            AddBinningPasses(graph, context,
                 hVisibleClusters, hGlobalInstanceHeader, hBinningUB,
                 hIndirectDrawArgs, hPhase2IndirectDrawArgs, // offset=0 (zeroed)
                 hRasterBinMeta, hBinnedClusterIndexBuffer, hBinnedDrawArgs, hBinningDispatchArgs);
@@ -1396,7 +1394,7 @@ public class ClusterRenderFeature(
             graph.AddPass(_drawPassLegacy);
 
             // Store intermediate outputs for external access
-            LastCullOutput = new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid);
+            LastCullOutput = new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid);
             LastRasterBinOutput = new ClusterRasterBinOutput(hBinnedClusterIndexBuffer, hBinnedDrawArgs, hRasterBinMeta, hBinningDispatchArgs);
             LastRasterOutput = new ClusterRasterOutput(hVisBuffer, depthTarget);
 
@@ -1463,7 +1461,7 @@ public class ClusterRenderFeature(
             graph.AddPass(_cullPassPhase1);
 
             // Phase 1 Binning (offset=0)
-            AddBinningPasses(graph, _binningPass!,
+            AddBinningPasses(graph, context,
                 hVisibleClusters, hGlobalInstanceHeader, hBinningUB,
                 hIndirectDrawArgs, hPhase2IndirectDrawArgs, // offset=0 (zeroed)
                 hRasterBinMeta, hBinnedClusterIndexBuffer, hBinnedDrawArgs, hBinningDispatchArgs);
@@ -1491,10 +1489,10 @@ public class ClusterRenderFeature(
             {
                 // Phase 1 HiZ Build (from Phase 1 depth, for Phase 2 cull)
                 // Writes into hCurrHiZ which will be overwritten later by full HiZ build
-                graph.AddPass(new HiZMip0Pass(_hizBuildPass!, depthTarget, hCurrHiZ));
+                graph.AddPass(new HiZMip0Pass(context, depthTarget, hCurrHiZ));
                 for (uint mip = 1; mip < _hizMipCount; mip++)
                 {
-                    graph.AddPass(new HiZDownsamplePass(_hizBuildPass!, hCurrHiZ, mip));
+                    graph.AddPass(new HiZDownsamplePass(context, hCurrHiZ, mip));
                 }
             }
 
@@ -1520,7 +1518,7 @@ public class ClusterRenderFeature(
                 graph.AddPass(_cullPassPhase2);
 
                 // Phase 2 Binning (independent Init→Scatter into P2 buffers)
-                AddBinningPasses(graph, _binningPass!,
+                AddBinningPasses(graph, context,
                     hVisibleClusters, hGlobalInstanceHeader, hBinningUB,
                     hPhase2IndirectDrawArgs, hIndirectDrawArgs, // DrawArgs=[4]=N2, offset=[4]=N1
                     hRasterBinMetaP2, hBinnedClusterIndexBufferP2, hBinnedDrawArgsP2, hBinningDispatchArgs);
@@ -1545,14 +1543,14 @@ public class ClusterRenderFeature(
                 graph.AddPass(_drawPassPhase2);
 
                 // Full HiZ Build (overwrite hCurrHiZ with complete Phase 1+2 depth for next frame's Phase 1)
-                graph.AddPass(new HiZMip0Pass(_hizBuildPass!, depthTarget, hCurrHiZ));
+                graph.AddPass(new HiZMip0Pass(context, depthTarget, hCurrHiZ));
                 for (uint mip = 1; mip < _hizMipCount; mip++)
                 {
-                    graph.AddPass(new HiZDownsamplePass(_hizBuildPass!, hCurrHiZ, mip));
+                    graph.AddPass(new HiZDownsamplePass(context, hCurrHiZ, mip));
                 }
 
                 // Store intermediate outputs for external access
-                LastCullOutput = new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, hPhase2IndirectDrawArgs, hCurrHiZ, hPhase2CandidateCount, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid);
+                LastCullOutput = new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, hPhase2IndirectDrawArgs, hPhase2CandidateCount, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid);
                 LastRasterBinOutput = new ClusterRasterBinOutput(hBinnedClusterIndexBufferP2, hBinnedDrawArgsP2, hRasterBinMetaP2, hBinningDispatchArgs);
                 LastRasterOutput = new ClusterRasterOutput(hVisBuffer, depthTarget);
 
@@ -1755,18 +1753,16 @@ public class ClusterRenderFeature(
         return levels;
     }
 
-    /// <summary>
-    /// Adds 2 RG passes (Init + Scatter) for raster binning.
-    /// Splitting into 2 passes ensures proper UAV barriers between init writes and scatter atomics.
-    /// </summary>
     private static void AddBinningPasses(
-        RenderGraph graph, ClusterBinningPass parent,
+        RenderGraph graph, RenderContext context,
         RenderGraphHandle hVisibleClusters, RenderGraphHandle hInstanceHeaders,
         RenderGraphHandle hBinningUB, RenderGraphHandle hDrawArgs, RenderGraphHandle hClusterReadOffsetArgs,
         RenderGraphHandle hRasterBinMeta, RenderGraphHandle hBinnedClusterBuffer,
         RenderGraphHandle hBinnedDrawArgs, RenderGraphHandle hBinningDispatchArgs)
     {
-        var initPass = new ClusterBinningInitPass(parent)
+        ClusterBinningPSOs.EnsureInitialized(context);
+
+        var initPass = new ClusterBinningInitPass(context)
         {
             HBinningUniforms = hBinningUB,
             HDrawArgs = hDrawArgs,
@@ -1776,7 +1772,7 @@ public class ClusterRenderFeature(
         };
         graph.AddPass(initPass);
 
-        var scatterPass = new ClusterBinningScatterPass(parent)
+        var scatterPass = new ClusterBinningScatterPass(context)
         {
             HBinningUniforms = hBinningUB,
             HVisibleClusters = hVisibleClusters,
@@ -2149,11 +2145,11 @@ public class ClusterRenderFeature(
         _drawPassLegacy?.Dispose();
         _drawPassPhase1?.Dispose();
         _drawPassPhase2?.Dispose();
-        _hizBuildPass?.Dispose();
+
         _debugPass?.Dispose();
         _debugAABBPass?.Dispose();
         _resolvePass?.Dispose();
-        _binningPass?.Dispose();
+
         _shadeBinningResources?.Dispose();
         registry.Dispose();
     }

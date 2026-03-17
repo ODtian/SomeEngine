@@ -31,9 +31,7 @@ public readonly record struct ClusterGlobalResources(
 public readonly record struct ClusterTraverseOutput(
     RenderGraphHandle CandidateClusters,
     RenderGraphHandle CandidateArgs,
-    RenderGraphHandle CandidateCount,
-    RenderGraphHandle Phase2IndirectDrawArgs,
-    RenderGraphHandle ZeroOffsetBuffer
+    RenderGraphHandle CandidateCount
 );
 
 /// <summary>
@@ -43,7 +41,6 @@ public readonly record struct ClusterCullOutput(
     RenderGraphHandle VisibleClusters,
     RenderGraphHandle DrawArgs,
     RenderGraphHandle Phase2DrawArgs,
-    RenderGraphHandle HiZ,
     RenderGraphHandle Phase2CandidateCount,
     RenderGraphHandle Phase2CandidateClusters,
     RenderGraphHandle Phase2CandidateArgs,
@@ -187,9 +184,7 @@ public readonly record struct ClusterRasterBinConfig
     public static ClusterRasterBinConfig Default() => new()
     {
         MaxBins = 16,
-#pragma warning disable CS0618 // Legacy shared capacity constant is still the current canonical limit
-        MaxClustersPerBin = ClusterRenderFeature.MaxDraws / 16,
-#pragma warning restore CS0618
+        MaxClustersPerBin = ClusterLimits.MaxDraws / 16,
     };
 }
 
