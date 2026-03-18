@@ -6,8 +6,8 @@ struct BinningUniforms
 {
     uint MaxBins;
     uint MaxClustersPerBin;
-    uint Pad0;
-    uint Pad1;
+    uint SlotCapacity;         // MaterialSlotBuffer SOA capacity (even)
+    uint BinFieldIndex;        // Field index for this binning pass in SOA
 };
 
 ConstantBuffer<BinningUniforms> Uniforms;
@@ -17,6 +17,7 @@ StructuredBuffer<uint4> VisibleClusters;
 StructuredBuffer<GpuInstanceHeader> InstanceHeaders;
 ByteAddressBuffer DrawArgs;                  // [4] = visible count for this phase
 ByteAddressBuffer ClusterReadOffsetArgs;     // [4] = base offset into VisibleClusters (0 for Legacy/Phase1, N1 for Phase2)
+StructuredBuffer<uint> MaterialSlotBuffer;   // SOA layout, StructuredBuffer<uint>
 
 // ─── Output ───
 RWByteAddressBuffer RasterBinMeta;           // 16B per bin: (ClusterOffset, BinCapacity, BinCount, Pad)
@@ -72,7 +73,8 @@ void CSBinning(uint3 dtid : SV_DispatchThreadID)
     uint instanceID = entry.z;
 
     GpuInstanceHeader header = InstanceHeaders[instanceID];
-    uint binKey = header.RasterBinKey;
+    uint slotOffset = header.MaterialSlotOffset;
+    uint binKey = GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
     if (binKey >= Uniforms.MaxBins)
         binKey = 0;
 

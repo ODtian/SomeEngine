@@ -43,11 +43,11 @@ public class InstanceSyncSystem(InstanceDataManager dataManager)
                 new GpuInstanceHeader
                 {
                     BVHRootIndex = m.BVHRootIndex,
-                    MaterialID = m.MaterialID,
+                    MaterialSlotOffset = m.MaterialSlotOffset,
                     MetadataOffset = metaOffset,
                     MetadataCount = metaCount,
-                    RasterBinKey = 0,
                     BoundsExpansion = 0f,
+                    Pad1 = 0,
                     Pad2 = 0,
                     Pad3 = 0,
                 }

@@ -79,18 +79,33 @@ struct ClusterBVHNode
     uint NodeType; // 0=Internal, 1=Leaf
 };
 
+// ─── MaterialSlotBuffer SOA access ───
+// GPU buffer is StructuredBuffer<uint>, SOA layout:
+//   field0: [slot0,slot1,...] | field1: [slot0,slot1,...] | ...
+// Each pair of ushort slots packs into one uint.
+// slotCapacity is always even.
+uint GetSlotField(StructuredBuffer<uint> slotBuffer, uint slotOffset, uint fieldIndex, uint slotCapacity)
+{
+    uint fieldBaseUint = fieldIndex * (slotCapacity / 2);
+    uint wordIdx = fieldBaseUint + (slotOffset / 2);
+    uint packed = slotBuffer[wordIdx];
+    return (slotOffset % 2 == 0) ? (packed & 0xFFFF) : (packed >> 16);
+}
+
 struct GpuInstanceHeader
 {
     uint BVHRootIndex;
-    uint MaterialID;
+    uint MaterialSlotOffset; // Index into MaterialSlotBuffer
     uint MetadataOffset;
     uint MetadataCount;
 
-    uint RasterBinKey;      // Material-driven rasterization bin key
     float BoundsExpansion;  // Conservative AABB expansion (world space)
+    uint Pad1;
     uint Pad2;
     uint Pad3;
 };
+
+
 
 struct AABB
 {

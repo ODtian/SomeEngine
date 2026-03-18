@@ -67,6 +67,41 @@ public struct CullingUniforms
     public float PrevP00;
     public float PrevP11;
     public Vector2 Pad8;
+
+    public static CullingUniforms Create(
+        in Matrix4x4 view, in Matrix4x4 proj, Vector3 cameraPos,
+        float lodThreshold, float lodScale, int forcedLODLevel,
+        uint instanceCount, bool bypassCulling, bool dumpHiZData, bool debugShowHiZAABBs,
+        in Matrix4x4 prevViewProjT, bool hasPrevHistory, uint hizMipCount, Vector2 hizInvSize,
+        in Matrix4x4 prevView, in Matrix4x4 prevProj,
+        Vector3 quantOrigin, float quantStep
+    ) => new()
+    {
+        ViewProj = Matrix4x4.Transpose(view * proj),
+        CameraPos = cameraPos,
+        LodThreshold = lodThreshold,
+        LodScale = lodScale,
+        MaxQueueNodes = 4 * 1024 * 1024u,
+        MaxCandidates = ClusterLimits.MaxDraws,
+        ForcedLODLevel = forcedLODLevel,
+        InstanceCount = instanceCount,
+        DebugMode = bypassCulling ? 1u : 0u,
+        DumpHiZData = dumpHiZData ? 1u : 0u,
+        CurrentDepth = 0,
+        Pad5 = debugShowHiZAABBs ? 1u : 0u,
+        PrevViewProj = Matrix4x4.Transpose(Matrix4x4.Transpose(prevViewProjT)),
+        HasPrevHistory = hasPrevHistory ? 1u : 0u,
+        HiZMipCount = hizMipCount,
+        HiZInvSize = hizInvSize,
+        View = Matrix4x4.Transpose(view),
+        P00 = proj.M11,
+        P11 = proj.M22,
+        QuantOrigin = quantOrigin,
+        QuantStep = quantStep,
+        PrevView = Matrix4x4.Transpose(prevView),
+        PrevP00 = prevProj.M11,
+        PrevP11 = prevProj.M22,
+    };
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -88,7 +123,11 @@ public struct ShadeBinUniforms
     public uint ScreenWidth;
     public uint ScreenHeight;
     public uint MaterialCount;
-    public uint Pad;
+    public uint SlotCapacity;         // MaterialSlotBuffer SOA capacity (even)
+    public uint BinFieldIndex;        // Field index for this binning pass in SOA
+    public uint Pad0;
+    public uint Pad1;
+    public uint Pad2;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -102,7 +141,7 @@ public struct ShadeUniforms
     public uint ScreenHeight;
     public Vector3 QuantOrigin;
     public float QuantStep;
-    public uint MaterialID;
+    public uint ShadingBin;
     public uint MaterialCount;
     public uint Pad0;
     public uint Pad1;
@@ -151,6 +190,7 @@ public class ClusterRenderFeature(
     private ClusterShadeBinReservePass? _shadeBinReservePass;
     private ClusterShadeBinScatterPass? _shadeBinScatterPass;
     private ClusterMaterialShadePass? _materialShadePass;
+    private IPipelineState? _materialShadePSO;
     private readonly ClusterStreamer _clusterStreamer = new(clusterManager);
 
 
@@ -367,8 +407,8 @@ public class ClusterRenderFeature(
         _shadeBinCountPass = new ClusterShadeBinCountPass(context, _shadeBinningResources);
         _shadeBinReservePass = new ClusterShadeBinReservePass(context, _shadeBinningResources);
         _shadeBinScatterPass = new ClusterShadeBinScatterPass(context, _shadeBinningResources);
-        RegisterDefaultMaterials(context, registry, out _defaultTextures, out _defaultSampler);
-        _materialShadePass = new ClusterMaterialShadePass(context, registry);
+        RegisterDefaultMaterials(context, registry, out _defaultTextures, out _defaultSampler, out _materialShadePSO);
+        _materialShadePass = new ClusterMaterialShadePass(context, registry, _materialShadePSO);
 
         _initialized = true;
     }
@@ -379,13 +419,15 @@ public class ClusterRenderFeature(
     /// </summary>
     internal static void RegisterDefaultMaterials(
         RenderContext context, MaterialRegistry registry,
-        out ITexture[]? defaultTextures, out ISampler? defaultSampler)
+        out ITexture[]? defaultTextures, out ISampler? defaultSampler,
+        out IPipelineState? materialShadePSO)
     {
         var device = context.Device;
         if (device == null)
         {
             defaultTextures = null;
             defaultSampler = null;
+            materialShadePSO = null;
             return;
         }
 
@@ -428,10 +470,11 @@ public class ClusterRenderFeature(
                 Cs = cs,
             }
         );
-        if (pso == null)
-            throw new InvalidOperationException("Failed to create Material Shade PSO.");
+        // Store PSO
+        materialShadePSO = pso;
 
-        registry.RegisterShaderType<StandardPBRMaterial>("StandardPBR", pso);
+        // Create default material (ID=0)
+        var mat0 = new Material { Name = "DefaultPBR", ShaderAssetName = "StandardPBRMaterial" };
 
         var defaultTex = CreateDefault1x1Texture(context, "DefaultWhite", 0xFFFFFFFF);
         var defaultNormalTex = CreateDefault1x1Texture(context, "DefaultNormal", 0xFFFF8080);
@@ -452,29 +495,38 @@ public class ClusterRenderFeature(
         defaultSampler = sampler;
 
         // Create default material (ID=0) with default textures
-        var mat0 = registry.CreateMaterial<StandardPBRMaterial>();
         SetupDefaultMaterialSlots(mat0, defaultTex, defaultNormalTex, defaultArmTex, sampler);
+        registry.Register(mat0);
+
+        // Tag default material as opaque + cluster shader
+        foreach (var pass in mat0.Passes)
+        {
+            registry.SetTag<OpaqueTag>(pass);
+            registry.SetTag<ClusterShaderTag>(pass);
+            // Create SRB for this pass
+            pass.SRB = pso.CreateShaderResourceBinding(false);
+        }
     }
 
     internal static void SetupDefaultMaterialSlots(
-        StandardPBRMaterial mat,
+        Material mat,
         ITexture albedo,
         ITexture normal,
         ITexture arm,
         ISampler sampler
     )
     {
-        mat.PBR.AlbedoMap = albedo.GetDefaultView(TextureViewType.ShaderResource)!;
-        mat.PBR.NormalMap = normal.GetDefaultView(TextureViewType.ShaderResource)!;
-        mat.PBR.ARMMap = arm.GetDefaultView(TextureViewType.ShaderResource)!;
-        mat.PBR.Sampler = sampler;
+        mat.SetTexture("AlbedoMap", albedo.GetDefaultView(TextureViewType.ShaderResource)!);
+        mat.SetTexture("NormalMap", normal.GetDefaultView(TextureViewType.ShaderResource)!);
+        mat.SetTexture("ARMMap", arm.GetDefaultView(TextureViewType.ShaderResource)!);
+        mat.SetSampler("MaterialSampler", sampler);
     }
 
     /// <summary>
-    /// Sets up a StandardPBRMaterial with default (1×1 white) textures.
+    /// Sets up a Material with default (1×1 white) textures.
     /// Call this for newly created materials that don't have custom textures yet.
     /// </summary>
-    public void SetupMaterialWithDefaults(StandardPBRMaterial mat)
+    public void SetupMaterialWithDefaults(Material mat)
     {
         if (_defaultTextures == null || _defaultSampler == null)
             throw new InvalidOperationException(
@@ -1112,7 +1164,7 @@ public class ClusterRenderFeature(
         // Store global resources for external access
         LastGlobalResources = new ClusterGlobalResources(
             hGlobalBVH, hPageHeap, hGlobalTransform, hGlobalInstanceHeader,
-            hInstanceDataHeap, hCullingUB, hDrawUB, hBinningUB, hCopyUB
+            hInstanceDataHeap
         );
 
         graph.AddPass(new ClusterResourceUploadPass(clusterManager, hGlobalBVH, hPageHeap));
@@ -1929,12 +1981,69 @@ public class ClusterRenderFeature(
             }
         );
 
+        // Create MaterialSlotBuffer (GPU-side indirection table: slotOffset → bin keys, SOA layout)
+        // SOA: [field0: slot0,slot1,... | field1: slot0,slot1,... | ...]
+        // slotCapacity is always even; GPU reads as StructuredBuffer<uint> (2 ushort per uint)
+        const int slotFieldCount = 4;  // RasterBin, ShadingBin, ShadowBin, Padding
+        int slotCapacity = (int)((activeMaterialCount + 1) & ~1u); // even
+        int totalUshorts = slotCapacity * slotFieldCount;
+        var hMaterialSlotBuffer = graph.CreateBuffer(
+            "MaterialSlotBuffer",
+            new BufferDesc
+            {
+                Size = (ulong)(totalUshorts * sizeof(ushort)),
+                BindFlags = BindFlags.ShaderResource,
+                Mode = BufferMode.Structured,
+                ElementByteStride = 4, // uint = 4 bytes
+            }
+        );
+
+        // Upload mock MaterialSlotBuffer — SOA layout
+        var slotData = new ushort[totalUshorts];
+        {
+            const int fieldShadingBin = 1;
+            var allPasses = registry.GetAllPasses();
+            uint i = 0;
+            foreach (var pass in allPasses)
+            {
+                if (i >= activeMaterialCount) break;
+                // SOA: _data[fieldIndex * capacity + slotOffset]
+                // Field 0 (RasterBin): leave 0
+                slotData[fieldShadingBin * slotCapacity + (int)i] = (ushort)pass.MaterialID;
+                // Field 2 (ShadowBin): leave 0
+                // Field 3 (Padding): leave 0
+                i++;
+            }
+        }
+        graph.AddPass<object>(
+            "UploadMaterialSlotBuffer",
+            (builder, _) =>
+            {
+                builder.Write(hMaterialSlotBuffer, ResourceState.CopyDest);
+            },
+            (rgCtx, _) =>
+            {
+                var ctx2 = rgCtx.RenderContext.ImmediateContext;
+                var buf = rgCtx.GetBuffer(hMaterialSlotBuffer);
+                if (ctx2 != null && buf != null)
+                {
+                    ctx2.UpdateBuffer(
+                        buf, 0,
+                        (ReadOnlySpan<ushort>)slotData,
+                        ResourceStateTransitionMode.Verify
+                    );
+                }
+            }
+        );
+
         // Upload shade bin uniforms
         var binUniformData = new ShadeBinUniforms
         {
             ScreenWidth = screenWidth,
             ScreenHeight = screenHeight,
             MaterialCount = activeMaterialCount,
+            SlotCapacity = (uint)slotCapacity,
+            BinFieldIndex = 1,  // field 1 = ShadingBin
         };
         graph.AddPass<object>(
             "UploadShadeBinUniforms",
@@ -1972,7 +2081,7 @@ public class ClusterRenderFeature(
             ScreenHeight = screenHeight,
             QuantOrigin = clusterManager.QuantOrigin,
             QuantStep = clusterManager.QuantStep,
-            MaterialID = 0,
+            ShadingBin = 0,
             MaterialCount = activeMaterialCount,
             LightDir = Vector3.Normalize(new Vector3(0.5f, 1.0f, 0.3f)),
             LightIntensity = 1.0f,
@@ -2033,6 +2142,7 @@ public class ClusterRenderFeature(
         _shadeBinCountPass.HInstanceHeaders = hGlobalInstanceHeader;
         _shadeBinCountPass.HShadeBinUniforms = hBinUniforms;
         _shadeBinCountPass.HBinCounts = hBinCounts;
+        _shadeBinCountPass.HMaterialSlotBuffer = hMaterialSlotBuffer;
         graph.AddPass(_shadeBinCountPass);
 
         // Shade Bin Reserve pass
@@ -2051,6 +2161,7 @@ public class ClusterRenderFeature(
         _shadeBinScatterPass.HBinOffsets = hBinOffsets;
         _shadeBinScatterPass.HBinScatterCount = hBinScatterCount;
         _shadeBinScatterPass.HPixelCoordBuffer = hPixelCoordBuffer;
+        _shadeBinScatterPass.HMaterialSlotBuffer = hMaterialSlotBuffer;
         graph.AddPass(_shadeBinScatterPass);
 
         // Store shade bin outputs for external access

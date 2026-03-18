@@ -40,6 +40,7 @@ table MeshAsset (fs_serializer) {
     bvh_offset:ulong;
     quant_origin:Vec3;
     quant_step:float;
+    default_material_slots:[string] (fs_vector:"IList");  // Material paths, indexed by localMaterialIndex
 }
 
 root_type MeshAsset;

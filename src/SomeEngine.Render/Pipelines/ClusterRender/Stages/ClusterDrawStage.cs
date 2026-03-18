@@ -19,17 +19,20 @@ public static class ClusterDraw
         in ClusterRasterBinOutput rasterBin,
         in ClusterCullOutput cull,
         in ClusterGlobalResources globals,
+        RenderGraphHandle hDrawUniforms,
         in ClusterDrawConfig config,
         RenderGraphHandle depthTarget,
         uint screenWidth,
-        uint screenHeight
+        uint screenHeight,
+        RenderGraphHandle hOutputVisBuffer = default,
+        RenderGraphHandle hOutputDepth = default
     )
     {
         string tag = config.Tag ?? "";
 
         // ─── Create or reuse output targets ───
-        var hVisBuffer = config.OutputVisBuffer.IsValid
-            ? config.OutputVisBuffer
+        var hVisBuffer = hOutputVisBuffer.IsValid
+            ? hOutputVisBuffer
             : config.UseVisBuffer
                 ? graph.CreateTexture($"{tag}VisBuffer", new TextureDesc
                 {
@@ -48,8 +51,8 @@ public static class ClusterDraw
                 })
                 : RenderGraphHandle.Invalid;
 
-        var hDepth = config.OutputDepth.IsValid
-            ? config.OutputDepth
+        var hDepth = hOutputDepth.IsValid
+            ? hOutputDepth
             : depthTarget;
 
         var hVisibleClusterMeta = config.VisibleClusterMeta;
@@ -107,7 +110,7 @@ public static class ClusterDraw
         drawPass.HIndirectDrawArgs = rasterBin.BinnedDrawArgs;
         drawPass.HVisBufferTarget = hVisBuffer;
         drawPass.HDepthTarget = hDepth;
-        drawPass.HDrawUniforms = globals.DrawUniforms;
+        drawPass.HDrawUniforms = hDrawUniforms;
         drawPass.HGlobalTransformBuffer = globals.GlobalTransform;
         drawPass.HPageHeap = globals.PageHeap;
         drawPass.HVisibleClusterMeta = hVisibleClusterMeta;

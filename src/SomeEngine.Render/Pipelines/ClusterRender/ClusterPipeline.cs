@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Runtime.InteropServices;
 using Diligent;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.Materials;
@@ -16,11 +17,9 @@ public class ClusterPipeline : IRenderFeature
     public string Name { get; }
 
     private readonly ClusterUploadStage _uploadStage;
-    private readonly ClusterTraverseStage _traverseStage;
-    private readonly ClusterCullStage _cullStage;
+    private readonly ClusterBVHTraversePass _bvhTraversePass;
 
-    private readonly ClusterShadeBinStage _shadeBinStage;
-    private readonly ClusterShadeStage _shadeStage;
+    private readonly ClusterShade _shadeStage;
 
     private readonly RenderContext _context;
     private readonly ClusterResourceManager _clusterMgr;
@@ -32,6 +31,7 @@ public class ClusterPipeline : IRenderFeature
     private readonly PingPongHandle _hizPingPong;
     private HiZDebugMode _prevHiZMode = HiZDebugMode.Full2Phase;
     internal ClusterDebugReadbackPass? _debugReadbackPass;
+    private IPipelineState? _materialShadePSO;
 
     // ─── Configuration ───
     public HiZDebugMode HiZMode { get; set; } = HiZDebugMode.Full2Phase;
@@ -123,6 +123,10 @@ public class ClusterPipeline : IRenderFeature
     private ITexture[]? _defaultTextures;
     private ISampler? _defaultSampler;
 
+    private readonly BinSpace _binSpace = new();
+    private int _rasterBinFieldIndex;
+    private int _shadingBinFieldIndex;
+
     // ─── 产出（AddPasses 后有效） ───
     public ClusterGlobalResources LastGlobalResources { get; private set; }
     public ClusterCullOutput LastCullOutput { get; private set; }
@@ -151,11 +155,9 @@ public class ClusterPipeline : IRenderFeature
         _hizPingPong = new PingPongHandle();
 
         _uploadStage = new ClusterUploadStage(context, clusterMgr, instanceMgr);
-        _traverseStage = new ClusterTraverseStage(context, clusterMgr, instanceMgr);
-        _cullStage = new ClusterCullStage(context);
+        _bvhTraversePass = new ClusterBVHTraversePass(context, clusterMgr, instanceMgr);
 
-        _shadeBinStage = new ClusterShadeBinStage(context);
-        _shadeStage = new ClusterShadeStage(context, registry);
+        _shadeStage = new ClusterShade(context, registry);
     }
 
     // ─── Factory methods ───
@@ -181,9 +183,9 @@ public class ClusterPipeline : IRenderFeature
     }
 
     /// <summary>
-    /// Sets up a StandardPBRMaterial with default (1×1 white) textures.
+    /// Sets up a Material with default (1×1 white) textures.
     /// </summary>
-    public void SetupMaterialWithDefaults(StandardPBRMaterial mat)
+    public void SetupMaterialWithDefaults(Material mat)
     {
         if (_defaultTextures == null || _defaultSampler == null)
             throw new InvalidOperationException(
@@ -196,21 +198,40 @@ public class ClusterPipeline : IRenderFeature
         #pragma warning restore CS0618
     }
 
+    /// <summary>
+    /// Creates SRB for a newly registered material's passes using the shade PSO.
+    /// </summary>
+    public void CreateSRBForMaterial(Material mat)
+    {
+        if (_materialShadePSO == null)
+            throw new InvalidOperationException("PSO not created. Call Initialize() first.");
+        foreach (var pass in mat.Passes)
+        {
+            pass.SRB ??= _materialShadePSO.CreateShaderResourceBinding(false);
+        }
+    }
+
     public void Initialize(RenderContext context)
     {
         _uploadStage.Init();
-        _traverseStage.Init();
-        _cullStage.Init();
+        _bvhTraversePass.Init();
 
-        _shadeBinStage.Init();
-        _shadeStage.Init();
         _debugReadbackPass = new ClusterDebugReadbackPass(context);
 
-        // Register material shader types + create default textures
+        // 初始化管线自有 BinSpace 布局
+        _rasterBinFieldIndex = _binSpace.RegisterField("RasterBin");
+        _shadingBinFieldIndex = _binSpace.RegisterField("ShadingBin");
+        _binSpace.FreezeLayout();
+
+        // Register material shader types + create default textures (gets PSO)
         #pragma warning disable CS0618 // Obsolete access is intentional
         ClusterRenderFeature.RegisterDefaultMaterials(
-            context, _registry, out _defaultTextures, out _defaultSampler);
+            context, _registry, out _defaultTextures, out _defaultSampler, out _materialShadePSO);
         #pragma warning restore CS0618
+
+        // Set PSO on shade facade before Init
+        _shadeStage.SetMaterialShadePSO(_materialShadePSO);
+        _shadeStage.Init();
     }
 
     public void AddPasses(RenderGraph graph)
@@ -226,7 +247,7 @@ public class ClusterPipeline : IRenderFeature
         // ─── HiZ state (managed by Pipeline via PingPongHandle) ───
         uint hizWidth = Math.Max(screenWidth, 1);
         uint hizHeight = Math.Max(screenHeight, 1);
-        uint hizMipCount = ClusterCullStage.CalculateMipCount(hizWidth, hizHeight);
+        uint hizMipCount = ClusterCull.CalculateMipCount(hizWidth, hizHeight);
         var hizInvSize = new Vector2(1.0f / hizWidth, 1.0f / hizHeight);
 
         // Reset ping-pong history when HiZ mode changes
@@ -263,7 +284,38 @@ public class ClusterPipeline : IRenderFeature
         var activeLodScale = _freezeCullingCamera ? _frozenLodScale : _lodScale;
         var activeForcedLOD = _freezeCullingCamera ? _frozenForcedLODLevel : _forcedLODLevel;
 
-        // ─── Upload ───
+        // ─── Upload global data (BVH/InstanceHeaders/PageHeap) ───
+        _binSpace.RebuildIfDirty(_registry);
+        var globals = _uploadStage.AddPasses(graph);
+        LastGlobalResources = globals;
+
+        // ─── Create CullingUniforms + upload pass ───
+        var cullingData = CullingUniforms.Create(
+            activeView, activeProj, activeCamPos,
+            activeLodThreshold, activeLodScale, activeForcedLOD,
+            (uint)_instanceMgr.Count, BypassCulling, DumpNextFrame, DebugShowHiZAABBs,
+            _prevViewProjT, _hizPingPong.HasHistory, hizMipCount, hizInvSize,
+            _prevView, _prevProj,
+            _clusterMgr.QuantOrigin, _clusterMgr.QuantStep
+        );
+        var hCullingUB = AddDynamicUniformPass(graph, "CullingUniforms", cullingData);
+
+        // ─── Create DrawUniforms + upload pass ───
+        var viewProjT = Matrix4x4.Transpose(activeView * activeProj);
+        var viewT = Matrix4x4.Transpose(activeView);
+        var hDrawUB = AddDynamicUniformPass(graph, "DrawUniforms", new DrawUniforms
+        {
+            ViewProj = viewProjT,
+            View = viewT,
+            PageTableSize = _clusterMgr.PageCount,
+            DebugMode = (uint)DebugMode,
+            ScreenWidth = screenWidth,
+            ScreenHeight = screenHeight,
+            QuantOrigin = _clusterMgr.QuantOrigin,
+            QuantStep = _clusterMgr.QuantStep,
+        });
+
+        // ─── Build uploadConfig for Traverse stage frame data ───
         var uploadConfig = ClusterUploadConfig.Default(activeView, activeProj, activeCamPos, screenWidth, screenHeight) with
         {
             LodThreshold = activeLodThreshold,
@@ -280,11 +332,9 @@ public class ClusterPipeline : IRenderFeature
             HiZMipCount = hizMipCount,
             HiZInvSize = hizInvSize,
         };
-        var globals = _uploadStage.AddPasses(graph, uploadConfig);
-        LastGlobalResources = globals;
 
         // ─── Traverse ───
-        var traverseOut = _traverseStage.AddPasses(graph, globals, ClusterTraverseConfig.Default(), uploadConfig);
+        var traverseOut = ClusterTraverse.AddPasses(graph, _context, _bvhTraversePass, _clusterMgr, _instanceMgr, globals, hCullingUB, ClusterTraverseConfig.Default(), uploadConfig);
 
         // ─── Phase2 + utility buffers (owned by Pipeline, not Traverse) ───
         var hPhase2IndirectDrawArgs = graph.CreateBuffer("Phase2IndirectDrawArgs", new BufferDesc
@@ -308,16 +358,20 @@ public class ClusterPipeline : IRenderFeature
 
         // ─── Cull ───
         var cullConfig = ClusterCullConfig.Default() with { HiZMode = HiZMode };
-        var cullOut = _cullStage.AddPasses(graph, traverseOut, globals, cullConfig, hCurrHiZ, hPrevHiZ, _hizPingPong.HasHistory, hPhase2IndirectDrawArgs, DebugShowHiZAABBs);
+        var cullOut = ClusterCull.AddPasses(graph, _context, traverseOut, globals, hCullingUB, cullConfig, hCurrHiZ, hPrevHiZ, _hizPingPong.HasHistory, hPhase2IndirectDrawArgs, DebugShowHiZAABBs);
         LastCullOutput = cullOut;
 
         graph.MarkOutput(colorTarget);
         if (hCurrHiZ.IsValid)
             graph.MarkOutput(hCurrHiZ);
 
+        // ─── MaterialSlotBuffer (SOA, shared by raster + shade binning) ───
+        var hMaterialSlotBuffer = _binSpace.AddUploadPass(graph);
+
         // ─── RasterBin Phase1 ───
-        var rasterBinP1 = ClusterRasterBin.AddPasses(graph, _context, cullOut, globals,
-            ClusterRasterBinConfig.Default(), cullOut.DrawArgs, cullOut.Phase2DrawArgs);
+        var rasterBinP1 = ClusterRasterBin.AddPasses(graph, _context, cullOut,
+            globals.GlobalInstanceHeader, cullOut.DrawArgs, cullOut.Phase2DrawArgs, hMaterialSlotBuffer,
+            (uint)_binSpace.SlotCapacity, (uint)_rasterBinFieldIndex);
 
         // ─── Draw Phase1 ───
         var drawConfigP1 = ClusterDrawConfig.Opaque() with
@@ -327,29 +381,28 @@ public class ClusterPipeline : IRenderFeature
             Overdraw = OverdrawEnabled,
             VisibleClusterMeta = hZeroOffsetBuffer,
         };
-        var rasterP1 = ClusterDraw.AddPasses(graph, _context, rasterBinP1, cullOut, globals, drawConfigP1, depthTarget, screenWidth, screenHeight);
+        var rasterP1 = ClusterDraw.AddPasses(graph, _context, rasterBinP1, cullOut, globals, hDrawUB, drawConfigP1, depthTarget, screenWidth, screenHeight);
 
         // ─── Phase1 HiZ Build (AFTER Phase1 Draw so depth has real geometry) ───
         if ((HiZMode == HiZDebugMode.Phase1ThenHiZ || HiZMode == HiZDebugMode.Full2Phase)
             && hCurrHiZ.IsValid)
         {
-            _cullStage.AddFinalHiZBuild(graph, depthTarget, hCurrHiZ, hizMipCount);
+            ClusterCull.AddFinalHiZBuild(graph, _context, depthTarget, hCurrHiZ, hizMipCount);
         }
 
         if (HiZMode == HiZDebugMode.Full2Phase && hCurrHiZ.IsValid)
         {
             // ─── Phase2 Cull (uses Phase1's HiZ built from real depth) ───
-            _cullStage.AddPhase2Passes(graph, cullOut, globals, hCurrHiZ);
+            ClusterCull.AddPhase2Passes(graph, _context, cullOut, globals, hCullingUB, hCurrHiZ);
 
             // ─── RasterBin Phase2 ───
-            var rasterBinP2 = ClusterRasterBin.AddPasses(graph, _context, cullOut, globals,
-                ClusterRasterBinConfig.Default(), cullOut.Phase2DrawArgs, cullOut.DrawArgs, tag: "P2");
+            var rasterBinP2 = ClusterRasterBin.AddPasses(graph, _context, cullOut,
+                globals.GlobalInstanceHeader, cullOut.Phase2DrawArgs, cullOut.DrawArgs, hMaterialSlotBuffer,
+                (uint)_binSpace.SlotCapacity, (uint)_rasterBinFieldIndex, tag: "P2");
 
             // ─── Draw Phase2 ───
             var drawConfigP2 = ClusterDrawConfig.Opaque() with
             {
-                OutputVisBuffer = rasterP1.VisBuffer,
-                OutputDepth = rasterP1.DepthTarget,
                 ClearTargets = false,
                 DebugMode = DebugMode,
                 Wireframe = WireframeEnabled,
@@ -357,10 +410,11 @@ public class ClusterPipeline : IRenderFeature
                 Tag = "P2",
                 VisibleClusterMeta = hZeroOffsetBuffer,
             };
-            var rasterP2 = ClusterDraw.AddPasses(graph, _context, rasterBinP2, cullOut, globals, drawConfigP2, depthTarget, screenWidth, screenHeight);
+            var rasterP2 = ClusterDraw.AddPasses(graph, _context, rasterBinP2, cullOut, globals, hDrawUB, drawConfigP2, depthTarget, screenWidth, screenHeight,
+                hOutputVisBuffer: rasterP1.VisBuffer, hOutputDepth: rasterP1.DepthTarget);
 
             // ─── Final HiZ Build (from Phase1+Phase2 depth, for next frame's Phase1) ───
-            _cullStage.AddFinalHiZBuild(graph, depthTarget, hCurrHiZ, hizMipCount);
+            ClusterCull.AddFinalHiZBuild(graph, _context, depthTarget, hCurrHiZ, hizMipCount);
 
             LastOpaqueRasterOutput = rasterP2;
         }
@@ -374,68 +428,40 @@ public class ClusterPipeline : IRenderFeature
         // ─── Transparent pass (optional) ───
         if (IncludeTransparentPass)
         {
-            var transparentConfig = ClusterDrawConfig.Transparent(LastOpaqueRasterOutput.DepthTarget) with
+            var transparentConfig = ClusterDrawConfig.Opaque() with
             {
+                DepthWrite = false,
+                ClearTargets = true,
+                Tag = "Transparent",
                 DebugMode = DebugMode,
                 VisibleClusterMeta = hZeroOffsetBuffer,
             };
             var transparentRaster = ClusterDraw.AddPasses(
-                graph, _context, rasterBinP1, cullOut, globals, transparentConfig,
-                depthTarget, screenWidth, screenHeight);
+                graph, _context, rasterBinP1, cullOut, globals, hDrawUB, transparentConfig,
+                depthTarget, screenWidth, screenHeight,
+                hOutputDepth: LastOpaqueRasterOutput.DepthTarget);
             LastTransparentRasterOutput = transparentRaster;
         }
 
         // ─── Shade ───
         if (UseVisBuffer)
         {
-            uint drawDebugMode = (uint)DebugMode;
-            bool isResolveOnlyDebug = drawDebugMode == 1 || drawDebugMode == 2;
-
-            var shadeBinOut = _shadeBinStage.AddPasses(graph,
-                LastOpaqueRasterOutput, cullOut, globals,
-                ClusterShadeBinConfig.Default(),
-                Math.Max(_registry.MaterialCount, 1u),
-                screenWidth, screenHeight);
+            var activeCamPosForShade = _freezeCullingCamera ? _frozenCameraPos : _cameraPos;
+            var (shadeBinOut, shadeOut) = _shadeStage.AddPasses(graph,
+                LastOpaqueRasterOutput, cullOut, globals, hDrawUB,
+                hMaterialSlotBuffer, colorTarget, depthTarget,
+                _binSpace, _shadingBinFieldIndex, _registry,
+                _view, _proj, activeCamPosForShade,
+                _clusterMgr.PageCount, _clusterMgr.QuantOrigin, _clusterMgr.QuantStep,
+                DebugMode, screenWidth, screenHeight);
             LastShadeBinOutput = shadeBinOut;
-
-            var viewProjT = Matrix4x4.Transpose(_view * _proj);
-            var viewT = Matrix4x4.Transpose(_view);
-            var shadeConfig = ClusterShadeConfig.Default(colorTarget) with
-            {
-                DebugMode = drawDebugMode,
-                UseResolveDebug = isResolveOnlyDebug,
-                ViewProj = viewProjT,
-                View = viewT,
-                PageTableSize = _clusterMgr.PageCount,
-                QuantOrigin = _clusterMgr.QuantOrigin,
-                QuantStep = _clusterMgr.QuantStep,
-                CameraPos = _freezeCullingCamera ? _frozenCameraPos : _cameraPos,
-            };
-            var shadeOut = _shadeStage.AddPasses(graph,
-                LastOpaqueRasterOutput, shadeBinOut, cullOut, globals,
-                shadeConfig, depthTarget, screenWidth, screenHeight);
             LastShadeOutput = shadeOut;
         }
 
         // ─── Debug readback ───
         if (_debugReadbackPass != null)
         {
-            _debugReadbackPass.HCandidateCount = traverseOut.CandidateCount;
-            _debugReadbackPass.HIndirectDrawArgs = cullOut.DrawArgs;
-            _debugReadbackPass.HCandidateArgs = traverseOut.CandidateArgs;
-            _debugReadbackPass.HPhase2CandidateCount = cullOut.Phase2CandidateCount;
-            _debugReadbackPass.HPhase2IndirectDrawArgs = cullOut.Phase2DrawArgs;
-
-            var hDebugReadback = graph.CreateBuffer("DebugReadback", new BufferDesc
-            {
-                Size = 256,
-                Usage = Usage.Staging,
-                CPUAccessFlags = CpuAccessFlags.Read,
-            });
-            graph.MarkOutput(hDebugReadback);
-            _debugReadbackPass.HDebugReadbackBuffer = hDebugReadback;
-            graph.AddPass(_debugReadbackPass);
-
+            _debugReadbackPass.AddPasses(graph, traverseOut, cullOut);
             _lastDebugHiZData = _debugReadbackPass.DebugHiZData;
         }
 
@@ -450,15 +476,42 @@ public class ClusterPipeline : IRenderFeature
         if (DumpNextFrame) DumpNextFrame = false;
     }
 
+    /// <summary>
+    /// 创建 Dynamic 的 uniform buffer 并添加 upload pass。
+    /// </summary>
+    private static RenderGraphHandle AddDynamicUniformPass<T>(RenderGraph graph, string name, T data) where T : unmanaged
+    {
+        var handle = graph.CreateBuffer(name, new BufferDesc
+        {
+            Size = (ulong)Marshal.SizeOf<T>(),
+            Usage = Usage.Dynamic,
+            BindFlags = BindFlags.UniformBuffer,
+            CPUAccessFlags = CpuAccessFlags.Write,
+        });
+        graph.AddPass<object>(
+            $"Upload{name}",
+            (builder, _) => { builder.Write(handle, ResourceState.ConstantBuffer); },
+            (rgCtx, _) =>
+            {
+                var ctx2 = rgCtx.RenderContext.ImmediateContext;
+                var buf = rgCtx.GetBuffer(handle);
+                if (ctx2 != null && buf != null)
+                {
+                    var span = ctx2.MapBuffer<T>(buf, MapType.Write, MapFlags.Discard);
+                    span[0] = data;
+                    ctx2.UnmapBuffer(buf, MapType.Write);
+                }
+            }
+        );
+        return handle;
+    }
+
     public void Dispose()
     {
         _uploadStage.Dispose();
-        _traverseStage.Dispose();
-        _cullStage.Dispose();
-
-
-        _shadeBinStage.Dispose();
+        _bvhTraversePass.Dispose();
         _shadeStage.Dispose();
+        _binSpace.Dispose();
         _defaultSampler?.Dispose();
         if (_defaultTextures != null)
             foreach (var t in _defaultTextures) t?.Dispose();

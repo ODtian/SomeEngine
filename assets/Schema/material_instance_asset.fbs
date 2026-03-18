@@ -1,0 +1,17 @@
+// FlatBuffers schema for Material Instance Asset
+namespace SomeEngine.Assets.Schema;
+
+attribute "fs_serializer";
+attribute "fs_vector";
+
+table ParamOverride {
+    name: string;                         // overridden texture name
+    path: string;                         // new Texture asset path
+}
+
+table MaterialInstanceAsset (fs_serializer) {
+    parent: string;                       // parent Material asset path
+    overrides: [ParamOverride] (fs_vector:"IList");
+}
+
+root_type MaterialInstanceAsset;

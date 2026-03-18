@@ -1,0 +1,28 @@
+// FlatBuffers schema for Material Asset
+namespace SomeEngine.Assets.Schema;
+
+attribute "fs_serializer";
+attribute "fs_vector";
+
+table TagEntry {
+    name: string;
+    value: int = 0;
+}
+
+table PassEntry {
+    shader: string;                       // ShaderAsset name or path
+    tags: [TagEntry] (fs_vector:"IList");
+}
+
+table TextureBinding {
+    name: string;                         // param name (e.g. "AlbedoMap")
+    path: string;                         // Texture asset path
+}
+
+table MaterialAsset (fs_serializer) {
+    name: string;
+    passes: [PassEntry] (fs_vector:"IList");
+    textures: [TextureBinding] (fs_vector:"IList");
+}
+
+root_type MaterialAsset;

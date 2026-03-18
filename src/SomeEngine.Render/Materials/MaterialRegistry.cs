@@ -1,74 +1,117 @@
+using System;
+using System.Collections.Generic;
 using Diligent;
 
 namespace SomeEngine.Render.Materials;
 
 /// <summary>
-/// 全局材质注册表。管理 ShaderType（PSO 缓存）和 Material 实例。
+/// 材质注册表。封装 TagStore&lt;MaterialPass&gt;，管理 Material 注册/注销和 Tag 查询。
+/// <para>
+/// 注册 Material 时，为每个 MaterialPass 分配全局唯一 MaterialID。
+/// </para>
 /// </summary>
 public sealed class MaterialRegistry : IDisposable
 {
-    private readonly Dictionary<Type, MaterialShaderType> _typeMap = new();
-    private readonly List<MaterialBase> _materials = new();
-    private readonly Dictionary<MaterialShaderType, List<MaterialBase>> _byShaderType = new();
-    private uint _nextID;
+    private readonly TagStore<MaterialPass> _tagStore = new();
+    private readonly List<Material> _materials = new();
+    private readonly Dictionary<uint, MaterialPass> _passById = new();
+    private uint _nextMaterialId;
+
+    /// <summary>已注册 MaterialPass 总数。</summary>
+    public uint MaterialCount => (uint)_passById.Count;
+
+    /// <summary>Tag 版本号。</summary>
+    public uint Version => _tagStore.Version;
+
+
+
+    /// <summary>所有已注册的 Material。</summary>
+    public IReadOnlyList<Material> Materials => _materials;
 
     /// <summary>
-    /// 注册材质类型 → ShaderType 映射。
-    /// PSO 由管线通过 Slang 特化编译后传入。
+    /// 注册 Material。为其每个 MaterialPass 分配 ID 并注册到 TagStore。
     /// </summary>
-    public MaterialShaderType RegisterShaderType<TMaterial>(
-        string name,
-        IPipelineState mainPSO) where TMaterial : MaterialBase, new()
+    public void Register(Material material)
     {
-        var slangName = new TMaterial().SlangStructName;
-        var type = new MaterialShaderType(name, slangName, mainPSO);
-        _typeMap[typeof(TMaterial)] = type;
-        _byShaderType[type] = new List<MaterialBase>();
-        return type;
-    }
+        _materials.Add(material);
 
-    /// <summary>创建材质实例（分配 ID + SRB）。</summary>
-    public TMaterial CreateMaterial<TMaterial>(string name = "")
-        where TMaterial : MaterialBase, new()
-    {
-        if (!_typeMap.TryGetValue(typeof(TMaterial), out var shaderType))
-            throw new InvalidOperationException(
-                $"ShaderType not registered for {typeof(TMaterial).Name}. " +
-                $"Call RegisterShaderType<{typeof(TMaterial).Name}>() first.");
-
-        var mat = new TMaterial
+        foreach (var pass in material.Passes)
         {
-            MaterialID = _nextID++,
-            ShaderType = shaderType,
-            SRB = shaderType.CreateSRB(),
-            Name = name,
-        };
-        _materials.Add(mat);
-        _byShaderType[shaderType].Add(mat);
-        return mat;
+            pass.MaterialID = _nextMaterialId++;
+            _passById[pass.MaterialID] = pass;
+            _tagStore.Register(pass);
+        }
+
+
+
+        // 自动推导多 Pass tag
+        if (material.Passes.Length > 1)
+        {
+            var primary = material.Passes[0];
+            _tagStore.SetTag(primary, new MultiPassTag
+            {
+                OverlayCount = (byte)(material.Passes.Length - 1)
+            });
+
+            for (int i = 1; i < material.Passes.Length; i++)
+            {
+                _tagStore.SetTag(material.Passes[i], new OverlayTag
+                {
+                    LayerIndex = (byte)(i - 1),
+                    PrimaryPass = primary,
+                });
+            }
+        }
     }
 
-    /// <summary>通过 MaterialID 查询。</summary>
-    public MaterialBase? GetMaterial(uint materialID)
-        => materialID < _materials.Count ? _materials[(int)materialID] : null;
 
-    /// <summary>已注册的所有 ShaderType。</summary>
-    public IReadOnlyList<MaterialShaderType> ShaderTypes
-        => [.. _byShaderType.Keys];
 
-    /// <summary>获取指定 ShaderType 下的所有材质实例。</summary>
-    public IReadOnlyList<MaterialBase> GetMaterialsByShaderType(MaterialShaderType type)
-        => _byShaderType.TryGetValue(type, out var list) ? list : [];
+    /// <summary>
+    /// 注销 Material。移除其所有 MaterialPass。
+    /// </summary>
+    public void Unregister(Material material)
+    {
 
-    /// <summary>当前已分配的材质数量。</summary>
-    public uint MaterialCount => _nextID;
+        foreach (var pass in material.Passes)
+        {
+            _tagStore.Unregister(pass);
+            _passById.Remove(pass.MaterialID);
+        }
+        _materials.Remove(material);
+    }
+
+    /// <summary>按 ID 查找 MaterialPass。</summary>
+    public MaterialPass? GetPass(uint materialId)
+    {
+        return _passById.TryGetValue(materialId, out var pass) ? pass : null;
+    }
+
+    // ── Tag API（委托给 TagStore） ──
+
+    public void SetTag<TTag>(MaterialPass pass, TTag value = default!) where TTag : struct, IMaterialTag
+        => _tagStore.SetTag(pass, value);
+
+    public TTag? GetTag<TTag>(MaterialPass pass) where TTag : struct, IMaterialTag
+        => _tagStore.GetTag<TTag>(pass);
+
+    public bool HasTag<TTag>(MaterialPass pass) where TTag : struct, IMaterialTag
+        => _tagStore.HasTag<TTag>(pass);
+
+    public MaterialPass[] Query<T1>() where T1 : struct, IMaterialTag
+        => _tagStore.Query<T1>();
+
+    public MaterialPass[] Query<T1, T2>() where T1 : struct, IMaterialTag where T2 : struct, IMaterialTag
+        => _tagStore.Query<T1, T2>();
+
+    /// <summary>获取所有 MaterialPass。</summary>
+    public MaterialPass[] GetAllPasses() => _tagStore.GetAll();
 
     public void Dispose()
     {
-        foreach (var m in _materials) m.Dispose();
-        foreach (var t in _byShaderType.Keys) t.Dispose();
+        foreach (var mat in _materials)
+            mat.Dispose();
         _materials.Clear();
-        _byShaderType.Clear();
-        _typeMap.Clear();
+        _passById.Clear();
+
     }
 }

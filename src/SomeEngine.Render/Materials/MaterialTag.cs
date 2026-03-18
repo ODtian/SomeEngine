@@ -1,61 +1,75 @@
 namespace SomeEngine.Render.Materials;
 
 /// <summary>
-/// 材质语义标签 marker 接口。
-/// 每个标签定义为实现此接口的 struct，以 Type 为 identity。
-/// 支持纯 marker（无值）和带值标签（如 StencilRefTag）。
-/// 各管线/系统可独立扩展自己的标签类型。
+/// 标记 IMaterialTag struct 的序列化名称。
+/// 源生成器扫描此特性生成 string→struct 反序列化映射。
 /// </summary>
-public interface IMaterialTag { }
-
-/// <summary>
-/// 标签集合。内部用 Dictionary&lt;Type, IMaterialTag&gt; 存储。
-/// struct 标签存入时会有一次装箱，但标签是低频操作可接受。
-/// </summary>
-public sealed class MaterialTagSet
+[AttributeUsage(AttributeTargets.Struct)]
+public sealed class MaterialTagAttribute(string name) : Attribute
 {
-    private readonly Dictionary<Type, IMaterialTag> _tags = new();
-
-    /// <summary>设置带值标签。</summary>
-    public void Set<T>(T tag) where T : struct, IMaterialTag => _tags[typeof(T)] = tag;
-
-    /// <summary>添加无值 marker 标签。</summary>
-    public void Add<T>() where T : struct, IMaterialTag => _tags[typeof(T)] = new T();
-
-    /// <summary>获取标签值（不存在返回 default）。</summary>
-    public T Get<T>() where T : struct, IMaterialTag
-        => _tags.TryGetValue(typeof(T), out var t) ? (T)t : default;
-
-    /// <summary>是否有此标签。</summary>
-    public bool Has<T>() where T : struct, IMaterialTag => _tags.ContainsKey(typeof(T));
-
-    /// <summary>按 Type 查询是否有此标签。</summary>
-    public bool Has(Type tagType) => _tags.ContainsKey(tagType);
-
-    /// <summary>移除标签。</summary>
-    public void Remove<T>() where T : struct, IMaterialTag => _tags.Remove(typeof(T));
-
-    /// <summary>标签数量。</summary>
-    public int Count => _tags.Count;
+    /// <summary>序列化名称（如 "opaque", "masked"）。</summary>
+    public string Name { get; } = name;
 }
 
-// ── 核心标签（渲染层通用）──
+/// <summary>语义标签接口。所有材质 tag 必须实现此接口。</summary>
+public interface IMaterialTag { }
 
-/// <summary>不透明。</summary>
+// ─── 基础渲染通道 Tag ───
+
+/// <summary>不透明渲染。</summary>
+[MaterialTag("opaque")]
 public struct OpaqueTag : IMaterialTag { }
 
-/// <summary>Alpha Test / Masked。</summary>
+/// <summary>Alpha 裁剪渲染。</summary>
+[MaterialTag("masked")]
 public struct MaskedTag : IMaterialTag { }
 
-/// <summary>半透明。</summary>
+/// <summary>半透明渲染。</summary>
+[MaterialTag("translucent")]
 public struct TranslucentTag : IMaterialTag { }
 
 /// <summary>双面渲染。</summary>
+[MaterialTag("two_sided")]
 public struct TwoSidedTag : IMaterialTag { }
 
-/// <summary>Stencil 参考值。</summary>
+/// <summary>模板参考值。</summary>
+[MaterialTag("stencil_ref")]
 public struct StencilRefTag : IMaterialTag
 {
     public byte Value;
-    public StencilRefTag(byte value) => Value = value;
+}
+
+// ─── 管线兼容性 Tag（不序列化，自动推导） ───
+
+/// <summary>支持 Cluster shader 管线。</summary>
+public struct ClusterShaderTag : IMaterialTag { }
+
+/// <summary>支持 Forward 管线。</summary>
+public struct ForwardShaderTag : IMaterialTag { }
+
+// ─── 多 Pass Tag ───
+
+/// <summary>投射阴影。</summary>
+[MaterialTag("shadow_caster")]
+public struct ShadowCasterTag : IMaterialTag { }
+
+/// <summary>
+/// 标记 primary pass 拥有 overlay pass。自动推导，不序列化。
+/// </summary>
+public struct MultiPassTag : IMaterialTag
+{
+    /// <summary>该材质的 overlay pass 数量。</summary>
+    public byte OverlayCount;
+}
+
+/// <summary>
+/// 标记 overlay pass。包含层序和回指 primary pass 的引用。自动推导，不序列化。
+/// </summary>
+public struct OverlayTag : IMaterialTag
+{
+    /// <summary>在 overlay 序列中的索引（0-based）。</summary>
+    public byte LayerIndex;
+
+    /// <summary>此 overlay 对应的 primary pass 引用。</summary>
+    public MaterialPass? PrimaryPass;
 }

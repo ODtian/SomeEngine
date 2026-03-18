@@ -652,6 +652,31 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
         _context = context;
     }
 
+    /// <summary>
+    /// 创建 readback buffer 并添加 debug readback pass 到 RenderGraph。
+    /// </summary>
+    public void AddPasses(
+        RenderGraph graph,
+        in ClusterTraverseOutput traverse,
+        in ClusterCullOutput cull)
+    {
+        HCandidateCount = traverse.CandidateCount;
+        HIndirectDrawArgs = cull.DrawArgs;
+        HCandidateArgs = traverse.CandidateArgs;
+        HPhase2CandidateCount = cull.Phase2CandidateCount;
+        HPhase2IndirectDrawArgs = cull.Phase2DrawArgs;
+
+        var hDebugReadback = graph.CreateBuffer("DebugReadback", new BufferDesc
+        {
+            Size = 256,
+            Usage = Usage.Staging,
+            CPUAccessFlags = CpuAccessFlags.Read,
+        });
+        graph.MarkOutput(hDebugReadback);
+        HDebugReadbackBuffer = hDebugReadback;
+        graph.AddPass(this);
+    }
+
     public void Setup(RenderGraphBuilder builder)
     {
         builder.Read(HCandidateCount, ResourceState.CopySource);

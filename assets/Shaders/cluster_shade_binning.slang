@@ -4,8 +4,12 @@ struct ShadeBinUniforms
 {
     uint ScreenWidth;
     uint ScreenHeight;
-    uint MaterialCount;   // Active material count this frame
-    uint Pad;
+    uint MaterialCount;        // Active material count this frame
+    uint SlotCapacity;         // MaterialSlotBuffer SOA capacity (even)
+    uint BinFieldIndex;        // Field index for this binning pass in SOA
+    uint Pad0;
+    uint Pad1;
+    uint Pad2;
 };
 
 ConstantBuffer<ShadeBinUniforms> Uniforms;
@@ -13,6 +17,7 @@ Texture2D<uint> VisBuffer;
 
 StructuredBuffer<DrawRequest> VisibleClusters;
 StructuredBuffer<GpuInstanceHeader> InstanceHeaders;
+StructuredBuffer<uint> MaterialSlotBuffer;
 
 // ─── Pass 1: Count ─── Dispatch: ceil(W/8), ceil(H/8), 1 ───
 
@@ -26,13 +31,14 @@ void CSBinCount(uint3 tid : SV_DispatchThreadID)
     uint visData = VisBuffer[tid.xy];
     if (visData == 0) return;
 
-    // VisBuffer → DrawRequest → InstanceHeader → MaterialID
+    // VisBuffer → DrawRequest → InstanceHeader → MaterialSlotBuffer → ShadingBin
     uint visClusterIdx = (visData >> 7) - 1;
     DrawRequest req = VisibleClusters[visClusterIdx];
-    uint materialID = InstanceHeaders[req.InstanceID].MaterialID;
+    uint slotOffset = InstanceHeaders[req.InstanceID].MaterialSlotOffset;
+    uint shadingBin = GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
 
     uint dummy;
-    InterlockedAdd(BinCounts[materialID], 1, dummy);
+    InterlockedAdd(BinCounts[shadingBin], 1, dummy);
 }
 
 // ─── Pass 2: Reserve ─── Dispatch: 1, 1, 1 ───
@@ -97,9 +103,10 @@ void CSBinScatter(uint3 tid : SV_DispatchThreadID)
 
     uint visClusterIdx = (visData >> 7) - 1;
     DrawRequest req = VisibleClusters[visClusterIdx];
-    uint materialID = InstanceHeaders[req.InstanceID].MaterialID;
+    uint slotOffset = InstanceHeaders[req.InstanceID].MaterialSlotOffset;
+    uint shadingBin = GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
 
     uint writeIdx;
-    InterlockedAdd(BinScatterCount[materialID], 1, writeIdx);
-    PixelCoordBuffer[BinOffsets[materialID] + writeIdx] = (tid.y << 16) | tid.x;
+    InterlockedAdd(BinScatterCount[shadingBin], 1, writeIdx);
+    PixelCoordBuffer[BinOffsets[shadingBin] + writeIdx] = (tid.y << 16) | tid.x;
 }

@@ -14,8 +14,8 @@ public struct BinningUniforms
 {
     public uint MaxBins;
     public uint MaxClustersPerBin;
-    public uint Pad0;
-    public uint Pad1;
+    public uint SlotCapacity;         // MaterialSlotBuffer SOA capacity (even)
+    public uint BinFieldIndex;        // Field index for this binning pass in SOA
 }
 
 /// <summary>
@@ -106,7 +106,8 @@ public static class ClusterBinningPSOs
     internal static void BindSRB(
         IShaderResourceBinding srb,
         IBuffer? uniforms, IBuffer? visible, IBuffer? headers, IBuffer? drawArgs, IBuffer? offsetArgs,
-        IBuffer? meta, IBuffer? binned, IBuffer? binnedDraw, IBuffer? dispatchArgs)
+        IBuffer? meta, IBuffer? binned, IBuffer? binnedDraw, IBuffer? dispatchArgs,
+        IBuffer? materialSlotBuffer = null)
     {
         if (uniforms != null)
             srb.GetVariableByName(ShaderType.Compute, "Uniforms")
@@ -135,6 +136,9 @@ public static class ClusterBinningPSOs
         if (dispatchArgs != null)
             srb.GetVariableByName(ShaderType.Compute, "BinningDispatchArgs")
                 ?.Set(dispatchArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        if (materialSlotBuffer != null)
+            srb.GetVariableByName(ShaderType.Compute, "MaterialSlotBuffer")
+                ?.Set(materialSlotBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
     }
 }
 
@@ -215,6 +219,7 @@ internal sealed class ClusterBinningScatterPass(RenderContext context) : IRender
     public RenderGraphHandle HRasterBinMeta = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinnedDrawArgs = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinnedClusterBuffer = RenderGraphHandle.Invalid;
+    public RenderGraphHandle HMaterialSlotBuffer = RenderGraphHandle.Invalid;
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -224,6 +229,8 @@ internal sealed class ClusterBinningScatterPass(RenderContext context) : IRender
         builder.Read(HDrawArgs, ResourceState.ShaderResource);
         if (HClusterReadOffsetArgs.IsValid)
             builder.Read(HClusterReadOffsetArgs, ResourceState.ShaderResource);
+        if (HMaterialSlotBuffer.IsValid)
+            builder.Read(HMaterialSlotBuffer, ResourceState.ShaderResource);
         builder.Read(HBinningDispatchArgs, ResourceState.IndirectArgument);
         builder.ReadWrite(HRasterBinMeta, ResourceState.UnorderedAccess);
         builder.ReadWrite(HBinnedDrawArgs, ResourceState.UnorderedAccess);
@@ -251,10 +258,12 @@ internal sealed class ClusterBinningScatterPass(RenderContext context) : IRender
             || metaBuf == null || binnedDrawBuf == null || binnedBuf == null)
             return;
 
+        var materialSlotBuf = HMaterialSlotBuffer.IsValid ? rgCtx.GetBuffer(HMaterialSlotBuffer) : null;
+
         var binSRB = ClusterBinningPSOs.RentSRB(ClusterBinningPSOs.BinPSO, ClusterBinningPSOs.BinSRBPool);
         ClusterBinningPSOs.BindSRB(binSRB,
             uniformBuf, visibleBuf, headerBuf, drawArgsBuf, offsetArgsBuf,
-            metaBuf, binnedBuf, binnedDrawBuf, null);
+            metaBuf, binnedBuf, binnedDrawBuf, null, materialSlotBuf);
         ctx.SetPipelineState(ClusterBinningPSOs.BinPSO);
         ctx.CommitShaderResources(binSRB, ResourceStateTransitionMode.Verify);
         ctx.DispatchComputeIndirect(new DispatchComputeIndirectAttribs

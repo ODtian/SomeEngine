@@ -44,7 +44,10 @@ public class ClusterShadeBinStage : IDisposable
         in ClusterCullOutput cull,
         in ClusterGlobalResources globals,
         in ClusterShadeBinConfig config,
+        RenderGraphHandle hMaterialSlotBuffer,
         uint activeMaterialCount,
+        uint slotCapacity,
+        uint shadingBinFieldIndex,
         uint screenWidth,
         uint screenHeight
     )
@@ -82,15 +85,13 @@ public class ClusterShadeBinStage : IDisposable
             Mode = BufferMode.Structured,
             ElementByteStride = 4,
         });
-        var hPixelCoordBuffer = config.OutputPixelCoordBuffer.IsValid
-            ? config.OutputPixelCoordBuffer
-            : graph.CreateBuffer("PixelCoordBuffer", new BufferDesc
-            {
-                Size = (ulong)(screenWidth * screenHeight * 4),
-                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-                Mode = BufferMode.Structured,
-                ElementByteStride = 4,
-            });
+        var hPixelCoordBuffer = graph.CreateBuffer("PixelCoordBuffer", new BufferDesc
+        {
+            Size = (ulong)(screenWidth * screenHeight * 4),
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+            Mode = BufferMode.Structured,
+            ElementByteStride = 4,
+        });
         var hBinIndirectArgs = graph.CreateBuffer("BinIndirectArgs", new BufferDesc
         {
             Size = (ulong)(MaxMaterials * 12),
@@ -105,6 +106,8 @@ public class ClusterShadeBinStage : IDisposable
             ScreenWidth = screenWidth,
             ScreenHeight = screenHeight,
             MaterialCount = activeMaterialCount,
+            SlotCapacity = slotCapacity,
+            BinFieldIndex = shadingBinFieldIndex,
         };
         graph.AddPass<object>(
             "UploadShadeBinUniforms",
@@ -145,6 +148,7 @@ public class ClusterShadeBinStage : IDisposable
         _countPass.HInstanceHeaders = globals.GlobalInstanceHeader;
         _countPass.HShadeBinUniforms = hBinUniforms;
         _countPass.HBinCounts = hBinCounts;
+        _countPass.HMaterialSlotBuffer = hMaterialSlotBuffer;
         graph.AddPass(_countPass);
 
         _reservePass!.HShadeBinUniforms = hBinUniforms;
@@ -161,6 +165,7 @@ public class ClusterShadeBinStage : IDisposable
         _scatterPass.HBinOffsets = hBinOffsets;
         _scatterPass.HBinScatterCount = hBinScatterCount;
         _scatterPass.HPixelCoordBuffer = hPixelCoordBuffer;
+        _scatterPass.HMaterialSlotBuffer = hMaterialSlotBuffer;
         graph.AddPass(_scatterPass);
 
         return new ClusterShadeBinOutput(hPixelCoordBuffer, hBinOffsets, hBinCounts, hBinIndirectArgs);

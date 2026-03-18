@@ -18,11 +18,7 @@ public readonly record struct ClusterGlobalResources(
     RenderGraphHandle PageHeap,
     RenderGraphHandle GlobalTransform,
     RenderGraphHandle GlobalInstanceHeader,
-    RenderGraphHandle InstanceDataHeap,
-    RenderGraphHandle CullingUniforms,
-    RenderGraphHandle DrawUniforms,
-    RenderGraphHandle BinningUniforms,
-    RenderGraphHandle CopyUniforms
+    RenderGraphHandle InstanceDataHeap
 );
 
 /// <summary>
@@ -113,7 +109,6 @@ public readonly record struct ClusterUploadConfig
     /// <summary>是否 dump 当前帧调试数据。</summary>
     public bool DumpNextFrame { get; init; }
     public bool DebugShowHiZAABBs { get; init; }
-
     public static ClusterUploadConfig Default(
         Matrix4x4 view, Matrix4x4 proj, Vector3 cameraPos,
         uint screenWidth, uint screenHeight
@@ -141,11 +136,6 @@ public readonly record struct ClusterTraverseConfig
     /// <summary>BVH 最大遍历深度。</summary>
     public int MaxDepth { get; init; }
 
-    /// <summary>自定义输出 Handle。Invalid = 自动创建。</summary>
-    public RenderGraphHandle OutputCandidateClusters { get; init; }
-    public RenderGraphHandle OutputCandidateArgs { get; init; }
-    public RenderGraphHandle OutputCandidateCount { get; init; }
-
     public static ClusterTraverseConfig Default() => new()
     {
         MaxDepth = 12,
@@ -159,46 +149,19 @@ public readonly record struct ClusterCullConfig
 {
     public HiZDebugMode HiZMode { get; init; }
 
-    /// <summary>自定义输出 Handle。Invalid = 自动创建。</summary>
-    public RenderGraphHandle OutputVisibleClusters { get; init; }
-    public RenderGraphHandle OutputDrawArgs { get; init; }
-
     public static ClusterCullConfig Default() => new()
     {
         HiZMode = HiZDebugMode.Full2Phase,
     };
 }
 
-/// <summary>
-/// Raster Binning Stage 配置。
-/// </summary>
-public readonly record struct ClusterRasterBinConfig
-{
-    public uint MaxBins { get; init; }
-    public uint MaxClustersPerBin { get; init; }
 
-    /// <summary>自定义输出 Handle。Invalid = 自动创建。</summary>
-    public RenderGraphHandle OutputBinnedClusterIndex { get; init; }
-    public RenderGraphHandle OutputBinnedDrawArgs { get; init; }
-
-    public static ClusterRasterBinConfig Default() => new()
-    {
-        MaxBins = 16,
-        MaxClustersPerBin = ClusterLimits.MaxDraws / 16,
-    };
-}
 
 /// <summary>
 /// Draw/Rasterize Stage 配置。
 /// </summary>
 public readonly record struct ClusterDrawConfig
 {
-    /// <summary>写入哪个 VisBuffer。Invalid = 自动创建。</summary>
-    public RenderGraphHandle OutputVisBuffer { get; init; }
-
-    /// <summary>写入哪个 Depth。Invalid = 自动创建。</summary>
-    public RenderGraphHandle OutputDepth { get; init; }
-
     /// <summary>
     /// Draw request 元数据缓冲。当前架构下用于传入可见 cluster 读取基址等扩展信息。
     /// Invalid = Stage 内部回退为 0 偏移缓冲。
@@ -234,24 +197,6 @@ public readonly record struct ClusterDrawConfig
         BinIndex = -1,
         UseVisBuffer = true,
     };
-
-    public static ClusterDrawConfig Transparent(RenderGraphHandle opaqueDepth) => new()
-    {
-        OutputDepth = opaqueDepth,
-        DepthWrite = false,
-        ClearTargets = true,
-        BinIndex = -1,
-        UseVisBuffer = true,
-        Tag = "Transparent",
-    };
-
-    public static ClusterDrawConfig DepthOnly() => new()
-    {
-        DepthWrite = true,
-        ClearTargets = true,
-        BinIndex = -1,
-        UseVisBuffer = false,
-    };
 }
 
 /// <summary>
@@ -259,9 +204,6 @@ public readonly record struct ClusterDrawConfig
 /// </summary>
 public readonly record struct ClusterShadeBinConfig
 {
-    /// <summary>自定义输出 Handle。Invalid = 自动创建。</summary>
-    public RenderGraphHandle OutputPixelCoordBuffer { get; init; }
-
     public static ClusterShadeBinConfig Default() => new();
 }
 

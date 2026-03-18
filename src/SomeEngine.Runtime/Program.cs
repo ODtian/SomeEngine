@@ -298,12 +298,12 @@ class Program
             return NativeFileDialog.ShowOpenModelDialog("Select GLTF/GLB file", initialDirectory);
         }
 
-        void SpawnEntity(GameWorld targetWorld, uint rootIndex, Vector3 position, float scale, uint materialId = 0)
+        void SpawnEntity(GameWorld targetWorld, uint rootIndex, Vector3 position, float scale, uint materialSlotOffset = 0)
         {
             var e = targetWorld.EntityStore.CreateEntity();
             e.AddComponent(new TransformQvvs(position, Quaternion.Identity, scale));
-            e.AddComponent(new MeshInstance { BVHRootIndex = rootIndex, MaterialID = materialId });
-            Console.WriteLine($"SpawnEntity: id={e.Id} rootIndex={rootIndex} materialId={materialId} pos={position}");
+            e.AddComponent(new MeshInstance { BVHRootIndex = rootIndex, MaterialSlotOffset = materialSlotOffset });
+            Console.WriteLine($"SpawnEntity: id={e.Id} rootIndex={rootIndex} materialSlotOffset={materialSlotOffset} pos={position}");
         }
 
         var camera = new FreeCamera(
@@ -390,8 +390,15 @@ class Program
             clusterPipeline.Initialize(context);
 
             // Create 2nd material for multi-material testing
-            var mat1 = materialRegistry.CreateMaterial<StandardPBRMaterial>(); // ID=1
+            var mat1 = new Material { Name = "TestPBR_1", ShaderAssetName = "StandardPBRMaterial" };
             clusterPipeline.SetupMaterialWithDefaults(mat1);
+            materialRegistry.Register(mat1);
+            foreach (var pass in mat1.Passes)
+            {
+                materialRegistry.SetTag<OpaqueTag>(pass);
+                materialRegistry.SetTag<ClusterShaderTag>(pass);
+            }
+            clusterPipeline.CreateSRBForMaterial(mat1);
 
             renderGraph = new RenderGraph();
 

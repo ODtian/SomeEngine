@@ -23,5 +23,7 @@
   <ItemGroup>
     <FlatSharpSchema Include="..\..\assets\Schema\mesh_asset.fbs" />
     <FlatSharpSchema Include="..\..\assets\Schema\shader_asset.fbs" />
+    <FlatSharpSchema Include="..\..\assets\Schema\material_asset.fbs" />
+    <FlatSharpSchema Include="..\..\assets\Schema\material_instance_asset.fbs" />
   </ItemGroup>
 </Project>

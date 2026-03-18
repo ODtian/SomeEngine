@@ -11,7 +11,7 @@ struct ShadeUniforms
     uint ScreenHeight;
     float3 QuantOrigin;
     float QuantStep;
-    uint MaterialID;        // Current material being shaded
+    uint ShadingBin;        // Current shading bin being dispatched
     uint MaterialCount;
     uint Pad0;
     uint Pad1;
@@ -157,7 +157,7 @@ bool buildPixelContext(
 [numthreads(64, 1, 1)]
 void CSMaterialShade(uint3 tid : SV_DispatchThreadID)
 {
-    uint pixelIdx = BinOffsets[Uniforms.MaterialID] + tid.x;
+    uint pixelIdx = BinOffsets[Uniforms.ShadingBin] + tid.x;
     uint packedCoord = PixelCoordBuffer[pixelIdx];
     uint2 pixelCoord = uint2(packedCoord & 0xFFFF, packedCoord >> 16);
 
@@ -181,9 +181,9 @@ void CSMaterialShade(uint3 tid : SV_DispatchThreadID)
             uint h = PCGHash(req.ClusterID);
             color = ColorFromHash(h);
         }
-        else if (Uniforms.DebugMode == 7) // MaterialID (per-dispatch)
+        else if (Uniforms.DebugMode == 7) // ShadingBin (per-dispatch)
         {
-            uint h = PCGHash(Uniforms.MaterialID);
+            uint h = PCGHash(Uniforms.ShadingBin);
             color = ColorFromHash(h);
         }
         else if (Uniforms.DebugMode == 8) // Barycentric

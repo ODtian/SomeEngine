@@ -8,10 +8,14 @@ namespace SomeEngine.Render.Pipelines;
 
 /// <summary>
 /// Per-material shade dispatch pass.
-/// Iterates over ShaderTypes (PSO switch) and Materials (SRB switch + DispatchIndirect).
-/// PSO and SRB are owned by MaterialRegistry, not by this pass.
+/// Iterates over all registered MaterialPasses, binds pipeline + material params, dispatches.
+/// PSO is owned by Feature, SRB is owned per MaterialPass.
 /// </summary>
-public class ClusterMaterialShadePass(RenderContext context, MaterialRegistry registry) : IRenderGraphPass
+public class ClusterMaterialShadePass(
+    RenderContext context,
+    MaterialRegistry registry,
+    IPipelineState? materialShadePSO
+) : IRenderGraphPass
 {
     public string Name => "Cluster Material Shade";
 
@@ -29,7 +33,7 @@ public class ClusterMaterialShadePass(RenderContext context, MaterialRegistry re
     public RenderGraphHandle HOutputColor = RenderGraphHandle.Invalid;
 
     /// <summary>
-    /// Base shade uniform data. MaterialID is overwritten per dispatch iteration.
+    /// Base shade uniform data. ShadingBin is overwritten per dispatch iteration.
     /// Set by ClusterRenderFeature before adding the pass.
     /// </summary>
     public ShadeUniforms ShadeUniformData;
@@ -52,7 +56,7 @@ public class ClusterMaterialShadePass(RenderContext context, MaterialRegistry re
     public void Execute(RenderGraphContext rgCtx)
     {
         var ctx = context.ImmediateContext;
-        if (ctx == null)
+        if (ctx == null || materialShadePSO == null)
             return;
 
         var visBufferSRV = rgCtx.GetTextureView(HVisBuffer, TextureViewType.ShaderResource);
@@ -93,37 +97,37 @@ public class ClusterMaterialShadePass(RenderContext context, MaterialRegistry re
 
         var uniformData = ShadeUniformData;
 
-        // Outer loop: per ShaderType (PSO switch)
-        foreach (var shaderType in registry.ShaderTypes)
+        // Set PSO once (single shader type for now)
+        ctx.SetPipelineState(materialShadePSO);
+
+        // Iterate all MaterialPasses
+        var allPasses = registry.GetAllPasses();
+        foreach (var pass in allPasses)
         {
-            ctx.SetPipelineState(shaderType.PSO);
+            if (pass.SRB == null) continue;
 
-            // Inner loop: per Material (SRB switch + dispatch)
-            foreach (var material in registry.GetMaterialsByShaderType(shaderType))
-            {
-                // 1. Pipeline resources (Dynamic — source generated)
-                pipelineParams.ApplyToSRB(material.SRB);
+            // 1. Pipeline resources (Dynamic — source generated)
+            pipelineParams.ApplyToSRB(pass.SRB);
 
-                // 2. Material resources + composed params (Mutable — source generated)
-                material.CommitBindings();
+            // 2. Material resources (from ShaderParamBag)
+            pass.CommitBindings();
 
-                // 3. Update MaterialID in uniform buffer
-                uniformData.MaterialID = material.MaterialID;
-                var mapped = ctx.MapBuffer<ShadeUniforms>(uniformBuf, MapType.Write, MapFlags.Discard);
-                mapped[0] = uniformData;
-                ctx.UnmapBuffer(uniformBuf, MapType.Write);
+            // 3. Update ShadingBin in uniform buffer
+            uniformData.ShadingBin = pass.MaterialID;
+            var mapped = ctx.MapBuffer<ShadeUniforms>(uniformBuf, MapType.Write, MapFlags.Discard);
+            mapped[0] = uniformData;
+            ctx.UnmapBuffer(uniformBuf, MapType.Write);
 
-                // 4. Dispatch
-                ctx.CommitShaderResources(material.SRB, ResourceStateTransitionMode.Verify);
-                ctx.DispatchComputeIndirect(
-                    new DispatchComputeIndirectAttribs
-                    {
-                        AttribsBuffer = binIndirectArgs,
-                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
-                        DispatchArgsByteOffset = (ulong)(material.MaterialID * 12),
-                    }
-                );
-            }
+            // 4. Dispatch
+            ctx.CommitShaderResources(pass.SRB, ResourceStateTransitionMode.Verify);
+            ctx.DispatchComputeIndirect(
+                new DispatchComputeIndirectAttribs
+                {
+                    AttribsBuffer = binIndirectArgs,
+                    AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+                    DispatchArgsByteOffset = (ulong)(pass.MaterialID * 12),
+                }
+            );
         }
     }
 }

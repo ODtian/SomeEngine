@@ -18,16 +18,20 @@ public class ClusterShadeStage : IDisposable
     private ClusterResolvePass? _resolvePass;
     private bool _initialized;
 
+    private IPipelineState? _materialShadePSO;
+
     public ClusterShadeStage(RenderContext context, MaterialRegistry registry)
     {
         _context = context;
         _registry = registry;
     }
 
+    public void SetMaterialShadePSO(IPipelineState? pso) => _materialShadePSO = pso;
+
     public void Init()
     {
         if (_initialized) return;
-        _materialShadePass = new ClusterMaterialShadePass(_context, _registry);
+        _materialShadePass = new ClusterMaterialShadePass(_context, _registry, _materialShadePSO);
         _resolvePass = new ClusterResolvePass(_context);
         _resolvePass.Init();
         _initialized = true;
@@ -42,6 +46,7 @@ public class ClusterShadeStage : IDisposable
         in ClusterShadeBinOutput shadeBin,
         in ClusterCullOutput cull,
         in ClusterGlobalResources globals,
+        RenderGraphHandle hDrawUniforms,
         in ClusterShadeConfig config,
         RenderGraphHandle depthTarget,
         uint screenWidth,
@@ -84,7 +89,7 @@ public class ClusterShadeStage : IDisposable
                 _resolvePass.HVisibleClusters = cull.VisibleClusters;
                 _resolvePass.HPageHeap = globals.PageHeap;
                 _resolvePass.HGlobalTransformBuffer = globals.GlobalTransform;
-                _resolvePass.HDrawUniforms = globals.DrawUniforms;
+                _resolvePass.HDrawUniforms = hDrawUniforms;
                 _resolvePass.HColorTarget = hResolveTarget;
                 graph.AddPass(_resolvePass);
             }
@@ -104,7 +109,7 @@ public class ClusterShadeStage : IDisposable
             ScreenHeight = screenHeight,
             QuantOrigin = config.QuantOrigin,
             QuantStep = config.QuantStep,
-            MaterialID = 0,
+            ShadingBin = 0,
             MaterialCount = Math.Max(_registry.MaterialCount, 1u),
             LightDir = config.LightDir,
             LightIntensity = config.LightIntensity,

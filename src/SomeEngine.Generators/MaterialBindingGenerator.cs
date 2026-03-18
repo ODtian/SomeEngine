@@ -7,15 +7,15 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 namespace SomeEngine.Generators;
 
 /// <summary>
-/// Incremental Source Generator that auto-generates ApplyToSRB() for IShaderParams implementations
-/// and MaterialBase subclasses. Scans fields/properties marked with [ShaderParam] and detects
+/// Incremental Source Generator that auto-generates ApplyToSRB() for IShaderParams implementations.
+/// Scans fields/properties marked with [ShaderParam] and detects
 /// composed IShaderParams fields for delegation.
 /// </summary>
 [Generator]
 public class ShaderParamsGenerator : IIncrementalGenerator
 {
     private const string ShaderParamAttr = "SomeEngine.Render.Materials.ShaderParamAttribute";
-    private const string MaterialBaseType = "SomeEngine.Render.Materials.MaterialBase";
+
     private const string IShaderParamsType = "SomeEngine.Render.Materials.IShaderParams";
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
@@ -41,10 +41,9 @@ public class ShaderParamsGenerator : IIncrementalGenerator
         if (ctx.SemanticModel.GetDeclaredSymbol(classDecl) is not INamedTypeSymbol symbol)
             return null;
 
-        bool isMaterialBase = InheritsFrom(symbol, MaterialBaseType);
         bool implementsIShaderParams = ImplementsInterface(symbol, IShaderParamsType);
 
-        if (!isMaterialBase && !implementsIShaderParams)
+        if (!implementsIShaderParams)
             return null;
 
         // Collect [ShaderParam] fields/properties (declared on THIS class only)
@@ -156,22 +155,10 @@ public class ShaderParamsGenerator : IIncrementalGenerator
         return new ShaderParamsClassInfo(
             symbol.ContainingNamespace.ToDisplayString(),
             symbol.Name,
-            isMaterialBase,
             bindings.ToImmutable(),
             composedParams.ToImmutable());
     }
 
-    private static bool InheritsFrom(ITypeSymbol symbol, string baseTypeName)
-    {
-        var current = symbol.BaseType;
-        while (current is not null)
-        {
-            if (current.ToDisplayString() == baseTypeName)
-                return true;
-            current = current.BaseType;
-        }
-        return false;
-    }
 
     private static bool ImplementsInterface(ITypeSymbol symbol, string interfaceName)
     {
@@ -189,19 +176,8 @@ public class ShaderParamsGenerator : IIncrementalGenerator
         sb.AppendLine($"partial class {info.ClassName}");
         sb.AppendLine("{");
 
-        if (info.IsMaterialBase)
-        {
-            // MaterialBase subclass: override ApplyToSRB with base call
-            sb.AppendLine("    public override void ApplyToSRB(Diligent.IShaderResourceBinding srb)");
-            sb.AppendLine("    {");
-            sb.AppendLine("        base.ApplyToSRB(srb);");
-        }
-        else
-        {
-            // Standalone IShaderParams: implement ApplyToSRB
-            sb.AppendLine("    public void ApplyToSRB(Diligent.IShaderResourceBinding srb)");
-            sb.AppendLine("    {");
-        }
+        sb.AppendLine("    public void ApplyToSRB(Diligent.IShaderResourceBinding srb)");
+        sb.AppendLine("    {");
 
         sb.AppendLine();
 
@@ -286,17 +262,15 @@ internal readonly struct ShaderParamsClassInfo
 {
     public readonly string Namespace;
     public readonly string ClassName;
-    public readonly bool IsMaterialBase;
     public readonly ImmutableArray<BindingInfo> Bindings;
     public readonly ImmutableArray<string> ComposedParams;
 
     public ShaderParamsClassInfo(
-        string ns, string className, bool isMaterialBase,
+        string ns, string className,
         ImmutableArray<BindingInfo> bindings, ImmutableArray<string> composedParams)
     {
         Namespace = ns;
         ClassName = className;
-        IsMaterialBase = isMaterialBase;
         Bindings = bindings;
         ComposedParams = composedParams;
     }

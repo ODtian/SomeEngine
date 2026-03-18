@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Diligent;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
@@ -17,10 +18,12 @@ public static class ClusterRasterBin
         RenderGraph graph,
         RenderContext context,
         in ClusterCullOutput cull,
-        in ClusterGlobalResources globals,
-        in ClusterRasterBinConfig config,
+        RenderGraphHandle hInstanceHeaders,
         RenderGraphHandle hDrawArgs,
         RenderGraphHandle hClusterReadOffsetArgs,
+        RenderGraphHandle hMaterialSlotBuffer,
+        uint slotCapacity,
+        uint rasterBinFieldIndex,
         string? tag = null
     )
     {
@@ -28,31 +31,29 @@ public static class ClusterRasterBin
 
         string prefix = tag != null ? $"{tag}_" : "";
 
+        uint maxBins = slotCapacity > 0 ? slotCapacity : 1;
+
         var hRasterBinMeta = graph.CreateBuffer($"{prefix}RasterBinMeta", new BufferDesc
         {
-            Size = config.MaxBins * 16,
+            Size = maxBins * 16,
             BindFlags = BindFlags.UnorderedAccess,
             Mode = BufferMode.Raw,
             ElementByteStride = 4,
         });
-        var hBinnedClusterIndex = config.OutputBinnedClusterIndex.IsValid
-            ? config.OutputBinnedClusterIndex
-            : graph.CreateBuffer($"{prefix}BinnedClusterIndexBuffer", new BufferDesc
-            {
-                Size = (ulong)(ClusterLimits.MaxDraws * 4),
-                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-                Mode = BufferMode.Structured,
-                ElementByteStride = 4,
-            });
-        var hBinnedDrawArgs = config.OutputBinnedDrawArgs.IsValid
-            ? config.OutputBinnedDrawArgs
-            : graph.CreateBuffer($"{prefix}BinnedDrawArgs", new BufferDesc
-            {
-                Size = config.MaxBins * 16,
-                BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
-                Mode = BufferMode.Raw,
-                ElementByteStride = 4,
-            });
+        var hBinnedClusterIndex = graph.CreateBuffer($"{prefix}BinnedClusterIndexBuffer", new BufferDesc
+        {
+            Size = (ulong)(ClusterLimits.MaxDraws * 4),
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+            Mode = BufferMode.Structured,
+            ElementByteStride = 4,
+        });
+        var hBinnedDrawArgs = graph.CreateBuffer($"{prefix}BinnedDrawArgs", new BufferDesc
+        {
+            Size = maxBins * 16,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
+            Mode = BufferMode.Raw,
+            ElementByteStride = 4,
+        });
         var hBinningDispatchArgs = graph.CreateBuffer($"{prefix}BinningDispatchArgs", new BufferDesc
         {
             Size = 12,
@@ -61,9 +62,42 @@ public static class ClusterRasterBin
             ElementByteStride = 4,
         });
 
+        // Create BinningUniforms buffer
+        var hBinningUniforms = graph.CreateBuffer($"{prefix}BinningUniforms", new BufferDesc
+        {
+            Size = (ulong)Marshal.SizeOf<BinningUniforms>(),
+            Usage = Usage.Dynamic,
+            BindFlags = BindFlags.UniformBuffer,
+            CPUAccessFlags = CpuAccessFlags.Write,
+        });
+
+        // Upload binning uniforms
+        var binUniData = new BinningUniforms
+        {
+            MaxBins = ClusterLimits.MaxBins,
+            MaxClustersPerBin = ClusterLimits.MaxClustersPerBin,
+            SlotCapacity = slotCapacity,
+            BinFieldIndex = rasterBinFieldIndex,
+        };
+        graph.AddPass<object>(
+            $"{prefix}UploadBinningUniforms",
+            (builder, _) => { builder.Write(hBinningUniforms, ResourceState.ConstantBuffer); },
+            (rgCtx, _) =>
+            {
+                var ctx = rgCtx.RenderContext.ImmediateContext;
+                var buf = rgCtx.GetBuffer(hBinningUniforms);
+                if (ctx != null && buf != null)
+                {
+                    var span = ctx.MapBuffer<BinningUniforms>(buf, MapType.Write, MapFlags.Discard);
+                    span[0] = binUniData;
+                    ctx.UnmapBuffer(buf, MapType.Write);
+                }
+            }
+        );
+
         graph.AddPass(new ClusterBinningInitPass(context)
         {
-            HBinningUniforms = globals.BinningUniforms,
+            HBinningUniforms = hBinningUniforms,
             HDrawArgs = hDrawArgs,
             HBinningDispatchArgs = hBinningDispatchArgs,
             HRasterBinMeta = hRasterBinMeta,
@@ -72,15 +106,16 @@ public static class ClusterRasterBin
 
         graph.AddPass(new ClusterBinningScatterPass(context)
         {
-            HBinningUniforms = globals.BinningUniforms,
+            HBinningUniforms = hBinningUniforms,
             HVisibleClusters = cull.VisibleClusters,
-            HInstanceHeaders = globals.GlobalInstanceHeader,
+            HInstanceHeaders = hInstanceHeaders,
             HDrawArgs = hDrawArgs,
             HClusterReadOffsetArgs = hClusterReadOffsetArgs,
             HBinningDispatchArgs = hBinningDispatchArgs,
             HRasterBinMeta = hRasterBinMeta,
             HBinnedDrawArgs = hBinnedDrawArgs,
             HBinnedClusterBuffer = hBinnedClusterIndex,
+            HMaterialSlotBuffer = hMaterialSlotBuffer,
         });
 
         return new ClusterRasterBinOutput(hBinnedClusterIndex, hBinnedDrawArgs, hRasterBinMeta, hBinningDispatchArgs);
