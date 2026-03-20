@@ -23,3 +23,16 @@ internal class LambdaRenderGraphPass<TData>(
 
     public void Execute(RenderGraphContext context) => execute(context, data);
 }
+
+internal class LambdaRenderGraphPass(
+    string name,
+    Action<RenderGraphBuilder> setup,
+    Action<RenderGraphContext> execute
+) : IRenderGraphPass
+{
+    public string Name => name;
+
+    public void Setup(RenderGraphBuilder builder) => setup(builder);
+
+    public void Execute(RenderGraphContext context) => execute(context);
+}

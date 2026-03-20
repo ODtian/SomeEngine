@@ -14,6 +14,7 @@ struct PixelContext
     uint   instanceID;
     float3 worldPos;
     float3 worldNormal;     // interpolated + transformed to world space
+    float4 worldTangent;    // xyz = tangent dir (world), w = handedness (±1)
     float2 uv0;
 
     // ── Output target ── (set by pipeline before calling evaluateSurface)

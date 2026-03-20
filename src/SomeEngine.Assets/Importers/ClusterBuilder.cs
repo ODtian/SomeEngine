@@ -89,6 +89,12 @@ public static class ClusterBuilder
         public Vector3 SelfLodCenter;
         public float SelfLodRadius;
         public int VertexCount;
+
+        public byte Mat0;
+        public byte Mat1;
+        public byte Mat2;
+        public byte Range0End;
+        public byte Range1End;
     }
 
     private struct ClusterLodBounds
@@ -277,102 +283,94 @@ public static class ClusterBuilder
     {
         var model = ModelRoot.Load(filePath);
         var mesh = model.LogicalMeshes[0];
-        var primitive = mesh.Primitives[0];
 
         static float[] ReadAccessorAsFloatArray(Accessor accessor)
         {
             return accessor.Dimensions switch
             {
                 DimensionType.SCALAR => accessor.AsScalarArray().ToArray(),
-                DimensionType.VEC2 => accessor
-                    .AsVector2Array()
-                    .SelectMany(v => new[] { v.X, v.Y })
-                    .ToArray(),
-                DimensionType.VEC3 => accessor
-                    .AsVector3Array()
-                    .SelectMany(v => new[] { v.X, v.Y, v.Z })
-                    .ToArray(),
-                DimensionType.VEC4 => accessor
-                    .AsVector4Array()
-                    .SelectMany(v => new[] { v.X, v.Y, v.Z, v.W })
-                    .ToArray(),
-                _ => throw new NotSupportedException(
-                    $"Unsupported accessor dimension: {accessor.Dimensions}"
-                ),
+                DimensionType.VEC2 => accessor.AsVector2Array().SelectMany(v => new[] { v.X, v.Y }).ToArray(),
+                DimensionType.VEC3 => accessor.AsVector3Array().SelectMany(v => new[] { v.X, v.Y, v.Z }).ToArray(),
+                DimensionType.VEC4 => accessor.AsVector4Array().SelectMany(v => new[] { v.X, v.Y, v.Z, v.W }).ToArray(),
+                _ => throw new NotSupportedException($"Unsupported accessor dimension: {accessor.Dimensions}"),
             };
         }
 
-        // 1. Get Positions (Special)
-        var positions = primitive.GetVertexAccessor("POSITION").AsVector3Array();
-        var rawPos = positions.ToArray();
+        var allPos = new List<Vector3>();
+        var allIndices = new List<uint>();
+        
+        var templatePrimitive = mesh.Primitives[0];
+        var combinedAttributes = new Dictionary<string, List<float>>();
+        var attrDefinitions = new List<(string Name, int Dimension, ValueType TargetType, byte NumComponents, bool Normalized)>();
 
-        // 2. Get Indices
-        var indices16 = primitive.GetIndexAccessor().AsIndicesArray();
-        var rawIndices = new uint[indices16.Count];
-        for (int i = 0; i < indices16.Count; i++)
-            rawIndices[i] = indices16[i];
-
-        // 3. Get Other Attributes
-        var rawAttributes = new List<RawAttribute>();
-
-        foreach (var key in primitive.VertexAccessors.Keys)
+        foreach (var key in templatePrimitive.VertexAccessors.Keys)
         {
-            if (key == "POSITION")
-                continue;
-
-            var accessor = primitive.GetVertexAccessor(key);
-
-            int dimension = accessor.Dimensions switch
-            {
-                DimensionType.SCALAR => 1,
-                DimensionType.VEC2 => 2,
-                DimensionType.VEC3 => 3,
-                DimensionType.VEC4 => 4,
-                _ => 1,
+            if (key == "POSITION") continue;
+            var accessor = templatePrimitive.GetVertexAccessor(key);
+            int dimension = accessor.Dimensions switch {
+                DimensionType.SCALAR => 1, DimensionType.VEC2 => 2, DimensionType.VEC3 => 3, DimensionType.VEC4 => 4, _ => 1,
             };
-
             ValueType targetType = ValueType.Float32;
             bool normalized = accessor.Normalized;
+            if (key == "NORMAL" || key == "TANGENT") { targetType = ValueType.Int8; normalized = true; }
+            else if (key.StartsWith("TEXCOORD")) { targetType = ValueType.Float16; }
+            else if (key.StartsWith("COLOR")) { targetType = ValueType.UInt8; normalized = true; }
+            else if (key.StartsWith("JOINTS")) { targetType = ValueType.UInt16; }
+            else if (key.StartsWith("WEIGHTS")) { targetType = ValueType.UInt8; normalized = true; }
 
-            // Heuristic for default target types based on attribute name and usage
-            if (key == "NORMAL" || key == "TANGENT")
-            {
-                // Pack normals/tangents to Int8 SNORM
-                targetType = ValueType.Int8;
-                normalized = true;
-            }
-            else if (key.StartsWith("TEXCOORD"))
-            {
-                // Texcoords usually fit in Half
-                targetType = ValueType.Float16;
-            }
-            else if (key.StartsWith("COLOR"))
-            {
-                // Colors usually UInt8 UNORM
-                targetType = ValueType.UInt8;
-                normalized = true;
-            }
-            else if (key.StartsWith("JOINTS"))
-            {
-                // Joints indices usually integer
-                targetType = ValueType.UInt16; // or UInt8 if < 256 bones
-            }
-            else if (key.StartsWith("WEIGHTS"))
-            {
-                // Weights usually normalized byte or short
-                targetType = ValueType.UInt8;
-                normalized = true;
-            }
-
-            var data = ReadAccessorAsFloatArray(accessor);
-
-            rawAttributes.Add(
-                new RawAttribute(key, data, dimension, targetType, (byte)dimension, normalized)
-            );
+            attrDefinitions.Add((key, dimension, targetType, (byte)dimension, normalized));
+            combinedAttributes[key] = new List<float>();
         }
 
-        // Sort attributes into canonical order for deterministic SoA stream layout:
-        // NORMAL → TANGENT → TEXCOORD_* → COLOR_* → JOINTS_* → WEIGHTS_* → others
+        var combinedMaterialIndices = new List<float>();
+        var materialNames = new List<string>();
+        uint vertexOffset = 0;
+
+        for (int primIdx = 0; primIdx < mesh.Primitives.Count; primIdx++)
+        {
+            var primitive = mesh.Primitives[primIdx];
+            var positions = primitive.GetVertexAccessor("POSITION").AsVector3Array().ToArray();
+            allPos.AddRange(positions);
+
+            var indices16 = primitive.GetIndexAccessor().AsIndicesArray();
+            for (int i = 0; i < indices16.Count; i++)
+            {
+                allIndices.Add((uint)(indices16[i] + vertexOffset));
+            }
+
+            foreach (var def in attrDefinitions)
+            {
+                // Fallback to zeros if primitive missing attribute (though invalid GLTF normally)
+                if (primitive.VertexAccessors.TryGetValue(def.Name, out var accessor))
+                {
+                    combinedAttributes[def.Name].AddRange(ReadAccessorAsFloatArray(accessor));
+                }
+                else
+                {
+                    combinedAttributes[def.Name].AddRange(new float[positions.Length * def.Dimension]);
+                }
+            }
+
+            string matName = primitive.Material?.Name ?? $"Material_{primIdx}";
+            materialNames.Add(matName);
+
+            for (int i = 0; i < positions.Length; i++)
+            {
+                combinedMaterialIndices.Add(primIdx);
+            }
+
+            vertexOffset += (uint)positions.Length;
+        }
+
+        var rawAttributes = new List<RawAttribute>();
+        foreach (var def in attrDefinitions)
+        {
+            rawAttributes.Add(new RawAttribute(def.Name, combinedAttributes[def.Name].ToArray(), def.Dimension, def.TargetType, def.NumComponents, def.Normalized));
+        }
+
+        // Add _MATERIAL_INDEX. Values are integer floats (0.0f, 1.0f...). We will store them as UInt8.
+        rawAttributes.Add(new RawAttribute("_MATERIAL_INDEX", combinedMaterialIndices.ToArray(), 1, ValueType.UInt8, 1, false));
+
         static int AttributeOrder(string name) => name switch
         {
             "NORMAL" => 0,
@@ -381,6 +379,7 @@ public static class ClusterBuilder
             _ when name.StartsWith("COLOR") => 3,
             _ when name.StartsWith("JOINTS") => 4,
             _ when name.StartsWith("WEIGHTS") => 5,
+            "_MATERIAL_INDEX" => 98,
             _ => 6,
         };
         rawAttributes.Sort((a, b) =>
@@ -391,13 +390,14 @@ public static class ClusterBuilder
             return string.Compare(a.Name, b.Name, StringComparison.Ordinal);
         });
 
-        return ProcessRaw(rawPos, rawAttributes, rawIndices, mesh.Name ?? "Unnamed");
+        return ProcessRaw(allPos.ToArray(), rawAttributes, allIndices.ToArray(), materialNames, mesh.Name ?? "Unnamed");
     }
 
     private static void BuildClusterLod(
         ClusterLodConfig config,
         ReadOnlySpan<Vector3> positions,
         ReadOnlySpan<uint> indices,
+        float[] materialIndicesArray,
         List<BuilderMeshlet> clusters,
         List<uint> globalIndices
     )
@@ -414,7 +414,7 @@ public static class ClusterBuilder
                 (nuint)Unsafe.SizeOf<Vector3>()
             );
 
-            Clusterize(config, indices, positions, clusters, globalIndices);
+            Clusterize(config, indices, positions, materialIndicesArray, clusters, globalIndices);
             int nextGroupId = 0;
             var globalSpan = CollectionsMarshal.AsSpan(globalIndices); // Only valid if list doesn't resize?
             // WARNING: globalIndices grows inside the loop. The span will be
@@ -545,6 +545,7 @@ public static class ClusterBuilder
                         config,
                         CollectionsMarshal.AsSpan(simplifiedIndices),
                         positions,
+                        materialIndicesArray,
                         clusters,
                         globalIndices
                     );
@@ -597,6 +598,7 @@ public static class ClusterBuilder
         Vector3[] rawPos,
         List<RawAttribute> rawAttributes,
         uint[] rawIndices,
+        List<string> materialNames,
         string name
     )
     {
@@ -694,6 +696,9 @@ public static class ClusterBuilder
             // Build Cluster LOD hierarchy
             var allMeshlets = new List<BuilderMeshlet>();
             var globalIndices = new List<uint>();
+            
+            var matIndexAttr = pAttributes.FirstOrDefault(a => a.Name == "_MATERIAL_INDEX");
+            float[] materialIndicesArray = matIndexAttr?.Data ?? new float[vertexCount];
 
             BuildClusterLod(
                 ClusterLodConfig.GetDefault() with
@@ -702,9 +707,16 @@ public static class ClusterBuilder
                 },
                 new ReadOnlySpan<Vector3>(pPos, 0, (int)vertexCount),
                 new ReadOnlySpan<uint>(pInd, 0, rawIndices.Length),
+                materialIndicesArray,
                 allMeshlets,
                 globalIndices
             );
+
+            // Remove internal attribute before serialization
+            if (matIndexAttr != null)
+            {
+                finalAttributes.Remove(matIndexAttr);
+            }
 
             // Compute Bounds for Morton Code + Global Quantization
             Vector3 sceneMin = new Vector3(float.MaxValue);
@@ -980,10 +992,16 @@ public static class ClusterBuilder
                 // LODError → float16
                 ushort lodErrorHalf = BitConverter.HalfToUInt16Bits((Half)m.Error);
 
-                // PackedCounts: [VertexCount:8][TriangleCount:8][LODLevel:8][Pad:8]
                 uint packedCounts = (uint)vCount
                     | ((uint)(localIndices.Count / 3) << 8)
                     | ((uint)(byte)m.Level << 16);
+
+                uint packedMaterials = (uint)m.Mat0
+                    | ((uint)m.Mat1 << 8)
+                    | ((uint)m.Mat2 << 16);
+                
+                uint packedRanges = (uint)m.Range0End
+                    | ((uint)m.Range1End << 8);
 
                 currentClusters.Add(
                     new GPUCluster
@@ -1000,6 +1018,10 @@ public static class ClusterBuilder
                         TriangleStart = (ushort)tStart,
                         GroupId = (short)m.GroupId,
                         PackedCounts = packedCounts,
+                        PackedMaterials = packedMaterials,
+                        PackedRanges = packedRanges,
+                        Pad0 = 0,
+                        Pad1 = 0,
                     }
                 );
 
@@ -1066,6 +1088,7 @@ public static class ClusterBuilder
                     Z = quantOrigin.Z,
                 },
                 QuantStep = quantStep,
+                DefaultMaterialSlots = materialNames.ToArray(),
             };
 
             fs.Seek(0, SeekOrigin.Begin);
@@ -1146,10 +1169,66 @@ public static class ClusterBuilder
         }
     }
 
+    private struct TempTri
+    {
+        public uint v0, v1, v2;
+        public byte mat;
+    }
+
+    private static void EmitSplitMeshlet(
+        ReadOnlySpan<TempTri> tris,
+        List<BuilderMeshlet> clusters,
+        List<uint> globalIndices
+    )
+    {
+        int startIndex = globalIndices.Count;
+        var uniqueMats = new List<byte>();
+        int range0End = 0, range1End = 0;
+
+        var uniqueVerts = new HashSet<uint>();
+
+        for (int i = 0; i < tris.Length; i++)
+        {
+            var t = tris[i];
+            if (!uniqueMats.Contains(t.mat))
+            {
+                uniqueMats.Add(t.mat);
+                if (uniqueMats.Count == 2) range0End = i;
+                if (uniqueMats.Count == 3) range1End = i;
+            }
+            globalIndices.Add(t.v0);
+            globalIndices.Add(t.v1);
+            globalIndices.Add(t.v2);
+            uniqueVerts.Add(t.v0);
+            uniqueVerts.Add(t.v1);
+            uniqueVerts.Add(t.v2);
+        }
+
+        if (uniqueMats.Count < 2) range0End = tris.Length;
+        if (uniqueMats.Count < 3) range1End = tris.Length;
+
+        clusters.Add(
+            new BuilderMeshlet
+            {
+                IndicesOffset = startIndex,
+                IndicesCount = tris.Length * 3,
+                VertexCount = uniqueVerts.Count,
+                GroupId = -1,
+                ParentGroupId = -1,
+                Mat0 = uniqueMats.Count > 0 ? uniqueMats[0] : (byte)0,
+                Mat1 = uniqueMats.Count > 1 ? uniqueMats[1] : (byte)0,
+                Mat2 = uniqueMats.Count > 2 ? uniqueMats[2] : (byte)0,
+                Range0End = (byte)range0End,
+                Range1End = (byte)range1End,
+            }
+        );
+    }
+
     private static void Clusterize(
         ClusterLodConfig config,
         ReadOnlySpan<uint> indices,
         ReadOnlySpan<Vector3> positions,
+        float[] materialIndicesArray,
         List<BuilderMeshlet> clusters,
         List<uint> globalIndices
     )
@@ -1220,51 +1299,48 @@ public static class ClusterBuilder
                     );
                 }
 
-                int startIndex = globalIndices.Count;
-                int count = (int)m.triangle_count * 3;
-
-                // Instead of adding one by one, we can batch add if List supports it
-                // or ensure capacity List<T> doesn't expose span-based add easily
-                // without CollectionsMarshal We'll resize globalIndices manually if
-                // needed or just loop. Or better: ensure capacity.
-
-                // Calculate required capacity
-                // int required = startIndex + count;
-                // if (globalIndices.Capacity < required) globalIndices.Capacity =
-                // required; Wait, Capacity setter might copy.
-
-                // We'll just loop for now, optimization of list add is secondary to
-                // algorithm structure. Or use CollectionsMarshal to get span to the
-                // end.
-
-                // Using CollectionsMarshal for zero-copy add:
-                // globalIndices.EnsureCapacity(globalIndices.Count + count);
-                // But List doesn't expose size easily.
-
+                var tris = new TempTri[m.triangle_count];
                 for (uint t = 0; t < m.triangle_count; t++)
                 {
                     int triOffset = (int)m.triangle_offset + (int)t * 3;
-                    globalIndices.Add(
-                        meshletVertices[(int)m.vertex_offset + meshletTriangles[triOffset + 0]]
-                    );
-                    globalIndices.Add(
-                        meshletVertices[(int)m.vertex_offset + meshletTriangles[triOffset + 1]]
-                    );
-                    globalIndices.Add(
-                        meshletVertices[(int)m.vertex_offset + meshletTriangles[triOffset + 2]]
-                    );
+                    uint v0 = meshletVertices[(int)m.vertex_offset + meshletTriangles[triOffset + 0]];
+                    uint v1 = meshletVertices[(int)m.vertex_offset + meshletTriangles[triOffset + 1]];
+                    uint v2 = meshletVertices[(int)m.vertex_offset + meshletTriangles[triOffset + 2]];
+                    byte mat = (byte)materialIndicesArray[v0];
+                    tris[t] = new TempTri { v0 = v0, v1 = v1, v2 = v2, mat = mat };
                 }
 
-                clusters.Add(
-                    new BuilderMeshlet
+                Array.Sort(tris, (a, b) => a.mat.CompareTo(b.mat));
+
+                var uniqueMats = new List<byte>();
+                int currentChunkStart = 0;
+
+                for (int t = 0; t < tris.Length; t++)
+                {
+                    if (!uniqueMats.Contains(tris[t].mat))
                     {
-                        IndicesOffset = startIndex,
-                        IndicesCount = count,
-                        VertexCount = (int)m.vertex_count,
-                        GroupId = -1,
-                        ParentGroupId = -1,
+                        if (uniqueMats.Count == 3)
+                        {
+                            EmitSplitMeshlet(
+                                new ReadOnlySpan<TempTri>(tris, currentChunkStart, t - currentChunkStart),
+                                clusters,
+                                globalIndices
+                            );
+                            uniqueMats.Clear();
+                            currentChunkStart = t;
+                        }
+                        uniqueMats.Add(tris[t].mat);
                     }
-                );
+                }
+
+                if (currentChunkStart < tris.Length)
+                {
+                    EmitSplitMeshlet(
+                        new ReadOnlySpan<TempTri>(tris, currentChunkStart, tris.Length - currentChunkStart),
+                        clusters,
+                        globalIndices
+                    );
+                }
             }
         }
         finally

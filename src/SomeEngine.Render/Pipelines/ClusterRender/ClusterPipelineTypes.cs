@@ -27,7 +27,8 @@ public readonly record struct ClusterGlobalResources(
 public readonly record struct ClusterTraverseOutput(
     RenderGraphHandle CandidateClusters,
     RenderGraphHandle CandidateArgs,
-    RenderGraphHandle CandidateCount
+    RenderGraphHandle CandidateCount,
+    RenderGraphHandle CullingUniforms
 );
 
 /// <summary>
@@ -77,6 +78,48 @@ public readonly record struct ClusterShadeBinOutput(
 public readonly record struct ClusterShadeOutput(
     RenderGraphHandle OutputColor
 );
+
+// ────────────────────────────────────────────────────────────
+//  Camera data (打包相机参数，减少 stage 传参数量)
+// ────────────────────────────────────────────────────────────
+
+/// <summary>
+/// 相机参数打包。所有 Stage 通过此结构获取相机信息，不再单独传递多个标量。
+/// </summary>
+public readonly record struct ClusterCameraData
+{
+    public Matrix4x4 View { get; init; }
+    public Matrix4x4 Proj { get; init; }
+    public Vector3 CameraPos { get; init; }
+    public float LodThreshold { get; init; }
+    public float LodScale { get; init; }
+    public int ForcedLODLevel { get; init; }
+    public uint ScreenWidth { get; init; }
+    public uint ScreenHeight { get; init; }
+
+    /// <summary>HiZ 跨帧需要的前一帧矩阵。</summary>
+    public Matrix4x4 PrevViewProj { get; init; }
+    public Matrix4x4 PrevView { get; init; }
+    public Matrix4x4 PrevProj { get; init; }
+
+    public static ClusterCameraData Default(
+        Matrix4x4 view, Matrix4x4 proj, Vector3 cameraPos,
+        uint screenWidth, uint screenHeight
+    ) => new()
+    {
+        View = view,
+        Proj = proj,
+        CameraPos = cameraPos,
+        LodThreshold = 1.0f,
+        LodScale = 500.0f,
+        ForcedLODLevel = -1,
+        ScreenWidth = screenWidth,
+        ScreenHeight = screenHeight,
+        PrevViewProj = Matrix4x4.Identity,
+        PrevView = Matrix4x4.Identity,
+        PrevProj = Matrix4x4.Identity,
+    };
+}
 
 // ────────────────────────────────────────────────────────────
 //  Config types (init 属性 + 预设工厂 + with 支持)
@@ -148,6 +191,19 @@ public readonly record struct ClusterTraverseConfig
 public readonly record struct ClusterCullConfig
 {
     public HiZDebugMode HiZMode { get; init; }
+
+    /// <summary>前一帧 HiZ 纹理（Phase1 遮挡剔除用）。Invalid = 不使用。</summary>
+    public RenderGraphHandle HiZTexture { get; init; }
+    /// <summary>是否有有效的前一帧 HiZ 历史。</summary>
+    public bool HasPrevHistory { get; init; }
+    /// <summary>HiZ mip 数量（用于 uniform 构建）。</summary>
+    public uint HiZMipCount { get; init; }
+    /// <summary>HiZ 纹理逆尺寸。</summary>
+    public Vector2 HiZInvSize { get; init; }
+    /// <summary>是否输出 HiZ debug AABB 数据。</summary>
+    public bool DebugShowHiZAABBs { get; init; }
+    /// <summary>是否 dump 当前帧数据。</summary>
+    public bool DumpNextFrame { get; init; }
 
     public static ClusterCullConfig Default() => new()
     {

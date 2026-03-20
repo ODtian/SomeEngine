@@ -1,4 +1,7 @@
 // FlatBuffers schema for Material Instance Asset
+// include must come before ALL other declarations
+include "common_types.fbs";
+
 namespace SomeEngine.Assets.Schema;
 
 attribute "fs_serializer";
@@ -9,9 +12,22 @@ table ParamOverride {
     path: string;                         // new Texture asset path
 }
 
+table ScalarOverride {
+    name: string;                         // overridden scalar param name
+    value: ParamValue;                    // new typed value
+}
+
+table TagOverride {
+    name: string;                         // tag name (e.g. "opaque")
+    value: int = 0;                       // tag value (for value tags like stencil_ref)
+    remove: bool = false;                 // true = remove this tag from parent
+}
+
 table MaterialInstanceAsset (fs_serializer) {
     parent: string;                       // parent Material asset path
     overrides: [ParamOverride] (fs_vector:"IList");
+    scalar_overrides: [ScalarOverride] (fs_vector:"IList");
+    tag_overrides: [TagOverride] (fs_vector:"IList");
 }
 
 root_type MaterialInstanceAsset;

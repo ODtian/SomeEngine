@@ -1,4 +1,7 @@
 // FlatBuffers schema for Material Asset
+// include must come before ALL other declarations
+include "common_types.fbs";
+
 namespace SomeEngine.Assets.Schema;
 
 attribute "fs_serializer";
@@ -19,10 +22,16 @@ table TextureBinding {
     path: string;                         // Texture asset path
 }
 
+table ScalarParam {
+    name: string;                         // param name (e.g. "Roughness")
+    value: ParamValue;                    // typed value (FloatVal, IntVal, etc.)
+}
+
 table MaterialAsset (fs_serializer) {
     name: string;
     passes: [PassEntry] (fs_vector:"IList");
     textures: [TextureBinding] (fs_vector:"IList");
+    scalars: [ScalarParam] (fs_vector:"IList");
 }
 
 root_type MaterialAsset;

@@ -128,4 +128,44 @@ public sealed class TagStore<T> where T : class
 
     /// <summary>获取所有已注册对象。</summary>
     public T[] GetAll() => _items.ToArray();
+
+    /// <summary>复制 from 上的所有 tag 到 to。两者都必须已注册。</summary>
+    public void CopyAllTags(T from, T to)
+    {
+        if (!_items.Contains(from))
+            throw new InvalidOperationException("Source item not registered.");
+        if (!_items.Contains(to))
+            throw new InvalidOperationException("Target item not registered.");
+
+        foreach (var (tagType, set) in _tagIndex)
+        {
+            if (!set.Contains(from)) continue;
+
+            set.Add(to);
+            if (_tagValues.TryGetValue((from, tagType), out var value))
+                _tagValues[(to, tagType)] = value;
+        }
+        Version++;
+    }
+
+    /// <summary>移除 item 上的所有 tag（不注销 item 本身）。</summary>
+    public void RemoveAllTags(T item)
+    {
+        if (!_items.Contains(item))
+            throw new InvalidOperationException("Item not registered.");
+
+        foreach (var (_, set) in _tagIndex)
+            set.Remove(item);
+
+        var keysToRemove = new List<(T, Type)>();
+        foreach (var key in _tagValues.Keys)
+        {
+            if (ReferenceEquals(key.Item1, item))
+                keysToRemove.Add(key);
+        }
+        foreach (var key in keysToRemove)
+            _tagValues.Remove(key);
+
+        Version++;
+    }
 }

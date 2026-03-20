@@ -18,6 +18,10 @@ public sealed class BinSpace : IDisposable
     private MaterialSlotCache? _cache;
     private int[] _slotOffsetByMaterialId = [];
     private uint _lastRegistryVersion = uint.MaxValue;
+    private uint _version;
+
+    /// <summary>每次 Rebuild 后递增，供外部检测 bin 是否变化。</summary>
+    public uint Version => _version;
 
     public bool IsFrozen => _frozen;
 
@@ -129,6 +133,7 @@ public sealed class BinSpace : IDisposable
             _fields[i].BinQueue.Rebuild();
             _cache!.RebuildField(i, _fields[i].BinQueue);
         }
+        _version++;
     }
 
     /// <summary>强制重建所有 field（不检查版本）。</summary>
@@ -140,6 +145,7 @@ public sealed class BinSpace : IDisposable
             _fields[i].BinQueue.Rebuild();
             _cache!.RebuildField(i, _fields[i].BinQueue);
         }
+        _version++;
     }
 
     // ── 查询 ──

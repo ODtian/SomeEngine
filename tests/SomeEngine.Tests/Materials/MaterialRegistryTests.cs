@@ -1,4 +1,5 @@
 using SomeEngine.Render.Materials;
+using SomeEngine.Assets.Schema;
 
 namespace SomeEngine.Tests.Materials;
 
@@ -145,6 +146,17 @@ public class MaterialTests
         // After InvalidateResolvedPasses, new pass objects are created
         Assert.That(pass2, Is.Not.SameAs(pass1));
     }
+
+    [Test]
+    public void ComputeSignature_IncludesShaderIdentity()
+    {
+        var mat1 = new Material { Name = "Test", ShaderAsset = new ShaderAsset { Name = "A" } };
+        var mat2 = new Material { Name = "Test", ShaderAsset = new ShaderAsset { Name = "B" } };
+        var mat3 = new Material { Name = "Test", ShaderAsset = new ShaderAsset { Name = "A" } };
+
+        Assert.That(mat1.Passes[0].ComputeSignature(), Is.Not.EqualTo(mat2.Passes[0].ComputeSignature()));
+        Assert.That(mat1.Passes[0].ComputeSignature(), Is.EqualTo(mat3.Passes[0].ComputeSignature()));
+    }
 }
 
 [TestFixture]
@@ -264,6 +276,24 @@ public class MaterialRegistryTests
         Assert.That(result, Has.Length.EqualTo(1));
         registry.Dispose();
     }
+
+    [Test]
+    public void Register_AutoDerivesTagFromShaderMetadata()
+    {
+        var registry = new MaterialRegistry();
+        var shaderAsset = new ShaderAsset 
+        { 
+            Name = "TestShader",
+            Metadata = new ShaderMetadata 
+            {
+                PipelineTags = new[] { "ClusterShader" }
+            }
+        };
+        var mat = new Material { Name = "Test", ShaderAsset = shaderAsset };
+        registry.Register(mat);
+        Assert.That(registry.HasTag<ClusterShaderTag>(mat.Passes[0]), Is.True);
+        registry.Dispose();
+    }
 }
 
 [TestFixture]
@@ -283,7 +313,7 @@ public class BinQueueTests
         var queue = new BinQueue();
         queue.RegisterRegion("opaque",
             () => registry.Query<OpaqueTag>(),
-            p => p.Params.GetSignatureHash());
+            p => p.ComputeSignature());
         queue.Rebuild();
 
         // Two passes with different signature hashes → 2 bins
@@ -302,7 +332,7 @@ public class BinQueueTests
         var queue = new BinQueue();
         queue.RegisterRegion("opaque",
             () => registry.Query<OpaqueTag>(),
-            p => p.Params.GetSignatureHash());
+            p => p.ComputeSignature());
         queue.Rebuild();
 
         var range = queue.GetRange("opaque");
@@ -322,11 +352,32 @@ public class BinQueueTests
         var queue = new BinQueue();
         queue.RegisterRegion("opaque",
             () => registry.Query<OpaqueTag>(),
-            p => p.Params.GetSignatureHash());
+            p => p.ComputeSignature());
         queue.Rebuild();
 
         var bin = queue.GetBinForPass(mat.Passes[0]);
         Assert.That(bin, Is.EqualTo(0));
+        registry.Dispose();
+    }
+
+    [Test]
+    public void Rebuild_DifferentShaders_DifferentBins()
+    {
+        var registry = new MaterialRegistry();
+        var mat1 = new Material { Name = "M1", ShaderAsset = new ShaderAsset { Name = "A" } };
+        var mat2 = new Material { Name = "M2", ShaderAsset = new ShaderAsset { Name = "B" } };
+        registry.Register(mat1);
+        registry.Register(mat2);
+        registry.SetTag<OpaqueTag>(mat1.Passes[0]);
+        registry.SetTag<OpaqueTag>(mat2.Passes[0]);
+
+        var queue = new BinQueue();
+        queue.RegisterRegion("opaque",
+            () => registry.Query<OpaqueTag>(),
+            p => p.ComputeSignature());
+        queue.Rebuild();
+
+        Assert.That(queue.TotalBinCount, Is.GreaterThanOrEqualTo(2));
         registry.Dispose();
     }
 }
@@ -412,7 +463,7 @@ public class OverlayMappingTests
         var queue = new BinQueue();
         queue.RegisterRegion("opaque",
             () => registry.Query<OpaqueTag>(),
-            p => p.Params.GetSignatureHash());
+            p => p.ComputeSignature());
         queue.Rebuild();
 
         // Build overlay mapping
@@ -440,7 +491,7 @@ public class OverlayMappingTests
         var queue = new BinQueue();
         queue.RegisterRegion("opaque",
             () => registry.Query<OpaqueTag>(),
-            p => p.Params.GetSignatureHash());
+            p => p.ComputeSignature());
         queue.Rebuild();
 
         var entries = OverlayMapping.Build(registry, queue);
@@ -466,7 +517,7 @@ public class OverlayMappingTests
         var queue = new BinQueue();
         queue.RegisterRegion("opaque",
             () => registry.Query<OpaqueTag>(),
-            p => p.Params.GetSignatureHash());
+            p => p.ComputeSignature());
         queue.Rebuild();
 
         var entries = OverlayMapping.Build(registry, queue);
@@ -559,7 +610,7 @@ public class MaterialSlotCacheTests
         var queue = new BinQueue();
         queue.RegisterRegion("opaque",
             () => registry.Query<OpaqueTag>(),
-            p => p.Params.GetSignatureHash());
+            p => p.ComputeSignature());
         queue.Rebuild();
 
         // RebuildField writes bin key to field 0
@@ -625,7 +676,7 @@ public class BinSpaceTests
         int shadeField = bs.RegisterField("ShadingBin");
         bs.RegisterRegion(shadeField, "opaque",
             () => registry.Query<OpaqueTag>(),
-            p => p.Params.GetSignatureHash());
+            p => p.ComputeSignature());
         bs.FreezeLayout();
 
         int offset = bs.AllocateSlots(mat.Passes.ToArray());
@@ -659,7 +710,7 @@ public class BinSpaceTests
 
         bs.RegisterRegion(shadeField, "opaque",
             () => registry.Query<OpaqueTag>(),
-            p => p.Params.GetSignatureHash());
+            p => p.ComputeSignature());
 
         bs.FreezeLayout();
         bs.AllocateSlots(mat.Passes.ToArray());

@@ -39,12 +39,14 @@ public struct StencilRefTag : IMaterialTag
     public byte Value;
 }
 
-// ─── 管线兼容性 Tag（不序列化，自动推导） ───
+// ─── 管线兼容性 Tag（不序列化，从 Shader 自动推导） ───
 
 /// <summary>支持 Cluster shader 管线。</summary>
+[MaterialTag("ClusterShader")]
 public struct ClusterShaderTag : IMaterialTag { }
 
 /// <summary>支持 Forward 管线。</summary>
+[MaterialTag("ForwardShader")]
 public struct ForwardShaderTag : IMaterialTag { }
 
 // ─── 多 Pass Tag ───

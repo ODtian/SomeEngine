@@ -21,7 +21,7 @@ public class ClusterLodLevelTests
         var (vertices, indices, attributes) = PrimitiveMeshGenerator.CreateIcoSphere(5);
 
         // 2. Process
-        var meshAsset = ClusterBuilder.ProcessRaw(vertices, attributes, indices, "TestLOD");
+        var meshAsset = ClusterBuilder.ProcessRaw(vertices, attributes, indices, new System.Collections.Generic.List<string>(), "TestLOD");
 
         // 3. Inspect Payload manually
         var payload = meshAsset.Payload!.Value;

@@ -19,5 +19,6 @@ public partial class ClusterShadePipelineParams : IShaderParams
     [ShaderParam(Dynamic = true)] public BufferSlot Uniforms;
     [ShaderParam(Dynamic = true)] public BufferSlot InstanceHeaders;
     [ShaderParam(Dynamic = true)] public BufferSlot InstanceDataHeap;
+    [ShaderParam(Dynamic = true)] public BufferSlot BinCounts;
 
 }

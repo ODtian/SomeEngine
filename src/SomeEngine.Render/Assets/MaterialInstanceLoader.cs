@@ -6,7 +6,7 @@ namespace SomeEngine.Render.Assets;
 
 /// <summary>
 /// 从 FlatBuffer MaterialInstanceAsset 加载 MaterialInstance。
-/// 基于 parent Material 的 Instantiate()，然后覆盖指定贴图参数。
+/// 基于 parent Material 的 Instantiate()，然后覆盖指定贴图/标量参数和 Tag。
 /// </summary>
 public static class MaterialInstanceLoader
 {
@@ -48,7 +48,7 @@ public static class MaterialInstanceLoader
         // 1. Clone parent
         var instance = parent.Instantiate();
 
-        // 2. Apply overrides
+        // 2. Apply texture overrides
         if (asset.Overrides != null)
         {
             foreach (var ovr in asset.Overrides)
@@ -60,33 +60,53 @@ public static class MaterialInstanceLoader
             }
         }
 
-        // 3. Register
+        // 3. Apply scalar overrides
+        if (asset.ScalarOverrides != null)
+        {
+            foreach (var ovr in asset.ScalarOverrides)
+            {
+                if (ovr.Name == null || ovr.Value == null) continue;
+                MaterialAssetLoader.ApplyScalarParam(instance.Params, ovr.Name, ovr.Value.Value);
+            }
+        }
+
+        // 4. Register
         registry.Register(instance);
 
-        // 4. Copy parent's tags to instance passes
-        foreach (var pass in instance.Passes)
+        // 5. 通用 tag 继承：复制 parent 的所有 tag (per-pass 配对)
+        int passCount = Math.Min(parent.Passes.Length, instance.Passes.Length);
+        for (int i = 0; i < passCount; i++)
         {
-            foreach (var parentPass in parent.Passes)
+            registry.CopyAllTags(parent.Passes[i], instance.Passes[i]);
+        }
+
+        // 6. Apply tag overrides
+        if (asset.TagOverrides != null)
+        {
+            foreach (var ovr in asset.TagOverrides)
             {
-                // Copy opaque/masked/etc tags from parent
-                CopyTagIfPresent<OpaqueTag>(registry, parentPass, pass);
-                CopyTagIfPresent<MaskedTag>(registry, parentPass, pass);
-                CopyTagIfPresent<TranslucentTag>(registry, parentPass, pass);
-                CopyTagIfPresent<TwoSidedTag>(registry, parentPass, pass);
-                CopyTagIfPresent<ShadowCasterTag>(registry, parentPass, pass);
-                CopyTagIfPresent<ClusterShaderTag>(registry, parentPass, pass);
-                break; // Single pass per material for now
+                if (ovr.Name == null) continue;
+
+                // Apply to primary pass (index 0)
+                if (instance.Passes.Length > 0)
+                {
+                    var pass = instance.Passes[0];
+                    if (ovr.Remove)
+                    {
+                        // 通过名称移除 tag（利用源生成的 resolver 反推类型不太可行，
+                        // 改为 RemoveAllTags + 重新 ApplyTag 除了被移除的）
+                        // 简化方案：单独用 ApplyTag 覆盖，remove=true 时不处理
+                        // 由于 TagStore 只有泛型 RemoveTag<T>，这里暂不支持按名称移除
+                        // TODO: 后续可通过扩展 MaterialTagResolver 添加 RemoveTag(name) 方法
+                    }
+                    else
+                    {
+                        MaterialTagResolver.ApplyTag(registry, pass, ovr.Name, ovr.Value);
+                    }
+                }
             }
         }
 
         return instance;
-    }
-
-    private static void CopyTagIfPresent<T>(MaterialRegistry registry, MaterialPass from, MaterialPass to)
-        where T : struct, IMaterialTag
-    {
-        var tag = registry.GetTag<T>(from);
-        if (tag.HasValue)
-            registry.SetTag(to, tag.Value);
     }
 }

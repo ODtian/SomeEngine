@@ -134,6 +134,7 @@ class Program
         RenderContext? context = null;
         ClusterResourceManager? resourceManager = null;
         ClusterPipeline? clusterPipeline = null;
+        MaterialRegistry? materialRegistry = null;
         RenderGraph? renderGraph = null;
         SimpleMeshRenderPass? simplePass = null;
         ImGuiRenderer? imguiRenderer = null;
@@ -158,6 +159,7 @@ class Program
         string meshUiMessage = string.Empty;
         List<string> availableMeshes = new();
         var random = new Random();
+        Dictionary<string, uint> MeshDefaultMaterialOffsets = new();
 
         static string ResolveSamplesDirectory()
         {
@@ -230,6 +232,33 @@ class Program
                     meshAsset.Name ?? Path.GetFileNameWithoutExtension(meshFilePath);
                 message =
                     $"Loaded mesh '{loadedName}' from {Path.GetFileName(meshFilePath)} (BVHRootIndex={rootIndex}).";
+
+                uint slotOffset = 0;
+                if (clusterPipeline != null && materialRegistry != null && meshAsset.DefaultMaterialSlots != null && meshAsset.DefaultMaterialSlots.Count > 0)
+                {
+                    var passes = new List<MaterialPass>();
+                    foreach (var matName in meshAsset.DefaultMaterialSlots)
+                    {
+                        var mat = materialRegistry.GetMaterial(matName);
+                        if (mat == null || mat.Passes.Length == 0)
+                        {
+                            mat = materialRegistry.GetMaterial("DefaultPBR");
+                        }
+                        
+                        if (mat != null && mat.Passes.Length > 0)
+                        {
+                            passes.Add(mat.Passes[0]);
+                        }
+                    }
+                    
+                    if (passes.Count > 0)
+                    {
+                        slotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots(CollectionsMarshal.AsSpan(passes));
+                    }
+                }
+                
+                MeshDefaultMaterialOffsets[loadedName] = slotOffset;
+
                 return true;
             }
             catch (Exception ex)
@@ -331,7 +360,112 @@ class Program
             // 2. Init Cluster Manager
             resourceManager = new ClusterResourceManager(context);
 
-            // 3. Discover and optionally load mesh assets from samples/
+            // 3. Init Pipeline (DI)
+            var services = new ServiceCollection();
+            services.AddSingleton(context);
+            services.AddSingleton(instanceDataManager!);
+            services.AddSingleton(resourceManager);
+            services.AddSingleton<MaterialRegistry>();
+
+            var provider = services.BuildServiceProvider();
+            materialRegistry = provider.GetRequiredService<MaterialRegistry>();
+
+            clusterPipeline = ClusterPipeline.Opaque(
+                context, resourceManager, instanceDataManager!, materialRegistry);
+            clusterPipeline.Initialize(context);
+
+            // ─── Create default textures + sampler ───
+            var defaultTex = ClusterMaterials.CreateDefault1x1Texture(context, "DefaultWhite", 0xFFFFFFFF);
+            var defaultNormalTex = ClusterMaterials.CreateDefault1x1Texture(context, "DefaultNormal", 0xFFFF8080);
+            var defaultArmTex = ClusterMaterials.CreateDefault1x1Texture(context, "DefaultARM", 0xFF00FF00);
+            var defaultSampler = context.Device!.CreateSampler(new Diligent.SamplerDesc
+            {
+                MinFilter = Diligent.FilterType.Linear,
+                MagFilter = Diligent.FilterType.Linear,
+                MipFilter = Diligent.FilterType.Linear,
+                AddressU = Diligent.TextureAddressMode.Wrap,
+                AddressV = Diligent.TextureAddressMode.Wrap,
+                AddressW = Diligent.TextureAddressMode.Wrap,
+            });
+
+            // ─── PBR material (via asset pipeline) ───
+            var pbrAsset = new MaterialAsset
+            {
+                Name = "DefaultPBR",
+                Passes = new List<PassEntry>
+                {
+                    new()
+                    {
+                        Shader = "cluster_shade_material",
+                        Tags = new List<TagEntry>
+                        {
+                            new() { Name = "opaque" },
+                            new() { Name = "cluster_shader" },
+                        }
+                    }
+                },
+                Textures = new List<TextureBinding>
+                {
+                    new() { Name = "AlbedoMap", Path = "default:white" },
+                    new() { Name = "NormalMap", Path = "default:normal" },
+                    new() { Name = "ARMMap", Path = "default:arm" },
+                },
+            };
+
+            Diligent.ITextureView? LoadTexture(string path)
+            {
+                return path switch
+                {
+                    "default:white" => defaultTex.GetDefaultView(Diligent.TextureViewType.ShaderResource),
+                    "default:normal" => defaultNormalTex.GetDefaultView(Diligent.TextureViewType.ShaderResource),
+                    "default:arm" => defaultArmTex.GetDefaultView(Diligent.TextureViewType.ShaderResource),
+                    _ => null,
+                };
+            }
+
+            string assetsDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets"));
+
+            ShaderAsset? LoadShader(string name)
+            {
+                string shaderPath = Path.Combine(assetsDir, "Shaders", name + ".slang");
+                if (File.Exists(shaderPath))
+                    return SlangShaderImporter.Import(shaderPath);
+                return null;
+            }
+
+            var matPBR = SomeEngine.Render.Assets.MaterialAssetLoader.LoadFromAsset(
+                pbrAsset, materialRegistry, LoadTexture, LoadShader);
+            matPBR.SetSampler("MaterialSampler", defaultSampler);
+
+            // ─── Unlit material (via asset pipeline) ───
+            var unlitAsset = new MaterialAsset
+            {
+                Name = "TestUnlit_1",
+                Passes = new List<PassEntry>
+                {
+                    new()
+                    {
+                        Shader = "cluster_shade_unlit",
+                        Tags = new List<TagEntry>
+                        {
+                            new() { Name = "opaque" },
+                            new() { Name = "cluster_shader" },
+                        }
+                    }
+                },
+                Textures = new List<TextureBinding>
+                {
+                    new() { Name = "AlbedoMap", Path = "default:white" },
+                    new() { Name = "NormalMap", Path = "default:normal" },
+                    new() { Name = "ARMMap", Path = "default:arm" },
+                },
+            };
+
+            var matUnlit = SomeEngine.Render.Assets.MaterialAssetLoader.LoadFromAsset(
+                unlitAsset, materialRegistry, LoadTexture, LoadShader);
+            matUnlit.SetSampler("MaterialSampler", defaultSampler);
+
+            // 4. Discover and optionally load mesh assets from samples/
             RefreshAvailableMeshes();
 
             if (availableMeshes.Count > 0)
@@ -349,6 +483,9 @@ class Program
                             )
                             .First();
 
+                        uint pbrSlotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots(matPBR.Passes);
+                        uint unlitSlotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots(matUnlit.Passes);
+
                         // Spawn 3 instances with different MaterialOverrides to test per-instance data
                         for (int i = -1; i <= 1; i++) 
                         {
@@ -356,7 +493,9 @@ class Program
                             entity.AddComponent(
                                 new TransformQvvs(new Vector3(i * 2.0f, 0, 0), Quaternion.Identity, 1.0f)
                             );
-                            entity.AddComponent(new MeshInstance { BVHRootIndex = firstLoaded.Value });
+                            
+                            uint slotOffsetToUse = (i == 1) ? unlitSlotOffset : pbrSlotOffset;
+                            entity.AddComponent(new MeshInstance { BVHRootIndex = firstLoaded.Value, MaterialSlotOffset = slotOffsetToUse });
                             
                             Vector4 color = i == -1 ? new Vector4(1, 0.5f, 0.5f, 1) : 
                                             i == 0 ? new Vector4(0.5f, 1, 0.5f, 1) : 
@@ -374,31 +513,6 @@ class Program
             {
                 Console.WriteLine($"Warning: no .mesh files found in {samplesDirectory}");
             }
-
-            // 4. Init Pipeline (DI)
-            var services = new ServiceCollection();
-            services.AddSingleton(context);
-            services.AddSingleton(instanceDataManager!);
-            services.AddSingleton(resourceManager);
-            services.AddSingleton<MaterialRegistry>();
-
-            var provider = services.BuildServiceProvider();
-            var materialRegistry = provider.GetRequiredService<MaterialRegistry>();
-
-            clusterPipeline = ClusterPipeline.Opaque(
-                context, resourceManager, instanceDataManager!, materialRegistry);
-            clusterPipeline.Initialize(context);
-
-            // Create 2nd material for multi-material testing
-            var mat1 = new Material { Name = "TestPBR_1", ShaderAssetName = "StandardPBRMaterial" };
-            clusterPipeline.SetupMaterialWithDefaults(mat1);
-            materialRegistry.Register(mat1);
-            foreach (var pass in mat1.Passes)
-            {
-                materialRegistry.SetTag<OpaqueTag>(pass);
-                materialRegistry.SetTag<ClusterShaderTag>(pass);
-            }
-            clusterPipeline.CreateSRBForMaterial(mat1);
 
             renderGraph = new RenderGraph();
 

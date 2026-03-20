@@ -28,7 +28,7 @@ public class IcoSphereTest
 
         // Process through ClusterBuilder
         var meshAsset = ClusterBuilder.ProcessRaw(
-            vertices, attributes, indices, "IcoSphere_LOD5"
+            vertices, attributes, indices, new System.Collections.Generic.List<string>(), "IcoSphere_LOD5"
         );
 
         Assert.That(meshAsset.Payload, Is.Not.Null);

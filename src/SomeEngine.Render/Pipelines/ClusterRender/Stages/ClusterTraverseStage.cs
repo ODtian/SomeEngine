@@ -1,3 +1,5 @@
+using System.Numerics;
+using System.Runtime.InteropServices;
 using Diligent;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
@@ -14,6 +16,7 @@ public static class ClusterTraverse
 {
     /// <summary>
     /// 向 RenderGraph 添加 BVH 遍历 pass，返回候选 Cluster 列表。
+    /// 内部构建并上传 CullingUniforms，输出 handle 供 CullStage 复用。
     /// </summary>
     public static ClusterTraverseOutput AddPasses(
         RenderGraph graph,
@@ -22,19 +25,30 @@ public static class ClusterTraverse
         ClusterResourceManager clusterMgr,
         InstanceDataManager instanceMgr,
         in ClusterGlobalResources globals,
-        RenderGraphHandle hCullingUniforms,
-        in ClusterTraverseConfig config,
-        in ClusterUploadConfig frameData
+        in ClusterCameraData camera,
+        in ClusterTraverseConfig config
     )
     {
         // Forward frame data to internal BVH pass
+        var prevViewProjT = Matrix4x4.Transpose(camera.PrevViewProj);
         bvhTraversePass.SetFrameData(
-            frameData.View, frameData.Proj, frameData.CameraPos,
-            frameData.LodThreshold, frameData.LodScale, frameData.ForcedLODLevel,
-            frameData.BypassCulling,
-            System.Numerics.Matrix4x4.Transpose(frameData.PrevViewProj), // UploadConfig stores non-transposed
-            frameData.HasPrevHistory, frameData.HiZMipCount, frameData.HiZInvSize
+            camera.View, camera.Proj, camera.CameraPos,
+            camera.LodThreshold, camera.LodScale, camera.ForcedLODLevel,
+            false, // bypassCulling (default for traverse)
+            prevViewProjT,
+            false, 0, Vector2.Zero // HiZ defaults (set externally if needed)
         );
+
+        // ─── Create + upload CullingUniforms ───
+        var cullingData = CullingUniforms.Create(
+            camera.View, camera.Proj, camera.CameraPos,
+            camera.LodThreshold, camera.LodScale, camera.ForcedLODLevel,
+            (uint)instanceMgr.Count, false, false, false,
+            prevViewProjT, false, 0, Vector2.Zero,
+            camera.PrevView, camera.PrevProj,
+            clusterMgr.QuantOrigin, clusterMgr.QuantStep
+        );
+        var hCullingUB = CreateDynamicUniformPass(graph, "CullingUniforms", cullingData);
 
         // ─── Create candidate/queue buffers ───
         uint maxDraws = ClusterLimits.MaxDraws;
@@ -135,7 +149,7 @@ public static class ClusterTraverse
         bvhTraversePass.HReadbackBuffer = hBvhReadback;
         bvhTraversePass.HPageFaultBuffer = hPageFaultBuffer;
         bvhTraversePass.HPageFaultReadbackBuffer = hPageFaultReadback;
-        bvhTraversePass.HCullingUniforms = hCullingUniforms;
+        bvhTraversePass.HCullingUniforms = hCullingUB;
         bvhTraversePass.HGlobalTransformBuffer = globals.GlobalTransform;
         bvhTraversePass.HGlobalInstanceHeaderBuffer = globals.GlobalInstanceHeader;
         bvhTraversePass.HGlobalBVHBuffer = globals.GlobalBVH;
@@ -175,7 +189,38 @@ public static class ClusterTraverse
         graph.AddPass(cullUpdateArgsPass);
 
         return new ClusterTraverseOutput(
-            hCandidateClusters, hCandidateArgs, hCandidateCount
+            hCandidateClusters, hCandidateArgs, hCandidateCount, hCullingUB
         );
+    }
+
+    /// <summary>
+    /// 创建动态 Uniform Buffer 并添加上传 pass。
+    /// </summary>
+    private static RenderGraphHandle CreateDynamicUniformPass<T>(
+        RenderGraph graph, string name, T data) where T : unmanaged
+    {
+        var handle = graph.CreateBuffer(name, new BufferDesc
+        {
+            Size = (ulong)Marshal.SizeOf<T>(),
+            Usage = Usage.Dynamic,
+            BindFlags = BindFlags.UniformBuffer,
+            CPUAccessFlags = CpuAccessFlags.Write,
+        });
+        graph.AddPass(
+            $"Upload{name}",
+            builder => { builder.Write(handle, ResourceState.ConstantBuffer); },
+            rgCtx =>
+            {
+                var ctx2 = rgCtx.RenderContext.ImmediateContext;
+                var buf = rgCtx.GetBuffer(handle);
+                if (ctx2 != null && buf != null)
+                {
+                    var span = ctx2.MapBuffer<T>(buf, MapType.Write, MapFlags.Discard);
+                    span[0] = data;
+                    ctx2.UnmapBuffer(buf, MapType.Write);
+                }
+            }
+        );
+        return handle;
     }
 }

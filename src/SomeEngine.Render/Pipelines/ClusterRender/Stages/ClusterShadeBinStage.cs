@@ -149,6 +149,7 @@ public class ClusterShadeBinStage : IDisposable
         _countPass.HShadeBinUniforms = hBinUniforms;
         _countPass.HBinCounts = hBinCounts;
         _countPass.HMaterialSlotBuffer = hMaterialSlotBuffer;
+        _countPass.HPageHeap = globals.PageHeap;
         graph.AddPass(_countPass);
 
         _reservePass!.HShadeBinUniforms = hBinUniforms;
@@ -166,6 +167,7 @@ public class ClusterShadeBinStage : IDisposable
         _scatterPass.HBinScatterCount = hBinScatterCount;
         _scatterPass.HPixelCoordBuffer = hPixelCoordBuffer;
         _scatterPass.HMaterialSlotBuffer = hMaterialSlotBuffer;
+        _scatterPass.HPageHeap = globals.PageHeap;
         graph.AddPass(_scatterPass);
 
         return new ClusterShadeBinOutput(hPixelCoordBuffer, hBinOffsets, hBinCounts, hBinIndirectArgs);

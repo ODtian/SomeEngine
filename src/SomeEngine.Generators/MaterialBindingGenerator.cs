@@ -20,19 +20,24 @@ public class ShaderParamsGenerator : IIncrementalGenerator
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
-        var candidates = context.SyntaxProvider
-            .CreateSyntaxProvider(
-                predicate: static (node, _) => node is ClassDeclarationSyntax cds &&
-                    cds.Modifiers.Any(m => m.Text == "partial"),
-                transform: static (ctx, _) => GetClassInfo(ctx))
+        var candidates = context
+            .SyntaxProvider.CreateSyntaxProvider(
+                predicate: static (node, _) =>
+                    node is ClassDeclarationSyntax cds
+                    && cds.Modifiers.Any(m => m.Text == "partial"),
+                transform: static (ctx, _) => GetClassInfo(ctx)
+            )
             .Where(static info => info is not null)
             .Select(static (info, _) => info!.Value);
 
-        context.RegisterSourceOutput(candidates, static (spc, info) =>
-        {
-            var source = GenerateApplyToSRB(info);
-            spc.AddSource($"{info.ClassName}_ShaderParams.g.cs", source);
-        });
+        context.RegisterSourceOutput(
+            candidates,
+            static (spc, info) =>
+            {
+                var source = GenerateApplyToSRB(info);
+                spc.AddSource($"{info.ClassName}_ShaderParams.g.cs", source);
+            }
+        );
     }
 
     private static ShaderParamsClassInfo? GetClassInfo(GeneratorSyntaxContext ctx)
@@ -61,18 +66,24 @@ public class ShaderParamsGenerator : IIncrementalGenerator
             {
                 IFieldSymbol f => f.Type,
                 IPropertySymbol p => p.Type,
-                _ => null
+                _ => null,
             };
 
-            if (memberType != null && ImplementsInterface(memberType, IShaderParamsType)
-                && memberType.ToDisplayString() != IShaderParamsType)
+            if (
+                memberType != null
+                && ImplementsInterface(memberType, IShaderParamsType)
+                && memberType.ToDisplayString() != IShaderParamsType
+            )
             {
-                string memberName = member is IFieldSymbol fs ? fs.Name
-                    : member is IPropertySymbol ps ? ps.Name : "";
+                string memberName =
+                    member is IFieldSymbol fs ? fs.Name
+                    : member is IPropertySymbol ps ? ps.Name
+                    : "";
                 if (!string.IsNullOrEmpty(memberName))
                 {
                     // Don't treat [ShaderParam]-annotated fields as composed params
-                    bool hasShaderParamAttr = member.GetAttributes()
+                    bool hasShaderParamAttr = member
+                        .GetAttributes()
                         .Any(a => a.AttributeClass?.ToDisplayString() == ShaderParamAttr);
                     if (!hasShaderParamAttr)
                         composedParams.Add(memberName);
@@ -90,9 +101,11 @@ public class ShaderParamsGenerator : IIncrementalGenerator
                 if (attr.AttributeClass?.ToDisplayString() == ShaderParamAttr)
                 {
                     hasAttr = true;
-                    if (attr.ConstructorArguments.Length > 0 &&
-                        attr.ConstructorArguments[0].Value is string name &&
-                        !string.IsNullOrEmpty(name))
+                    if (
+                        attr.ConstructorArguments.Length > 0
+                        && attr.ConstructorArguments[0].Value is string name
+                        && !string.IsNullOrEmpty(name)
+                    )
                     {
                         shaderName = name;
                     }
@@ -140,7 +153,7 @@ public class ShaderParamsGenerator : IIncrementalGenerator
                 "SomeEngine.Render.Materials.TextureSlot" => SlotKind.Texture,
                 "SomeEngine.Render.Materials.BufferSlot" => SlotKind.Buffer,
                 "SomeEngine.Render.Materials.SamplerSlot" => SlotKind.Sampler,
-                _ => SlotKind.Unknown,  // Scalars — skip for now (future: ConstantBuffer)
+                _ => SlotKind.Unknown, // Scalars — skip for now (future: ConstantBuffer)
             };
 
             if (kind == SlotKind.Unknown)
@@ -156,9 +169,9 @@ public class ShaderParamsGenerator : IIncrementalGenerator
             symbol.ContainingNamespace.ToDisplayString(),
             symbol.Name,
             bindings.ToImmutable(),
-            composedParams.ToImmutable());
+            composedParams.ToImmutable()
+        );
     }
-
 
     private static bool ImplementsInterface(ITypeSymbol symbol, string interfaceName)
     {
@@ -201,24 +214,32 @@ public class ShaderParamsGenerator : IIncrementalGenerator
             {
                 case SlotKind.Texture:
                     sb.AppendLine($"        if ({binding.FieldName}.View is not null)");
-                    sb.AppendLine($"            srb.GetVariableByName({binding.Stage}, \"{binding.ShaderName}\")");
+                    sb.AppendLine(
+                        $"            srb.GetVariableByName({binding.Stage}, \"{binding.ShaderName}\")"
+                    );
                     sb.AppendLine($"                ?.Set({binding.FieldName}.View, {flags});");
                     sb.AppendLine();
                     break;
 
                 case SlotKind.Buffer:
                     sb.AppendLine($"        if ({binding.FieldName}.View is not null)");
-                    sb.AppendLine($"            srb.GetVariableByName({binding.Stage}, \"{binding.ShaderName}\")");
+                    sb.AppendLine(
+                        $"            srb.GetVariableByName({binding.Stage}, \"{binding.ShaderName}\")"
+                    );
                     sb.AppendLine($"                ?.Set({binding.FieldName}.View, {flags});");
                     sb.AppendLine($"        else if ({binding.FieldName}.Buffer is not null)");
-                    sb.AppendLine($"            srb.GetVariableByName({binding.Stage}, \"{binding.ShaderName}\")");
+                    sb.AppendLine(
+                        $"            srb.GetVariableByName({binding.Stage}, \"{binding.ShaderName}\")"
+                    );
                     sb.AppendLine($"                ?.Set({binding.FieldName}.Buffer, {flags});");
                     sb.AppendLine();
                     break;
 
                 case SlotKind.Sampler:
                     sb.AppendLine($"        if ({binding.FieldName}.Sampler is not null)");
-                    sb.AppendLine($"            srb.GetVariableByName({binding.Stage}, \"{binding.ShaderName}\")");
+                    sb.AppendLine(
+                        $"            srb.GetVariableByName({binding.Stage}, \"{binding.ShaderName}\")"
+                    );
                     sb.AppendLine($"                ?.Set({binding.FieldName}.Sampler, {flags});");
                     sb.AppendLine();
                     break;
@@ -248,7 +269,13 @@ internal readonly struct BindingInfo
     public readonly string Stage;
     public readonly bool Dynamic;
 
-    public BindingInfo(string fieldName, string shaderName, SlotKind kind, string stage, bool dynamic)
+    public BindingInfo(
+        string fieldName,
+        string shaderName,
+        SlotKind kind,
+        string stage,
+        bool dynamic
+    )
     {
         FieldName = fieldName;
         ShaderName = shaderName;
@@ -266,8 +293,11 @@ internal readonly struct ShaderParamsClassInfo
     public readonly ImmutableArray<string> ComposedParams;
 
     public ShaderParamsClassInfo(
-        string ns, string className,
-        ImmutableArray<BindingInfo> bindings, ImmutableArray<string> composedParams)
+        string ns,
+        string className,
+        ImmutableArray<BindingInfo> bindings,
+        ImmutableArray<string> composedParams
+    )
     {
         Namespace = ns;
         ClassName = className;

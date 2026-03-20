@@ -112,7 +112,46 @@ public static class SlangShaderImporter
             Name = name,
             Variants = [],
             Reflections = [],
+            Metadata = new ShaderMetadata
+            {
+                PipelineTags = [],
+                MaterialBindings = []
+            }
         };
+
+        var moduleRefl = module.GetModuleReflection();
+        for (uint i = 0; i < moduleRefl.Count; i++)
+        {
+            var decl = moduleRefl[(int)i];
+            if (decl.Kind != DeclReflectionKind.Variable) continue;
+
+            var v = decl.AsVariable();
+            if (v == VariableReflection.Null) continue;
+
+            if (v.Type.Kind == SlangTypeKind.ParameterBlock)
+            {
+                var elementType = v.Type.ElementType;
+
+                for (uint a = 0; a < elementType.AttributeCount; a++)
+                {
+                    var attr = elementType.GetAttribute(a);
+                    if (attr.Name == "PipelineTag" && attr.ArgumentCount > 0)
+                    {
+                        asset.Metadata.PipelineTags.Add(attr.GetArgumentValueString(0));
+                    }
+                }
+
+                for (uint f = 0; f < elementType.FieldCount; f++)
+                {
+                    var field = elementType.GetFieldByIndex(f);
+                    asset.Metadata.MaterialBindings.Add(new ShaderMaterialBinding
+                    {
+                        Name = field.Name,
+                        ResourceType = InferResourceType(field.Type.Kind),
+                    });
+                }
+            }
+        }
 
         var backendResourceMaps =
             new Dictionary<
@@ -245,6 +284,17 @@ public static class SlangShaderImporter
         }
 
         return asset;
+    }
+
+    private static byte InferResourceType(SlangTypeKind kind)
+    {
+        return kind switch
+        {
+            SlangTypeKind.Resource => 0,
+            SlangTypeKind.SamplerState => 1,
+            SlangTypeKind.ConstantBuffer => 2,
+            _ => 255
+        };
     }
 
     private static void FinalizeReflection(

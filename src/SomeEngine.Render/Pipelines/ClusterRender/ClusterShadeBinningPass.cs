@@ -111,6 +111,7 @@ public class ClusterShadeBinCountPass(
     public RenderGraphHandle HShadeBinUniforms = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinCounts = RenderGraphHandle.Invalid;
     public RenderGraphHandle HMaterialSlotBuffer = RenderGraphHandle.Invalid;
+    public RenderGraphHandle HPageHeap = RenderGraphHandle.Invalid;
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -119,6 +120,7 @@ public class ClusterShadeBinCountPass(
         builder.Read(HInstanceHeaders, ResourceState.ShaderResource);
         builder.Read(HShadeBinUniforms, ResourceState.ConstantBuffer);
         builder.Read(HMaterialSlotBuffer, ResourceState.ShaderResource);
+        builder.Read(HPageHeap, ResourceState.ShaderResource);
         builder.Write(HBinCounts, ResourceState.UnorderedAccess);
     }
 
@@ -134,8 +136,9 @@ public class ClusterShadeBinCountPass(
         var uniformBuf = rgCtx.GetBuffer(HShadeBinUniforms);
         var binCounts = rgCtx.GetBuffer(HBinCounts);
         var materialSlotBuffer = rgCtx.GetBuffer(HMaterialSlotBuffer);
+        var pageHeap = rgCtx.GetBuffer(HPageHeap);
         if (visBufferSRV == null || visibleClusters == null || instanceHeaders == null
-            || uniformBuf == null || binCounts == null || materialSlotBuffer == null)
+            || uniformBuf == null || binCounts == null || materialSlotBuffer == null || pageHeap == null)
             return;
 
         var srb = resources.CountSRB;
@@ -149,6 +152,8 @@ public class ClusterShadeBinCountPass(
             ?.Set(instanceHeaders.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
         srb.GetVariableByName(ShaderType.Compute, "MaterialSlotBuffer")
             ?.Set(materialSlotBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        srb.GetVariableByName(ShaderType.Compute, "PageHeap")
+            ?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
         srb.GetVariableByName(ShaderType.Compute, "BinCounts")
             ?.Set(binCounts.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
@@ -249,6 +254,7 @@ public class ClusterShadeBinScatterPass(
     public RenderGraphHandle HBinScatterCount = RenderGraphHandle.Invalid;
     public RenderGraphHandle HPixelCoordBuffer = RenderGraphHandle.Invalid;
     public RenderGraphHandle HMaterialSlotBuffer = RenderGraphHandle.Invalid;
+    public RenderGraphHandle HPageHeap = RenderGraphHandle.Invalid;
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -257,6 +263,7 @@ public class ClusterShadeBinScatterPass(
         builder.Read(HInstanceHeaders, ResourceState.ShaderResource);
         builder.Read(HShadeBinUniforms, ResourceState.ConstantBuffer);
         builder.Read(HMaterialSlotBuffer, ResourceState.ShaderResource);
+        builder.Read(HPageHeap, ResourceState.ShaderResource);
         // BinOffsets is RWStructuredBuffer in shader, so must be UAV even though we only read
         builder.Read(HBinOffsets, ResourceState.UnorderedAccess);
         builder.Write(HBinScatterCount, ResourceState.UnorderedAccess);
@@ -277,9 +284,10 @@ public class ClusterShadeBinScatterPass(
         var binScatterCount = rgCtx.GetBuffer(HBinScatterCount);
         var pixelCoordBuffer = rgCtx.GetBuffer(HPixelCoordBuffer);
         var materialSlotBuffer = rgCtx.GetBuffer(HMaterialSlotBuffer);
+        var pageHeap = rgCtx.GetBuffer(HPageHeap);
         if (visBufferSRV == null || visibleClusters == null || instanceHeaders == null
             || uniformBuf == null || binOffsets == null || binScatterCount == null
-            || pixelCoordBuffer == null || materialSlotBuffer == null)
+            || pixelCoordBuffer == null || materialSlotBuffer == null || pageHeap == null)
             return;
 
         var srb = resources.ScatterSRB;
@@ -293,6 +301,8 @@ public class ClusterShadeBinScatterPass(
             ?.Set(instanceHeaders.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
         srb.GetVariableByName(ShaderType.Compute, "MaterialSlotBuffer")
             ?.Set(materialSlotBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        srb.GetVariableByName(ShaderType.Compute, "PageHeap")
+            ?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
         srb.GetVariableByName(ShaderType.Compute, "BinOffsets")
             ?.Set(binOffsets.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
         srb.GetVariableByName(ShaderType.Compute, "BinScatterCount")

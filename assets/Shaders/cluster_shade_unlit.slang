@@ -1,5 +1,5 @@
 #include "cluster_common.slang"
-#include "standard_pbr.slang"
+#include "material_interfaces.slang"
 
 struct ShadeUniforms
 {
@@ -208,7 +208,6 @@ void CSMaterialShade(uint3 tid : SV_DispatchThreadID)
             PixelContext debugCtx;
             if (buildPixelContext(pixelCoord, debugCtx))
             {
-                // Recompute bary from screen positions for debug display
                 int3 intBase; uint vStart; uint tStart; uint packedCounts;
                 LoadClusterInfo(PageHeap, req.PageOffset, req.ClusterID, intBase, vStart, tStart, packedCounts);
                 uint4 header1 = PageHeap.Load4(req.PageOffset + 16);
@@ -226,72 +225,40 @@ void CSMaterialShade(uint3 tid : SV_DispatchThreadID)
                 float3 sp2 = ProjectToScreen(wp2, Uniforms.ViewProj, Uniforms.ScreenWidth, Uniforms.ScreenHeight);
                 color = ComputeBarycentric(float2(pixelCoord) + 0.5, sp0.xy, sp1.xy, sp2.xy);
             }
-            else
-            {
-                color = float3(0.0);
-            }
+            else color = float3(0.0);
         }
         else if (Uniforms.DebugMode == 9) // Normal
         {
             PixelContext debugCtx;
-            if (buildPixelContext(pixelCoord, debugCtx))
-                color = debugCtx.worldNormal * 0.5 + 0.5;
-            else
-                color = float3(0.0);
+            if (buildPixelContext(pixelCoord, debugCtx)) color = debugCtx.worldNormal * 0.5 + 0.5;
+            else color = float3(0.0);
         }
         else if (Uniforms.DebugMode == 10) // UV
         {
             PixelContext uvCtx;
             if (buildPixelContext(pixelCoord, uvCtx))
             {
-                // UV as color + checkerboard pattern
                 float2 uv = uvCtx.uv0;
                 float checker = step(0.5, frac(uv.x * 8.0)) != step(0.5, frac(uv.y * 8.0)) ? 0.8 : 0.2;
                 color = float3(uv.x, uv.y, checker);
             }
-            else
-            {
-                color = float3(0.0);
-            }
+            else color = float3(0.0);
         }
-        else
-        {
-            color = float3(1, 0, 1); // fallback magenta
-        }
+        else color = float3(1, 0, 1);
+        
         OutputColor[pixelCoord] = float4(color, 1.0);
         return;
     }
 
-    // ── Material evaluation ──
+    // ── Material evaluation (Unlit) ──
     PixelContext ctx;
     if (!buildPixelContext(pixelCoord, ctx))
         return;
 
     // Sample material textures
     float4 albedoSample = AlbedoMap.SampleLevel(MaterialSampler, ctx.uv0, 0.0);
-    float3 armSample    = ARMMap.SampleLevel(MaterialSampler, ctx.uv0, 0.0).rgb;
-    float3 normalTS     = NormalMap.SampleLevel(MaterialSampler, ctx.uv0, 0.0).rgb * 2.0 - 1.0;
-
-    // TBN matrix: transform normal from tangent space to world space
-    float3 N = normalize(ctx.worldNormal);
-    float3 T = normalize(ctx.worldTangent.xyz - N * dot(N, ctx.worldTangent.xyz)); // Gram-Schmidt
-    float3 B = cross(N, T) * ctx.worldTangent.w; // handedness
-    float3 mappedNormal = normalize(T * normalTS.x + B * normalTS.y + N * normalTS.z);
-
     float4 tint = getInstancePropertyFloat4(ctx, 0, float4(1.0));
 
-    StandardPBRMaterial material;
-    material.baseColor = albedoSample.rgb * tint.rgb;
-    material.ao        = armSample.r;
-    material.roughness = armSample.g;
-    material.metallic  = armSample.b;
-    material.light.lightDir       = Uniforms.LightDir;
-    material.light.lightIntensity = Uniforms.LightIntensity;
-    material.light.ambientColor   = Uniforms.AmbientColor;
-    material.light.cameraPos      = Uniforms.CameraPos;
-
-    // Override normal with mapped normal for shading
-    PixelContext shadingCtx = ctx;
-    shadingCtx.worldNormal = mappedNormal;
-    material.evaluateSurface(shadingCtx, OutputColor);
+    // Direct Unlit Color
+    OutputColor[pixelCoord] = float4(albedoSample.rgb * tint.rgb, 1.0);
 }

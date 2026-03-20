@@ -43,7 +43,19 @@ public struct GPUCluster
     // 44: uint PackedCounts — [VertexCount:8][TriangleCount:8][LODLevel:8][Pad:8]
     public uint PackedCounts;
 
-    // Total: 48 bytes
+    // 48: uint PackedMaterials — [mat0:8][mat1:8][mat2:8][Pad:8]
+    public uint PackedMaterials;
+
+    // 52: uint PackedRanges — [range0End:8][range1End:8][Pad:16]
+    public uint PackedRanges;
+
+    // 56: uint Pad0
+    public uint Pad0;
+
+    // 60: uint Pad1
+    public uint Pad1;
+
+    // Total: 64 bytes
 
     // Helper to pack CenterOffset and RadiusQuant
     public static uint PackU16Pair(ushort a, ushort b) => (uint)a | ((uint)b << 16);

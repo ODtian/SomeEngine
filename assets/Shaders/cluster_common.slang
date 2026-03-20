@@ -22,7 +22,7 @@ void LoadClusterInfo(ByteAddressBuffer pageHeap, uint pageOffset, uint clusterId
                      out int3 intBase, out uint vStart, out uint tStart, out uint packedCounts)
 {
     uint clustersOffset = pageHeap.Load(pageOffset + 16);
-    uint clusterOffset = pageOffset + clustersOffset + clusterId * 48;
+    uint clusterOffset = pageOffset + clustersOffset + clusterId * 64;
 
     int3 ib;
     ib.x = asint(pageHeap.Load(clusterOffset + 0));
@@ -37,6 +37,30 @@ void LoadClusterInfo(ByteAddressBuffer pageHeap, uint pageOffset, uint clusterId
     tStart = packedTStartGroup & 0xFFFF;
 
     packedCounts = pageHeap.Load(clusterOffset + 44);
+}
+
+/// Load material info (PackedMaterials + PackedRanges) from the page heap for a given cluster.
+void LoadClusterMaterialInfo(ByteAddressBuffer pageHeap, uint pageOffset, uint clusterId,
+                             out uint packedMaterials, out uint packedRanges)
+{
+    uint clustersOffset = pageHeap.Load(pageOffset + 16);
+    uint clusterOffset = pageOffset + clustersOffset + clusterId * 64;
+    packedMaterials = pageHeap.Load(clusterOffset + 48);
+    packedRanges    = pageHeap.Load(clusterOffset + 52);
+}
+
+/// Decode local material index from raw PackedRanges/PackedMaterials, given triangle index.
+uint GetLocalMaterialIndexRaw(uint packedMaterials, uint packedRanges, uint triIdx)
+{
+    uint range0End = packedRanges & 0xFF;
+    uint range1End = (packedRanges >> 8) & 0xFF;
+
+    if (triIdx < range0End)
+        return packedMaterials & 0xFF;
+    else if (triIdx < range1End)
+        return (packedMaterials >> 8) & 0xFF;
+    else
+        return (packedMaterials >> 16) & 0xFF;
 }
 
 /// Fetch a quantized vertex position from the page heap and dequantize to object space.

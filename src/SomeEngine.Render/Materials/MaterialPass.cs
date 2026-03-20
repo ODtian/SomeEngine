@@ -20,10 +20,8 @@ public class MaterialPass
     /// </summary>
     public ShaderParamBag Params { get; }
 
-    /// <summary>
-    /// 关联的 SRB。由 Registry 或 Feature 分配。
-    /// </summary>
-    public IShaderResourceBinding? SRB { get; internal set; }
+    /// <summary>关联的 ShaderAsset</summary>
+    public SomeEngine.Assets.Schema.ShaderAsset? Shader { get; internal set; }
 
     internal MaterialPass(Material owner, ShaderParamBag? @params = null)
     {
@@ -31,16 +29,17 @@ public class MaterialPass
         Params = @params ?? owner.Params;
     }
 
-    /// <summary>将材质参数绑定到 SRB。</summary>
-    public void CommitBindings()
-    {
-        if (SRB != null)
-            Params.ApplyTo(SRB);
-    }
-
     /// <summary>将材质参数绑定到指定 SRB。</summary>
     public void ApplyToSRB(IShaderResourceBinding srb)
     {
         Params.ApplyTo(srb);
+    }
+
+    /// <summary>计算包含 Shader 身份和材质参数的唯一签名</summary>
+    public ulong ComputeSignature()
+    {
+        ulong shaderHash = Shader != null
+            ? (ulong)Shader.Name.GetHashCode() : 0UL;
+        return shaderHash ^ Params.GetSignatureHash();
     }
 }

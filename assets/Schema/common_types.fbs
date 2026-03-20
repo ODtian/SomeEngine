@@ -1,0 +1,12 @@
+// Common scalar parameter value types for material schemas.
+// This file is only consumed via `include` — do not add to FlatSharpSchema input list.
+namespace SomeEngine.Assets.Schema;
+
+table FloatVal  { v:float; }
+table IntVal    { v:int; }
+table BoolVal   { v:bool; }
+table Vec2Val   { x:float; y:float; }
+table Vec3Val   { x:float; y:float; z:float; }
+table Vec4Val   { x:float; y:float; z:float; w:float; }
+
+union ParamValue { FloatVal, IntVal, BoolVal, Vec2Val, Vec3Val, Vec4Val }

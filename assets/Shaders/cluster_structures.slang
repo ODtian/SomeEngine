@@ -27,6 +27,12 @@ struct GPUCluster
     uint PackedTStartGroup;     // 40 — TriangleStart:16 | GroupId(i16):16
     uint PackedCounts;          // 44 — [VertexCount:8][TriangleCount:8][LODLevel:8][Pad:8]
     //  Total: 48 bytes
+    
+    uint PackedMaterials;       // 48 — [mat0:8][mat1:8][mat2:8][Pad:8]
+    uint PackedRanges;          // 52 — [range0End:8][range1End:8][Pad:16]
+    uint Pad0;                  // 56
+    uint Pad1;                  // 60
+    //  Total: 64 bytes
 };
 
 // Decode helpers
@@ -66,6 +72,19 @@ int DecodeGroupId(GPUCluster c)
     // Sign-extend from 16-bit
     int raw = int(c.PackedTStartGroup >> 16);
     return (raw << 16) >> 16;
+}
+
+uint GetLocalMaterialIndex(GPUCluster c, uint triIdx)
+{
+    uint range0End = c.PackedRanges & 0xFF;
+    uint range1End = (c.PackedRanges >> 8) & 0xFF;
+    
+    if (triIdx < range0End)
+        return c.PackedMaterials & 0xFF;
+    else if (triIdx < range1End)
+        return (c.PackedMaterials >> 8) & 0xFF;
+    else
+        return (c.PackedMaterials >> 16) & 0xFF;
 }
 
 struct ClusterBVHNode

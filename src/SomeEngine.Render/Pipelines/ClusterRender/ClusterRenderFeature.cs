@@ -408,7 +408,8 @@ public class ClusterRenderFeature(
         _shadeBinReservePass = new ClusterShadeBinReservePass(context, _shadeBinningResources);
         _shadeBinScatterPass = new ClusterShadeBinScatterPass(context, _shadeBinningResources);
         RegisterDefaultMaterials(context, registry, out _defaultTextures, out _defaultSampler, out _materialShadePSO);
-        _materialShadePass = new ClusterMaterialShadePass(context, registry, _materialShadePSO);
+        _materialShadePass = new ClusterMaterialShadePass(context, registry);
+        // PSOLookup removed — use PSOGroups in ClusterPipeline
 
         _initialized = true;
     }
@@ -503,8 +504,7 @@ public class ClusterRenderFeature(
         {
             registry.SetTag<OpaqueTag>(pass);
             registry.SetTag<ClusterShaderTag>(pass);
-            // Create SRB for this pass
-            pass.SRB = pso.CreateShaderResourceBinding(false);
+            // SRB removed — managed by PSOGroup in ClusterPipeline
         }
     }
 
@@ -2143,6 +2143,7 @@ public class ClusterRenderFeature(
         _shadeBinCountPass.HShadeBinUniforms = hBinUniforms;
         _shadeBinCountPass.HBinCounts = hBinCounts;
         _shadeBinCountPass.HMaterialSlotBuffer = hMaterialSlotBuffer;
+        _shadeBinCountPass.HPageHeap = hPageHeap;
         graph.AddPass(_shadeBinCountPass);
 
         // Shade Bin Reserve pass
@@ -2162,6 +2163,7 @@ public class ClusterRenderFeature(
         _shadeBinScatterPass.HBinScatterCount = hBinScatterCount;
         _shadeBinScatterPass.HPixelCoordBuffer = hPixelCoordBuffer;
         _shadeBinScatterPass.HMaterialSlotBuffer = hMaterialSlotBuffer;
+        _shadeBinScatterPass.HPageHeap = hPageHeap;
         graph.AddPass(_shadeBinScatterPass);
 
         // Store shade bin outputs for external access

@@ -22,7 +22,14 @@ public class ClusterShade : IDisposable
         _shadeStage = new ClusterShadeStage(context, registry);
     }
 
-    public void SetMaterialShadePSO(IPipelineState? pso) => _shadeStage.SetMaterialShadePSO(pso);
+    /// <summary>
+    /// Feature-owned PSOGroups. Must be set before AddPasses.
+    /// </summary>
+    public ShadePSOGroup[]? PSOGroups
+    {
+        get => _shadeStage.PSOGroups;
+        set => _shadeStage.PSOGroups = value;
+    }
 
     public void Init()
     {

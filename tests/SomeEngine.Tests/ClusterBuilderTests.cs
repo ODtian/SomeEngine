@@ -63,7 +63,7 @@ public class ClusterBuilderTests
         };
 
         // 2. Run Builder
-        var asset = ClusterBuilder.ProcessRaw(positions, rawAttributes, indices, "TestPlane");
+        var asset = ClusterBuilder.ProcessRaw(positions, rawAttributes, indices, new List<string>(), "TestPlane");
         
         // 3. Assertions
         Assert.That(asset.Payload, Is.Not.Null);
@@ -96,7 +96,7 @@ public class ClusterBuilderTests
             new("TEXCOORD_0", uvs, 2, ValueType.Float16, 2, false),   // 4 bytes/vertex
         };
 
-        var asset = ClusterBuilder.ProcessRaw(positions, rawAttributes, indices, "TestSoA");
+        var asset = ClusterBuilder.ProcessRaw(positions, rawAttributes, indices, new List<string>(), "TestSoA");
 
         Assert.That(asset.Payload, Is.Not.Null);
         var span = asset.Payload.Value.Span;

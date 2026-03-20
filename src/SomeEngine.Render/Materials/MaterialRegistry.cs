@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Diligent;
+using SomeEngine.Assets;
 
 namespace SomeEngine.Render.Materials;
 
@@ -40,11 +41,19 @@ public sealed class MaterialRegistry : IDisposable
             pass.MaterialID = _nextMaterialId++;
             _passById[pass.MaterialID] = pass;
             _tagStore.Register(pass);
+
+            // 自动从 Shader 推导管线 tag
+            if (pass.Shader?.Metadata?.PipelineTags != null)
+            {
+                foreach (var tagName in pass.Shader.Metadata.PipelineTags)
+                {
+                    MaterialTagResolver.ApplyTag(this, pass, tagName, 0);
+                }
+            }
         }
 
-
-
         // 自动推导多 Pass tag
+
         if (material.Passes.Length > 1)
         {
             var primary = material.Passes[0];
@@ -86,6 +95,16 @@ public sealed class MaterialRegistry : IDisposable
         return _passById.TryGetValue(materialId, out var pass) ? pass : null;
     }
 
+    /// <summary>按名称查找 Material。</summary>
+    public Material? GetMaterial(string name)
+    {
+        foreach (var mat in _materials)
+        {
+            if (mat.Name == name) return mat;
+        }
+        return null;
+    }
+
     // ── Tag API（委托给 TagStore） ──
 
     public void SetTag<TTag>(MaterialPass pass, TTag value = default!) where TTag : struct, IMaterialTag
@@ -105,6 +124,15 @@ public sealed class MaterialRegistry : IDisposable
 
     /// <summary>获取所有 MaterialPass。</summary>
     public MaterialPass[] GetAllPasses() => _tagStore.GetAll();
+
+    public bool RemoveTag<TTag>(MaterialPass pass) where TTag : struct, IMaterialTag
+        => _tagStore.RemoveTag<TTag>(pass);
+
+    public void CopyAllTags(MaterialPass from, MaterialPass to)
+        => _tagStore.CopyAllTags(from, to);
+
+    public void RemoveAllTags(MaterialPass pass)
+        => _tagStore.RemoveAllTags(pass);
 
     public void Dispose()
     {

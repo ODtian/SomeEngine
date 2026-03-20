@@ -41,10 +41,21 @@ table BackendReflection {
     reflection: ShaderReflectionData;
 }
 
+table ShaderMaterialBinding {
+    name: string;
+    resource_type: ubyte;    // 0=Texture, 1=Sampler, 2=Buffer
+}
+
+table ShaderMetadata {
+    pipeline_tags: [string];
+    material_bindings: [ShaderMaterialBinding];
+}
+
 table ShaderAsset (fs_serializer) {
     name: string;
     variants: [ShaderBytecode];
     reflections: [BackendReflection];
+    metadata: ShaderMetadata;
 }
 
 root_type ShaderAsset;

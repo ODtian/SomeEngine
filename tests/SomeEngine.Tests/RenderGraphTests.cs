@@ -574,4 +574,36 @@ public class RenderGraphTests
         );
         return (List<int>)field!.GetValue(graph)!;
     }
+
+    [Test]
+    public void TestAddPassNonGeneric()
+    {
+        using var graph = new RenderGraph();
+        bool setupCalled = false;
+        bool executeCalled = false;
+
+        var h = graph.CreateBuffer("TestBuffer", new BufferDesc
+        {
+            Size = 64,
+            BindFlags = BindFlags.UnorderedAccess,
+            Mode = BufferMode.Raw,
+        });
+
+        graph.AddPass(
+            "NonGenericPass",
+            builder =>
+            {
+                builder.Write(h, ResourceState.UnorderedAccess);
+                setupCalled = true;
+            },
+            ctx =>
+            {
+                executeCalled = true;
+            }
+        );
+        graph.MarkOutput(h);
+        graph.Compile();
+
+        Assert.That(setupCalled, Is.True, "Setup lambda should be called during Compile");
+    }
 }

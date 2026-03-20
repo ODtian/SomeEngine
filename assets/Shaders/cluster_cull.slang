@@ -65,7 +65,7 @@ GPUCluster LoadCluster(uint pageOffset, uint clusterIndex)
 {
     uint headerOffset = pageOffset;
     uint clustersOffset = PageHeap.Load(headerOffset + 16);
-    uint offset = headerOffset + clustersOffset + (clusterIndex * 48);
+    uint offset = headerOffset + clustersOffset + (clusterIndex * 64);
     GPUCluster c;
 
     // IntBase (0..11)
@@ -92,6 +92,16 @@ GPUCluster LoadCluster(uint pageOffset, uint clusterIndex)
 
     // PackedCounts (44)
     c.PackedCounts = PageHeap.Load(offset + 44);
+
+    // PackedMaterials (48)
+    c.PackedMaterials = PageHeap.Load(offset + 48);
+
+    // PackedRanges (52)
+    c.PackedRanges = PageHeap.Load(offset + 52);
+
+    // Pad0 (56), Pad1 (60)
+    c.Pad0 = PageHeap.Load(offset + 56);
+    c.Pad1 = PageHeap.Load(offset + 60);
 
     return c;
 }

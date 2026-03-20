@@ -53,6 +53,13 @@ public sealed class BinQueue
         foreach (var region in _regions)
         {
             var passes = region.QueryFunc();
+            // Sort by ShaderAsset identity so same-shader passes get contiguous bins
+            Array.Sort(passes, (a, b) =>
+            {
+                var ha = a.Shader?.Name.GetHashCode() ?? 0;
+                var hb = b.Shader?.Name.GetHashCode() ?? 0;
+                return ha.CompareTo(hb);
+            });
             var signatureMap = new Dictionary<ulong, ushort>();
             ushort regionStartBin = currentBin;
 

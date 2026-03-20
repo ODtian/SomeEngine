@@ -17,13 +17,17 @@
     </PackageReference>
     <PackageReference Include="FlatSharp.Runtime" Version="7.9.0" />
     <PackageReference Include="SharpGLTF.Core" Version="1.0.6" />
-    <PackageReference Include="SlangShaderSharp" Version="2026.2.2" />
+    <ProjectReference Include="..\..\external\SlangShaderSharp\src\SlangShaderSharp.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <FlatSharpSchema Include="..\..\assets\Schema\mesh_asset.fbs" />
     <FlatSharpSchema Include="..\..\assets\Schema\shader_asset.fbs" />
-    <FlatSharpSchema Include="..\..\assets\Schema\material_asset.fbs" />
-    <FlatSharpSchema Include="..\..\assets\Schema\material_instance_asset.fbs" />
+    <FlatSharpSchema Include="..\..\assets\Schema\material_asset.fbs">
+      <IncludePath>..\..\assets\Schema</IncludePath>
+    </FlatSharpSchema>
+    <FlatSharpSchema Include="..\..\assets\Schema\material_instance_asset.fbs">
+      <IncludePath>..\..\assets\Schema</IncludePath>
+    </FlatSharpSchema>
   </ItemGroup>
 </Project>

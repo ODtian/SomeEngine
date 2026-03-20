@@ -18,6 +18,7 @@ Texture2D<uint> VisBuffer;
 StructuredBuffer<DrawRequest> VisibleClusters;
 StructuredBuffer<GpuInstanceHeader> InstanceHeaders;
 StructuredBuffer<uint> MaterialSlotBuffer;
+ByteAddressBuffer PageHeap;
 
 // ─── Pass 1: Count ─── Dispatch: ceil(W/8), ceil(H/8), 1 ───
 
@@ -31,10 +32,17 @@ void CSBinCount(uint3 tid : SV_DispatchThreadID)
     uint visData = VisBuffer[tid.xy];
     if (visData == 0) return;
 
-    // VisBuffer → DrawRequest → InstanceHeader → MaterialSlotBuffer → ShadingBin
+    // VisBuffer → DrawRequest → PageHeap cluster → MaterialSlotBuffer → ShadingBin
     uint visClusterIdx = (visData >> 7) - 1;
+    uint triIdx = visData & 0x7F;
+
     DrawRequest req = VisibleClusters[visClusterIdx];
-    uint slotOffset = InstanceHeaders[req.InstanceID].MaterialSlotOffset;
+
+    uint packedMaterials, packedRanges;
+    LoadClusterMaterialInfo(PageHeap, req.PageOffset, req.ClusterID, packedMaterials, packedRanges);
+
+    uint localMatIdx = GetLocalMaterialIndexRaw(packedMaterials, packedRanges, triIdx);
+    uint slotOffset = InstanceHeaders[req.InstanceID].MaterialSlotOffset + localMatIdx;
     uint shadingBin = GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
 
     uint dummy;
@@ -102,8 +110,15 @@ void CSBinScatter(uint3 tid : SV_DispatchThreadID)
     if (visData == 0) return;
 
     uint visClusterIdx = (visData >> 7) - 1;
+    uint triIdx = visData & 0x7F;
+
     DrawRequest req = VisibleClusters[visClusterIdx];
-    uint slotOffset = InstanceHeaders[req.InstanceID].MaterialSlotOffset;
+
+    uint packedMaterials, packedRanges;
+    LoadClusterMaterialInfo(PageHeap, req.PageOffset, req.ClusterID, packedMaterials, packedRanges);
+
+    uint localMatIdx = GetLocalMaterialIndexRaw(packedMaterials, packedRanges, triIdx);
+    uint slotOffset = InstanceHeaders[req.InstanceID].MaterialSlotOffset + localMatIdx;
     uint shadingBin = GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
 
     uint writeIdx;

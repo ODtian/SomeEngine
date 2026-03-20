@@ -18,7 +18,10 @@ public class ClusterShadeStage : IDisposable
     private ClusterResolvePass? _resolvePass;
     private bool _initialized;
 
-    private IPipelineState? _materialShadePSO;
+    /// <summary>
+    /// Feature-owned PSOGroups. Must be set before AddPasses.
+    /// </summary>
+    public ShadePSOGroup[]? PSOGroups { get; set; }
 
     public ClusterShadeStage(RenderContext context, MaterialRegistry registry)
     {
@@ -26,12 +29,12 @@ public class ClusterShadeStage : IDisposable
         _registry = registry;
     }
 
-    public void SetMaterialShadePSO(IPipelineState? pso) => _materialShadePSO = pso;
+
 
     public void Init()
     {
         if (_initialized) return;
-        _materialShadePass = new ClusterMaterialShadePass(_context, _registry, _materialShadePSO);
+        _materialShadePass = new ClusterMaterialShadePass(_context, _registry);
         _resolvePass = new ClusterResolvePass(_context);
         _resolvePass.Init();
         _initialized = true;
@@ -162,9 +165,11 @@ public class ClusterShadeStage : IDisposable
         _materialShadePass.HShadeUniforms = hShadeUniforms;
         _materialShadePass.HPixelCoordBuffer = shadeBin.PixelCoordBuffer;
         _materialShadePass.HBinOffsets = shadeBin.BinOffsets;
+        _materialShadePass.HBinCounts = shadeBin.BinCounts;
         _materialShadePass.HBinIndirectArgs = shadeBin.BinIndirectArgs;
         _materialShadePass.HOutputColor = hResolveTarget;
         _materialShadePass.ShadeUniformData = shadeUniformData;
+        _materialShadePass.PSOGroups = PSOGroups;
         graph.AddPass(_materialShadePass);
 
         // ─── Copy to back buffer ───

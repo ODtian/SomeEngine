@@ -24,6 +24,7 @@ struct StandardPBRMaterial : ISurfaceEvaluate
     float3 baseColor;
     float  metallic;
     float  roughness;
+    float  ao;
 
     // Lighting (injected from uniforms by the pipeline)
     DirectionalLightParams light;
@@ -52,7 +53,7 @@ struct StandardPBRMaterial : ISurfaceEvaluate
         float3 skyColor    = light.ambientColor;
         float3 groundColor = light.ambientColor * 0.3;
         float  skyBlend    = N.y * 0.5 + 0.5;
-        float3 ambient     = lerp(groundColor, skyColor, skyBlend) * baseColor;
+        float3 ambient     = lerp(groundColor, skyColor, skyBlend) * baseColor * ao;
 
         float3 finalColor = directColor + ambient;
 

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 using Diligent;
 
 namespace SomeEngine.Render.Materials;
@@ -37,6 +38,32 @@ public sealed class ShaderParamBag : IDisposable
     public void Set(string name, ISampler? sampler)
     {
         _entries[name] = new Entry(EntryKind.Sampler, sampler);
+    }
+
+    /// <summary>设置标量参数（float）。</summary>
+    public void SetScalar(string name, float value)
+    {
+        _entries[name] = new Entry(EntryKind.Scalar, value);
+    }
+
+    /// <summary>设置标量参数（int）。</summary>
+    public void SetScalar(string name, int value)
+    {
+        _entries[name] = new Entry(EntryKind.Scalar, value);
+    }
+
+    /// <summary>设置标量参数（Vector4，也用于 Vec2/Vec3）。</summary>
+    public void SetScalar(string name, Vector4 value)
+    {
+        _entries[name] = new Entry(EntryKind.Scalar, value);
+    }
+
+    /// <summary>获取标量参数值。</summary>
+    public object? GetScalar(string name)
+    {
+        if (_entries.TryGetValue(name, out var entry) && entry.Kind == EntryKind.Scalar)
+            return entry.Value;
+        return null;
     }
 
     /// <summary>移除绑定。</summary>
@@ -124,6 +151,7 @@ public sealed class ShaderParamBag : IDisposable
         BufferView,
         Buffer,
         Sampler,
+        Scalar,
     }
 
     private readonly record struct Entry(EntryKind Kind, object? Value);

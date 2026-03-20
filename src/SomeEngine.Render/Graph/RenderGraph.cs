@@ -205,6 +205,15 @@ public class RenderGraph : IDisposable
         AddPass(pass);
     }
 
+    public void AddPass(
+        string name,
+        Action<RenderGraphBuilder> setup,
+        Action<RenderGraphContext> execute
+    )
+    {
+        AddPass(new LambdaRenderGraphPass(name, setup, execute));
+    }
+
     public void MarkOutput(RenderGraphHandle h)
     {
         if (!h.IsValid)

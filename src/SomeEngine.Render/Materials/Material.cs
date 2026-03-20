@@ -18,6 +18,9 @@ public class Material : IDisposable
     /// <summary>对应的 Slang struct 名称。</summary>
     public string ShaderAssetName { get; set; } = "";
 
+    /// <summary>强类型的 shader 资产引用（加载后赋值）</summary>
+    public SomeEngine.Assets.Schema.ShaderAsset? ShaderAsset { get; set; }
+
     /// <summary>资产路径（序列化引用）。</summary>
     public string? AssetPath { get; set; }
 
@@ -55,21 +58,18 @@ public class Material : IDisposable
     public void SetTexture(string name, ITextureView? view)
     {
         Params.Set(name, view);
-        InvalidateResolvedPasses();
     }
 
     /// <summary>设置采样器参数。</summary>
     public void SetSampler(string name, ISampler? sampler)
     {
         Params.Set(name, sampler);
-        InvalidateResolvedPasses();
     }
 
     /// <summary>设置 Buffer 参数。</summary>
     public void SetBuffer(string name, IBufferView? view)
     {
         Params.Set(name, view);
-        InvalidateResolvedPasses();
     }
 
     /// <summary>强制重新 resolve passes。</summary>
@@ -98,7 +98,11 @@ public class Material : IDisposable
     private MaterialPass[] Resolve()
     {
         // 默认生成 1 个 primary MaterialPass，共享 Params
-        return [new MaterialPass(this, Params)];
+        var pass = new MaterialPass(this, Params)
+        {
+            Shader = ShaderAsset
+        };
+        return [pass];
     }
 
     public void Dispose()

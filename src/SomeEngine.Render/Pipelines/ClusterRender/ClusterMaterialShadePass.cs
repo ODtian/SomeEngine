@@ -8,13 +8,11 @@ namespace SomeEngine.Render.Pipelines;
 
 /// <summary>
 /// Per-material shade dispatch pass.
-/// Iterates over all registered MaterialPasses, binds pipeline + material params, dispatches.
-/// PSO is owned by Feature, SRB is owned per MaterialPass.
+/// Iterates over PSOGroups, each group shares a PSO. SRBs are per-bin within the group.
 /// </summary>
 public class ClusterMaterialShadePass(
     RenderContext context,
-    MaterialRegistry registry,
-    IPipelineState? materialShadePSO
+    MaterialRegistry registry
 ) : IRenderGraphPass
 {
     public string Name => "Cluster Material Shade";
@@ -29,14 +27,20 @@ public class ClusterMaterialShadePass(
     public RenderGraphHandle HShadeUniforms = RenderGraphHandle.Invalid;
     public RenderGraphHandle HPixelCoordBuffer = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinOffsets = RenderGraphHandle.Invalid;
+    public RenderGraphHandle HBinCounts = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinIndirectArgs = RenderGraphHandle.Invalid;
     public RenderGraphHandle HOutputColor = RenderGraphHandle.Invalid;
 
     /// <summary>
     /// Base shade uniform data. ShadingBin is overwritten per dispatch iteration.
-    /// Set by ClusterRenderFeature before adding the pass.
+    /// Set by Feature before adding the pass.
     /// </summary>
     public ShadeUniforms ShadeUniformData;
+
+    /// <summary>
+    /// Feature-owned PSOGroups. Each group shares a PSO, contains per-bin SRBs.
+    /// </summary>
+    public ShadePSOGroup[]? PSOGroups;
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -49,6 +53,7 @@ public class ClusterMaterialShadePass(
         builder.Read(HShadeUniforms, ResourceState.ConstantBuffer);
         builder.Read(HPixelCoordBuffer, ResourceState.ShaderResource);
         builder.Read(HBinOffsets, ResourceState.ShaderResource);
+        builder.Read(HBinCounts, ResourceState.ShaderResource);
         builder.Read(HBinIndirectArgs, ResourceState.IndirectArgument);
         builder.Write(HOutputColor, ResourceState.UnorderedAccess);
     }
@@ -56,7 +61,7 @@ public class ClusterMaterialShadePass(
     public void Execute(RenderGraphContext rgCtx)
     {
         var ctx = context.ImmediateContext;
-        if (ctx == null || materialShadePSO == null)
+        if (ctx == null || PSOGroups == null || PSOGroups.Length == 0)
             return;
 
         var visBufferSRV = rgCtx.GetTextureView(HVisBuffer, TextureViewType.ShaderResource);
@@ -68,12 +73,13 @@ public class ClusterMaterialShadePass(
         var uniformBuf = rgCtx.GetBuffer(HShadeUniforms);
         var pixelCoordBuffer = rgCtx.GetBuffer(HPixelCoordBuffer);
         var binOffsets = rgCtx.GetBuffer(HBinOffsets);
+        var binCounts = rgCtx.GetBuffer(HBinCounts);
         var binIndirectArgs = rgCtx.GetBuffer(HBinIndirectArgs);
         var outputColor = rgCtx.GetTexture(HOutputColor);
 
         if (visBufferSRV == null || visibleClusters == null || pageHeap == null
             || instances == null || instanceHeaders == null || instanceDataHeap == null || uniformBuf == null || pixelCoordBuffer == null
-            || binOffsets == null || binIndirectArgs == null || outputColor == null)
+            || binOffsets == null || binCounts == null || binIndirectArgs == null || outputColor == null)
             return;
 
         var outputColorUAV = outputColor.GetDefaultView(TextureViewType.UnorderedAccess);
@@ -91,43 +97,52 @@ public class ClusterMaterialShadePass(
             InstanceDataHeap = instanceDataHeap.GetDefaultView(BufferViewType.ShaderResource),
             PixelCoordBuffer = pixelCoordBuffer.GetDefaultView(BufferViewType.ShaderResource),
             BinOffsets = binOffsets.GetDefaultView(BufferViewType.ShaderResource),
+            BinCounts = binCounts.GetDefaultView(BufferViewType.ShaderResource),
             OutputColor = outputColorUAV,
             Uniforms = uniformBuf,
         };
 
         var uniformData = ShadeUniformData;
 
-        // Set PSO once (single shader type for now)
-        ctx.SetPipelineState(materialShadePSO);
-
-        // Iterate all MaterialPasses
-        var allPasses = registry.GetAllPasses();
-        foreach (var pass in allPasses)
+        // Grouped dispatch — outer loop per PSO group, inner loop per bin
+        foreach (var group in PSOGroups)
         {
-            if (pass.SRB == null) continue;
+            if (group.PSO == null || group.SRBs == null)
+                continue;
 
-            // 1. Pipeline resources (Dynamic — source generated)
-            pipelineParams.ApplyToSRB(pass.SRB);
+            ctx.SetPipelineState(group.PSO);
 
-            // 2. Material resources (from ShaderParamBag)
-            pass.CommitBindings();
+            for (int i = 0; i < group.BinCount; i++)
+            {
+                var srb = group.SRBs[i];
+                if (srb == null) continue;
 
-            // 3. Update ShadingBin in uniform buffer
-            uniformData.ShadingBin = pass.MaterialID;
-            var mapped = ctx.MapBuffer<ShadeUniforms>(uniformBuf, MapType.Write, MapFlags.Discard);
-            mapped[0] = uniformData;
-            ctx.UnmapBuffer(uniformBuf, MapType.Write);
+                int bin = group.BinStart + i;
+                var pass = group.Passes[i];
 
-            // 4. Dispatch
-            ctx.CommitShaderResources(pass.SRB, ResourceStateTransitionMode.Verify);
-            ctx.DispatchComputeIndirect(
-                new DispatchComputeIndirectAttribs
-                {
-                    AttribsBuffer = binIndirectArgs,
-                    AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
-                    DispatchArgsByteOffset = (ulong)(pass.MaterialID * 12),
-                }
-            );
+                // 1. Pipeline resources (Dynamic)
+                pipelineParams.ApplyToSRB(srb);
+
+                // 2. Material resources (Mutable — already bound at rebuild time via pass.ApplyToSRB)
+
+                // 3. Update ShadingBin in uniform buffer
+                uniformData.ShadingBin = (uint)bin;
+                var mapped = ctx.MapBuffer<ShadeUniforms>(uniformBuf, MapType.Write, MapFlags.Discard);
+                mapped[0] = uniformData;
+                ctx.UnmapBuffer(uniformBuf, MapType.Write);
+
+                // 4. Dispatch
+                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+                ctx.DispatchComputeIndirect(
+                    new DispatchComputeIndirectAttribs
+                    {
+                        AttribsBuffer = binIndirectArgs,
+                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+                        DispatchArgsByteOffset = (ulong)(bin * 12),
+                    }
+                );
+            }
         }
     }
 }
+

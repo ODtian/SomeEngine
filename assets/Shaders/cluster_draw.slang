@@ -60,7 +60,7 @@ void LoadClusterInfo(uint pageOffset, uint clusterId,
                      out int3 intBase, out uint vStart, out uint tStart, out uint packedCounts)
 {
     uint clustersOffset = PageHeap.Load(pageOffset + 16);
-    uint clusterOffset = pageOffset + clustersOffset + clusterId * 48;
+    uint clusterOffset = pageOffset + clustersOffset + clusterId * 64;
 
     // IntBase at offset 0 (int3 = 12 bytes)
     int3 ib;
