@@ -69,8 +69,8 @@ public static class ClusterDraw
                     var rtv = rgCtx.GetTextureView(hVisBuffer, TextureViewType.RenderTarget);
                     if (ctx2 != null && rtv != null)
                     {
-                        ctx2.SetRenderTargets([rtv], null, ResourceStateTransitionMode.Verify);
-                        ctx2.ClearRenderTarget(rtv, new System.Numerics.Vector4(0, 0, 0, 0), ResourceStateTransitionMode.Verify);
+                        ctx2.SetRenderTargets([rtv], null, ResourceStateTransitionMode.None);
+                        ctx2.ClearRenderTarget(rtv, new System.Numerics.Vector4(0, 0, 0, 0), ResourceStateTransitionMode.None);
                     }
                 }
             );
@@ -96,7 +96,7 @@ public static class ClusterDraw
                     if (buf != null)
                     {
                         rgCtx.RenderContext.ImmediateContext?.UpdateBuffer(
-                            buf, 0, zeroData, ResourceStateTransitionMode.Verify
+                            buf, 0, zeroData, ResourceStateTransitionMode.None
                         );
                     }
                 }
@@ -107,7 +107,9 @@ public static class ClusterDraw
         var drawPass = new ClusterDrawPass(context, $"{tag}ClusterDraw");
         drawPass.HVisibleClusters = rasterBin.BinnedClusterIndex;
         drawPass.HVisibleClustersData = cull.VisibleClusters;
-        drawPass.HIndirectDrawArgs = rasterBin.BinnedDrawArgs;
+        drawPass.HIndirectDrawArgs = config.UseHWDrawArgs
+            ? rasterBin.BinnedHWDrawArgs
+            : rasterBin.BinnedDrawArgs;
         drawPass.HVisBufferTarget = hVisBuffer;
         drawPass.HDepthTarget = hDepth;
         drawPass.HDrawUniforms = hDrawUniforms;
@@ -124,6 +126,6 @@ public static class ClusterDraw
         );
         graph.AddPass(drawPass);
 
-        return new ClusterRasterOutput(hVisBuffer, hDepth);
+        return new ClusterRasterOutput(hVisBuffer, hDepth, hDepth);
     }
 }

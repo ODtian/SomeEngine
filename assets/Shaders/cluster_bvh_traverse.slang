@@ -29,7 +29,8 @@ struct CullingUniforms
     float4x4 View;
     float P00;
     float P11;
-    float2 Pad7;
+    uint ScreenWidth;
+    uint ScreenHeight;
 
     float3 QuantOrigin;
     float QuantStep;
@@ -56,10 +57,10 @@ cbuffer DepthIndexCB
 // Queues (Ping-Pong)
 // ==========================================
 StructuredBuffer<uint2> Queue_Current;
-ByteAddressBuffer CurrentDispatchArgs;
+ByteAddressBuffer CurrentDispatchArgs;       // IndirectArgs: must stay raw
 RWStructuredBuffer<uint2> Queue_Next;
-RWByteAddressBuffer NextDispatchArgs;
-RWByteAddressBuffer CandidateCount;
+RWByteAddressBuffer NextDispatchArgs;        // IndirectArgs: must stay raw
+RWStructuredBuffer<uint> CandidateCount;
 RWStructuredBuffer<uint3> CandidateClusters;
 RWByteAddressBuffer PageFaultBuffer;
 
@@ -107,7 +108,7 @@ bool IsNodeOutsideFrustum(ClusterBVHNode node, GpuTransform t)
 [numthreads(64, 1, 1)]
 void main(uint3 dispatchThreadID: SV_DispatchThreadID)
 {
-    uint count = CurrentDispatchArgs.Load(12);
+    uint count = CurrentDispatchArgs.Load<BVHDispatchArgs>(0).NodeCount;
     uint threadId = dispatchThreadID.x;
     if (threadId >= count)
         return;
@@ -164,6 +165,7 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
         uint start = node.ChildPointer;
         uint count = node.ChildCount;
         uint outIndex;
+        BVHDispatchArgs curArgs = NextDispatchArgs.Load<BVHDispatchArgs>(0);
         NextDispatchArgs.InterlockedAdd(12, count, outIndex);
         for (uint i = 0; i < count; ++i)
         {
@@ -180,8 +182,7 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
         uint count = node.ChildCount >> 12;
 
         uint outIndex;
-        // Offset 0 used for count storage
-        CandidateCount.InterlockedAdd(0, count, outIndex);
+        InterlockedAdd(CandidateCount[0], count, outIndex);
 
         for (uint i = 0; i < count; ++i)
         {
@@ -197,20 +198,15 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
 [numthreads(1, 1, 1)]
 void UpdateArgs(uint3 id: SV_DispatchThreadID)
 {
-    uint count = NextDispatchArgs.Load(12);
+    uint count = NextDispatchArgs.Load<BVHDispatchArgs>(0).NodeCount;
     uint groups = (count + 63) / 64;
-    NextDispatchArgs.Store(0, groups);
-    NextDispatchArgs.Store(4, 1);
-    NextDispatchArgs.Store(8, 1);
+    NextDispatchArgs.Store<BVHDispatchArgs>(0, BVHDispatchArgs(groups, 1, 1, count));
 }
 
 [numthreads(1, 1, 1)]
 void ClearArgs(uint3 id: SV_DispatchThreadID)
 {
-    NextDispatchArgs.Store(0, 0);
-    NextDispatchArgs.Store(4, 1);
-    NextDispatchArgs.Store(8, 1);
-    NextDispatchArgs.Store(12, 0);
+    NextDispatchArgs.Store<BVHDispatchArgs>(0, BVHDispatchArgs(0, 1, 1, 0));
 }
 
 [numthreads(64, 1, 1)]

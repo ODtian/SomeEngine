@@ -16,9 +16,10 @@ public partial class ClusterShadePipelineParams : IShaderParams
     [ShaderParam(Dynamic = true)] public BufferSlot PixelCoordBuffer;
     [ShaderParam(Dynamic = true)] public BufferSlot BinOffsets;
     [ShaderParam(Dynamic = true)] public TextureSlot OutputColor;
-    [ShaderParam(Dynamic = true)] public BufferSlot Uniforms;
     [ShaderParam(Dynamic = true)] public BufferSlot InstanceHeaders;
     [ShaderParam(Dynamic = true)] public BufferSlot InstanceDataHeap;
     [ShaderParam(Dynamic = true)] public BufferSlot BinCounts;
+    [ShaderParam(Dynamic = true)] public BufferSlot DeformCache;
+    [ShaderParam(Dynamic = true)] public BufferSlot CacheOffsets;
 
 }

@@ -40,13 +40,17 @@ public static class ClusterTraverse
         );
 
         // ─── Create + upload CullingUniforms ───
+        var cullSwapDesc = context.SwapChain?.GetDesc();
+        uint screenWidth = cullSwapDesc?.Width ?? 1;
+        uint screenHeight = cullSwapDesc?.Height ?? 1;
         var cullingData = CullingUniforms.Create(
             camera.View, camera.Proj, camera.CameraPos,
             camera.LodThreshold, camera.LodScale, camera.ForcedLODLevel,
             (uint)instanceMgr.Count, false, false, false,
             prevViewProjT, false, 0, Vector2.Zero,
             camera.PrevView, camera.PrevProj,
-            clusterMgr.QuantOrigin, clusterMgr.QuantStep
+            clusterMgr.QuantOrigin, clusterMgr.QuantStep,
+            screenWidth, screenHeight
         );
         var hCullingUB = CreateDynamicUniformPass(graph, "CullingUniforms", cullingData);
 
@@ -73,7 +77,7 @@ public static class ClusterTraverse
         {
             Size = 4,
             BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-            Mode = BufferMode.Raw,
+            Mode = BufferMode.Structured,
             ElementByteStride = 4,
         });
 
@@ -189,7 +193,7 @@ public static class ClusterTraverse
         graph.AddPass(cullUpdateArgsPass);
 
         return new ClusterTraverseOutput(
-            hCandidateClusters, hCandidateArgs, hCandidateCount, hCullingUB
+            hCandidateClusters, hCandidateArgs, hCandidateCount, hCullingUB, hIndirectDrawArgs
         );
     }
 

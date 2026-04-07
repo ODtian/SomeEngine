@@ -1,60 +1,58 @@
 using System;
 using Diligent;
+using Friflo.Engine.ECS;
+using SomeEngine.Assets;
+using SomeEngine.Assets.Schema;
 
 namespace SomeEngine.Render.Materials;
 
 /// <summary>
-/// 材质资产层 + 运行时 source。替代旧 MaterialBase。
-/// <para>
-/// Material 持有 shader 参数（贴图/采样器），resolve 后生成 MaterialPass 列表。
-/// Phase 2 每个 Material 只产生 1 个 MaterialPass。
-/// </para>
+/// 材质资产层 + 运行时 source。
 /// </summary>
 public class Material : IDisposable
 {
+    public AssetGuid AssetGuid { get; set; }
+
     /// <summary>名称（调试/序列化用）。</summary>
     public string Name { get; set; } = "";
-
-    /// <summary>对应的 Slang struct 名称。</summary>
-    public string ShaderAssetName { get; set; } = "";
-
-    /// <summary>强类型的 shader 资产引用（加载后赋值）</summary>
-    public SomeEngine.Assets.Schema.ShaderAsset? ShaderAsset { get; set; }
-
-    /// <summary>资产路径（序列化引用）。</summary>
-    public string? AssetPath { get; set; }
 
     /// <summary>所有贴图/采样器参数。</summary>
     public ShaderParamBag Params { get; private set; } = new();
 
-    /// <summary>resolve 后的 pass 列表。Phase 2 只有 1 个。</summary>
-    private MaterialPass[]? _passes;
+    /// <summary>唯一的渲染身份。1 Material = 1 Entity。</summary>
+    public Entity Entity { get; internal set; }
 
-    /// <summary>获取 resolved passes。首次调用时自动 resolve。</summary>
-    public ReadOnlySpan<MaterialPass> Passes
-    {
-        get
-        {
-            _passes ??= Resolve();
-            return _passes;
-        }
-    }
+    internal MaterialSystem? System { get; set; }
 
     /// <summary>
     /// 克隆此材质。新实例 Params 独立副本，共享底层 GPU 资源引用。
     /// </summary>
     public Material Instantiate()
     {
-        return new Material
+        var materialSystem = System ?? throw new InvalidOperationException("Material is not attached to a MaterialSystem.");
+        var inst = new Material
         {
+            AssetGuid = AssetGuid,
             Name = Name + " (Instance)",
-            ShaderAssetName = ShaderAssetName,
-            AssetPath = AssetPath,
             Params = Params.Clone(),
         };
+
+        var entity = materialSystem.Store.CreateEntity();
+        if (!Entity.IsNull && Entity.StoreOwnership == StoreOwnership.attached)
+        {
+            MaterialEntityUtility.CloneMaterialIdentity(inst, Entity, entity);
+        }
+        else
+        {
+            entity.AddComponent(new Pipelines.MaterialRef { Owner = inst });
+        }
+
+        inst.Entity = entity;
+        inst.System = materialSystem;
+
+        return inst;
     }
 
-    /// <summary>设置贴图参数。</summary>
     public void SetTexture(string name, ITextureView? view)
     {
         Params.Set(name, view);
@@ -72,41 +70,15 @@ public class Material : IDisposable
         Params.Set(name, view);
     }
 
-    /// <summary>强制重新 resolve passes。</summary>
-    public void InvalidateResolvedPasses()
-    {
-        _passes = null;
-    }
-
-    /// <summary>
-    /// 追加一个 pass（用于多 pass 材质，如 overlay）。
-    /// 必须在首次访问 Passes 之后调用（以确保 primary pass 已 resolve）。
-    /// </summary>
-    public MaterialPass AddPass(ShaderParamBag? @params = null)
-    {
-        // 确保 primary pass 已 resolve
-        _ = Passes;
-
-        var pass = new MaterialPass(this, @params ?? new ShaderParamBag());
-        var list = new MaterialPass[_passes!.Length + 1];
-        _passes.CopyTo(list, 0);
-        list[^1] = pass;
-        _passes = list;
-        return pass;
-    }
-
-    private MaterialPass[] Resolve()
-    {
-        // 默认生成 1 个 primary MaterialPass，共享 Params
-        var pass = new MaterialPass(this, Params)
-        {
-            Shader = ShaderAsset
-        };
-        return [pass];
-    }
-
     public void Dispose()
     {
+        System = null;
+
+        if (!Entity.IsNull && Entity.StoreOwnership == StoreOwnership.attached)
+        {
+            Entity.DeleteEntity();
+        }
+
         Params.Dispose();
     }
 }

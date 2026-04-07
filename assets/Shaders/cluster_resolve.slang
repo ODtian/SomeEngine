@@ -19,7 +19,6 @@ Texture2D<float> DepthBuffer;
 
 StructuredBuffer<DrawRequest> VisibleClusters;
 ByteAddressBuffer PageHeap;
-StructuredBuffer<GpuTransform> Instances;
 
 RWTexture2D<float4> OutputColor;
 
@@ -42,8 +41,10 @@ void CSResolve(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
 
     // Decode VisBuffer: (VisibleClusterIndex + 1) in high 25 bits, TriangleID in low 7 bits
-    uint visibleClusterIndex = (visData >> 7) - 1;
-    uint triangleID = visData & 0x7F;
+    // Strip bit 31 (used as SW/HW debug marker when DebugMode==3, always 0 otherwise)
+    uint visDataClean = visData & 0x7FFFFFFFu;
+    uint visibleClusterIndex = (visDataClean >> 7) - 1;
+    uint triangleID = visDataClean & 0x7F;
 
     // Look up the draw request
     DrawRequest req = VisibleClusters[visibleClusterIndex];
@@ -98,13 +99,23 @@ void CSResolve(uint3 dispatchThreadID : SV_DispatchThreadID)
         float l = float(lodLevel) / 10.0;
         color = float3(l, 1.0 - l, 0.0);
     }
+    else if (Uniforms.DebugMode == 3) // SW/HW raster debug view
+    {
+        bool isSW = (visData & 0x80000000u) != 0;
+        // Tint: blue = SW rasterized, red = HW rasterized
+        float3 baseColor = faceNormal * 0.5 + 0.5;
+        if (isSW)
+            color = baseColor * float3(0.3, 0.3, 1.0); // blue tint
+        else
+            color = baseColor * float3(1.0, 0.3, 0.3); // red tint
+    }
     else if (Uniforms.DebugMode == 0) // Normal shading (face normal fallback)
     {
         color = faceNormal * 0.5 + 0.5;
     }
     else
     {
-        // Debug modes >= 3 are handled by the material shade pass.
+        // Debug modes >= 4 are handled by the material shade pass.
         // Don't write here — let the shade pass handle them.
         return;
     }

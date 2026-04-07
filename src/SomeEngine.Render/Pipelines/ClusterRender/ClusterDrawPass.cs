@@ -307,17 +307,17 @@ public class ClusterDrawPass(
             if (vbRtv != null && dsv != null && vbPso != null)
             {
                 var srb = RentSRB(vbPso, vbPool);
-                ctx.SetRenderTargets([vbRtv], dsv, ResourceStateTransitionMode.Verify);
+                ctx.SetRenderTargets([vbRtv], dsv, ResourceStateTransitionMode.None);
                 BindSRB(srb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
                 ctx.SetPipelineState(vbPso);
-                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
                         AttribsBuffer = drawArgs,
                         DrawArgsOffset = drawArgsOffset,
                         Flags = DrawFlags.VerifyAll,
-                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.None,
                     }
                 );
                 ReturnSRB(srb, vbPool);
@@ -330,7 +330,7 @@ public class ClusterDrawPass(
         var fwdDsv = rgCtx.GetTextureView(HDepthTarget, TextureViewType.DepthStencil);
         if (rtv != null && fwdDsv != null)
         {
-            ctx.SetRenderTargets([rtv], fwdDsv, ResourceStateTransitionMode.Verify);
+            ctx.SetRenderTargets([rtv], fwdDsv, ResourceStateTransitionMode.None);
         }
 
         if (_overdraw)
@@ -341,14 +341,14 @@ public class ClusterDrawPass(
                 var srb = RentSRB(s_drawDepthOnlyPSO, s_depthOnlySRBPool);
                 BindSRB(srb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
                 ctx.SetPipelineState(s_drawDepthOnlyPSO);
-                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
                         AttribsBuffer = drawArgs,
                         DrawArgsOffset = drawArgsOffset,
                         Flags = DrawFlags.VerifyAll,
-                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.None,
                     }
                 );
                 ReturnSRB(srb, s_depthOnlySRBPool);
@@ -360,14 +360,14 @@ public class ClusterDrawPass(
                 var srb = RentSRB(s_drawOverdrawPSO, s_overdrawSRBPool);
                 BindSRB(srb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
                 ctx.SetPipelineState(s_drawOverdrawPSO);
-                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
                         AttribsBuffer = drawArgs,
                         DrawArgsOffset = drawArgsOffset,
                         Flags = DrawFlags.VerifyAll,
-                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.None,
                     }
                 );
                 ReturnSRB(srb, s_overdrawSRBPool);
@@ -383,14 +383,14 @@ public class ClusterDrawPass(
                 var srb = RentSRB(pso, pool);
                 BindSRB(srb, drawUniformBuffer, visible, visibleDataBuffer, pageHeapBuffer, globalTransformView, metaBuffer);
                 ctx.SetPipelineState(pso);
-                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+                ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
                 ctx.DrawIndirect(
                     new DrawIndirectAttribs
                     {
                         AttribsBuffer = drawArgs,
                         DrawArgsOffset = drawArgsOffset,
                         Flags = DrawFlags.VerifyAll,
-                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+                        AttribsBufferStateTransitionMode = ResourceStateTransitionMode.None,
                     }
                 );
                 ReturnSRB(srb, pool);

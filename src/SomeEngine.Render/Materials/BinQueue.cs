@@ -1,118 +1,198 @@
 using System;
 using System.Collections.Generic;
+using Friflo.Engine.ECS;
 
 namespace SomeEngine.Render.Materials;
 
 /// <summary>
-/// Bin 级渲染队列。管理多个区间（region），每个区间内按签名去重分 bin。
-/// <para>
-/// 流程：RegisterRegion → Rebuild → 按 bin index 遍历 dispatch。
-/// </para>
+/// Bin 级渲染队列。按 orderKey 动态生成有序区间，并在区间内按签名去重分 bin。
 /// </summary>
 public sealed class BinQueue
 {
-    /// <summary>一个连续的 bin 范围。</summary>
     public readonly struct BinRange
     {
         public readonly ushort Start;
         public readonly ushort Count;
-        public BinRange(ushort start, ushort count) { Start = start; Count = count; }
+        public readonly int OrderKey;
+
+        public BinRange(ushort start, ushort count, int orderKey)
+        {
+            Start = start;
+            Count = count;
+            OrderKey = orderKey;
+        }
     }
 
-    private readonly List<RegionConfig> _regions = new();
-    private MaterialPass[] _passes = [];
-    private readonly Dictionary<MaterialPass, ushort> _passToBin = new();
-    private readonly Dictionary<string, BinRange> _regionRanges = new();
-    private int _totalBinCount;
-
-    /// <summary>总 bin 数。</summary>
-    public int TotalBinCount => _totalBinCount;
-
-    /// <summary>注册一个区间配置。</summary>
-    /// <param name="name">区间名称（如 "opaque", "translucent"）。</param>
-    /// <param name="queryFunc">返回该区间内的 MaterialPass 列表。</param>
-    /// <param name="signatureFunc">计算 pass 签名 hash（相同签名合并为同一 bin）。</param>
-    public void RegisterRegion(string name,
-        Func<MaterialPass[]> queryFunc,
-        Func<MaterialPass, ulong> signatureFunc)
+    public readonly struct BinGroup
     {
-        _regions.Add(new RegionConfig(name, queryFunc, signatureFunc));
+        public required Func<Entity[]> Query { get; init; }
+        public required Func<Entity, int> OrderKey { get; init; }
+        public required Func<Entity, ulong> SignatureFunc { get; init; }
     }
 
-    /// <summary>
-    /// 重建 bin 分配。遍历所有 region，为每个 pass 分配 bin index。
-    /// </summary>
+    private readonly List<BinGroup> _groups = new();
+    private Entity[] _entities = [];
+    private BinRange[] _ranges = [];
+    private ushort[] _argsBinMap = [];
+    private readonly List<EntityBinEntry> _entityBins = [];
+
+    public int TotalBinCount => _entities.Length;
+
+    public void RegisterGroup(BinGroup group)
+    {
+        _groups.Add(group);
+    }
+
     public void Rebuild()
     {
-        _passToBin.Clear();
-        _regionRanges.Clear();
+        _entityBins.Clear();
+        var pendingEntries = new List<EntitySignatureEntry>();
 
-        var allPasses = new List<MaterialPass>();
+        foreach (var group in _groups)
+        {
+            var entities = group.Query() ?? [];
+            foreach (var entity in entities)
+            {
+                pendingEntries.Add(new EntitySignatureEntry(entity, group.OrderKey(entity), group.SignatureFunc(entity)));
+            }
+        }
+
+        pendingEntries.Sort(static (a, b) =>
+        {
+            int orderCompare = a.OrderKey.CompareTo(b.OrderKey);
+            if (orderCompare != 0)
+            {
+                return orderCompare;
+            }
+
+            int signatureCompare = a.Signature.CompareTo(b.Signature);
+            return signatureCompare != 0 ? signatureCompare : a.Entity.Id.CompareTo(b.Entity.Id);
+        });
+
+        var allEntities = new List<Entity>();
+        var ranges = new List<BinRange>();
+        var primaryBinsBySignature = new List<SignatureBinEntry>();
+        var argsMap = new List<ushort>();
         ushort currentBin = 0;
 
-        foreach (var region in _regions)
+        int entryIndex = 0;
+        while (entryIndex < pendingEntries.Count)
         {
-            var passes = region.QueryFunc();
-            // Sort by ShaderAsset identity so same-shader passes get contiguous bins
-            Array.Sort(passes, (a, b) =>
-            {
-                var ha = a.Shader?.Name.GetHashCode() ?? 0;
-                var hb = b.Shader?.Name.GetHashCode() ?? 0;
-                return ha.CompareTo(hb);
-            });
-            var signatureMap = new Dictionary<ulong, ushort>();
+            int orderKey = pendingEntries[entryIndex].OrderKey;
+            var signatureBins = new List<SignatureBinEntry>();
             ushort regionStartBin = currentBin;
 
-            foreach (var pass in passes)
+            while (entryIndex < pendingEntries.Count && pendingEntries[entryIndex].OrderKey == orderKey)
             {
-                ulong sig = region.SignatureFunc(pass);
-                if (!signatureMap.TryGetValue(sig, out ushort binIndex))
+                var entry = pendingEntries[entryIndex++];
+                int signatureIndex = FindSignature(signatureBins, entry.Signature);
+                ushort binIndex;
+
+                if (signatureIndex >= 0)
+                {
+                    binIndex = signatureBins[signatureIndex].Bin;
+                }
+                else
                 {
                     binIndex = currentBin++;
-                    signatureMap[sig] = binIndex;
+                    signatureBins.Add(new SignatureBinEntry(entry.Signature, binIndex));
+                    allEntities.Add(entry.Entity);
+
+                    ushort argsBin = binIndex;
+                    if (orderKey == 0)
+                    {
+                        primaryBinsBySignature.Add(new SignatureBinEntry(entry.Signature, binIndex));
+                    }
+                    else
+                    {
+                        int primaryIndex = FindSignature(primaryBinsBySignature, entry.Signature);
+                        if (primaryIndex >= 0)
+                        {
+                            argsBin = primaryBinsBySignature[primaryIndex].Bin;
+                        }
+                    }
+
+                    argsMap.Add(argsBin);
                 }
 
-                _passToBin[pass] = binIndex;
-
-                // Ensure allPasses has enough space
-                while (allPasses.Count <= binIndex)
-                    allPasses.Add(null!);
-                allPasses[binIndex] = pass; // last-write for duplicate signatures
+                AddOrReplaceEntityBin(entry.Entity.Id, binIndex);
             }
 
             ushort regionCount = (ushort)(currentBin - regionStartBin);
-            _regionRanges[region.Name] = new BinRange(regionStartBin, regionCount);
+            if (regionCount > 0)
+            {
+                ranges.Add(new BinRange(regionStartBin, regionCount, orderKey));
+            }
         }
 
-        _passes = allPasses.ToArray();
-        _totalBinCount = currentBin;
+        _entities = allEntities.ToArray();
+        _ranges = ranges.ToArray();
+        _argsBinMap = argsMap.ToArray();
     }
 
-    /// <summary>获取指定区间的 bin 范围。</summary>
-    public BinRange GetRange(string regionName)
+    public BinRange[] GetRanges()
     {
-        return _regionRanges.TryGetValue(regionName, out var range) ? range : default;
+        return _ranges;
     }
 
-    /// <summary>获取指定 bin index 的 MaterialPass。</summary>
-    public MaterialPass GetPass(int binIndex)
+    public Entity GetEntity(int binIndex)
     {
-        if (binIndex < 0 || binIndex >= _passes.Length)
+        if (binIndex < 0 || binIndex >= _entities.Length)
             throw new ArgumentOutOfRangeException(nameof(binIndex));
-        return _passes[binIndex];
+        return _entities[binIndex];
     }
 
-    /// <summary>反向查找 MaterialPass 对应的 bin index。</summary>
-    public ushort GetBinForPass(MaterialPass pass)
+    public ushort GetBinForEntity(Entity entity)
     {
-        if (_passToBin.TryGetValue(pass, out ushort bin))
-            return bin;
-        throw new KeyNotFoundException("MaterialPass not found in BinQueue.");
+        for (int i = 0; i < _entityBins.Count; i++)
+        {
+            if (_entityBins[i].EntityId == entity.Id)
+            {
+                return _entityBins[i].Bin;
+            }
+        }
+
+        throw new KeyNotFoundException("Entity not found in BinQueue.");
     }
 
-    private readonly record struct RegionConfig(
-        string Name,
-        Func<MaterialPass[]> QueryFunc,
-        Func<MaterialPass, ulong> SignatureFunc
-    );
+    public int GetArgsBin(int binIndex)
+    {
+        if (binIndex < 0 || binIndex >= _argsBinMap.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(binIndex));
+        }
+
+        return _argsBinMap[binIndex];
+    }
+
+    private void AddOrReplaceEntityBin(int entityId, ushort bin)
+    {
+        for (int i = 0; i < _entityBins.Count; i++)
+        {
+            if (_entityBins[i].EntityId == entityId)
+            {
+                _entityBins[i] = new EntityBinEntry(entityId, bin);
+                return;
+            }
+        }
+
+        _entityBins.Add(new EntityBinEntry(entityId, bin));
+    }
+
+    private static int FindSignature(List<SignatureBinEntry> entries, ulong signature)
+    {
+        for (int i = 0; i < entries.Count; i++)
+        {
+            if (entries[i].Signature == signature)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private readonly record struct EntitySignatureEntry(Entity Entity, int OrderKey, ulong Signature);
+    private readonly record struct SignatureBinEntry(ulong Signature, ushort Bin);
+    private readonly record struct EntityBinEntry(int EntityId, ushort Bin);
 }

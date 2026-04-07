@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Friflo.Engine.ECS;
 
 namespace SomeEngine.Render.Materials;
 
@@ -7,7 +8,7 @@ namespace SomeEngine.Render.Materials;
 /// 统一 bin 基础设施入口。管理动态字段 SlotBuffer + 内部 BinQueue + SlotCache。
 /// <para>
 /// 纯 CPU 数据 + GPU buffer 数据，不负责 GPU dispatch。
-/// Feature 通过 RegisterField / RegisterRegion 注册，通过 GetRange / GetPass 查询。
+/// Feature 通过 RegisterField / RegisterGroup 注册，通过 GetRanges / GetEntity 查询。
 /// </para>
 /// </summary>
 public sealed class BinSpace : IDisposable
@@ -16,12 +17,12 @@ public sealed class BinSpace : IDisposable
     private bool _frozen;
     private MaterialSlotBuffer? _buffer;
     private MaterialSlotCache? _cache;
-    private int[] _slotOffsetByMaterialId = [];
-    private uint _lastRegistryVersion = uint.MaxValue;
+    private readonly List<EntitySlotEntry> _slotOffsets = [];
     private uint _version;
 
-    /// <summary>每次 Rebuild 后递增，供外部检测 bin 是否变化。</summary>
     public uint Version => _version;
+
+    public MaterialSlotBuffer? SlotBuffer => _buffer;
 
     public bool IsFrozen => _frozen;
 
@@ -37,7 +38,7 @@ public sealed class BinSpace : IDisposable
     // ── 字段注册 ──
 
     /// <summary>
-    /// 注册一个 bin key 字段。返回 fieldIndex，用于后续 RegisterRegion / GetRange 调用。
+    /// 注册一个 bin key 字段。返回 fieldIndex，用于后续 RegisterGroup / GetRanges 调用。
     /// 必须在 FreezeLayout 之前调用。
     /// </summary>
     public int RegisterField(string name)
@@ -66,48 +67,40 @@ public sealed class BinSpace : IDisposable
         throw new KeyNotFoundException($"Field '{name}' not registered.");
     }
 
-    // ── Region 注册 ──
+    // ── Group 注册 ──
 
-    /// <summary>
-    /// 在指定 field 的内部 BinQueue 上注册一个 region。
-    /// </summary>
-    public void RegisterRegion(int fieldIndex, string regionName,
-        Func<MaterialPass[]> queryFunc,
-        Func<MaterialPass, ulong> signatureFunc)
+    public void RegisterGroup(int fieldIndex, BinQueue.BinGroup group)
     {
         ValidateFieldIndex(fieldIndex);
-        _fields[fieldIndex].BinQueue.RegisterRegion(regionName, queryFunc, signatureFunc);
+        _fields[fieldIndex].BinQueue.RegisterGroup(group);
     }
 
     // ── Slot 管理 ──
 
-    /// <summary>分配 slot 区间（cache-aware）。返回 slotOffset。自动维护 MaterialID → slotOffset 映射。</summary>
-    public int AllocateSlots(ReadOnlySpan<MaterialPass> passes)
+    public int AllocateSlots(ReadOnlySpan<Entity> entities)
     {
         EnsureFrozen();
-        int offset = _cache!.GetOrAllocate(passes);
+        int offset = _cache!.GetOrAllocate(entities);
 
-        // 维护 flat array 映射
-        for (int i = 0; i < passes.Length; i++)
+        for (int i = 0; i < entities.Length; i++)
         {
-            uint id = passes[i].MaterialID;
-            if (id >= (uint)_slotOffsetByMaterialId.Length)
-            {
-                int newLen = Math.Max((int)(id + 1) * 2, 16);
-                Array.Resize(ref _slotOffsetByMaterialId, newLen);
-            }
-            _slotOffsetByMaterialId[id] = offset + i;
+            AddOrReplaceSlotOffset(entities[i].Id, offset + i);
         }
+
         return offset;
     }
 
-    /// <summary>O(1) 查询 MaterialPass 对应的 slot offset。</summary>
-    public int GetSlotOffset(uint materialId)
+    public int GetSlotOffset(Entity entity)
     {
-        if (materialId >= (uint)_slotOffsetByMaterialId.Length)
-            throw new ArgumentOutOfRangeException(nameof(materialId),
-                $"MaterialID {materialId} not allocated in this BinSpace.");
-        return _slotOffsetByMaterialId[materialId];
+        for (int i = 0; i < _slotOffsets.Count; i++)
+        {
+            if (_slotOffsets[i].EntityId == entity.Id)
+            {
+                return _slotOffsets[i].Offset;
+            }
+        }
+
+        throw new KeyNotFoundException($"Entity {entity.Id} not allocated in this BinSpace.");
     }
 
     /// <summary>释放 slot 区间。</summary>
@@ -118,22 +111,10 @@ public sealed class BinSpace : IDisposable
 
     // ── Rebuild ──
 
-    /// <summary>
-    /// 如果 MaterialRegistry 版本变化，重建所有 field 的 BinQueue 并 patch SlotBuffer。
-    /// </summary>
-    public void RebuildIfDirty(MaterialRegistry registry)
+    public void RebuildIfDirty()
     {
         EnsureFrozen();
-        uint currentVersion = registry.Version;
-        if (currentVersion == _lastRegistryVersion) return;
-        _lastRegistryVersion = currentVersion;
-
-        for (int i = 0; i < _fields.Count; i++)
-        {
-            _fields[i].BinQueue.Rebuild();
-            _cache!.RebuildField(i, _fields[i].BinQueue);
-        }
-        _version++;
+        ForceRebuild();
     }
 
     /// <summary>强制重建所有 field（不检查版本）。</summary>
@@ -150,18 +131,16 @@ public sealed class BinSpace : IDisposable
 
     // ── 查询 ──
 
-    /// <summary>获取指定 field + region 的 bin 范围。</summary>
-    public BinQueue.BinRange GetRange(int fieldIndex, string regionName)
+    public BinQueue.BinRange[] GetRanges(int fieldIndex)
     {
         ValidateFieldIndex(fieldIndex);
-        return _fields[fieldIndex].BinQueue.GetRange(regionName);
+        return _fields[fieldIndex].BinQueue.GetRanges();
     }
 
-    /// <summary>获取指定 field + bin index 的 MaterialPass。</summary>
-    public MaterialPass GetPass(int fieldIndex, int binIndex)
+    public Entity GetEntity(int fieldIndex, int binIndex)
     {
         ValidateFieldIndex(fieldIndex);
-        return _fields[fieldIndex].BinQueue.GetPass(binIndex);
+        return _fields[fieldIndex].BinQueue.GetEntity(binIndex);
     }
 
     /// <summary>获取指定 field 的总 bin 数。</summary>
@@ -171,11 +150,16 @@ public sealed class BinSpace : IDisposable
         return _fields[fieldIndex].BinQueue.TotalBinCount;
     }
 
-    /// <summary>反向查找 pass 在指定 field 中的 bin index。</summary>
-    public ushort GetBinForPass(int fieldIndex, MaterialPass pass)
+    public ushort GetBinForEntity(int fieldIndex, Entity entity)
     {
         ValidateFieldIndex(fieldIndex);
-        return _fields[fieldIndex].BinQueue.GetBinForPass(pass);
+        return _fields[fieldIndex].BinQueue.GetBinForEntity(entity);
+    }
+
+    public int GetArgsBin(int fieldIndex, int binIndex)
+    {
+        ValidateFieldIndex(fieldIndex);
+        return _fields[fieldIndex].BinQueue.GetArgsBin(binIndex);
     }
 
     // ── GPU 数据 ──
@@ -204,6 +188,21 @@ public sealed class BinSpace : IDisposable
     {
         _cache?.Dispose();
         _buffer?.Dispose();
+        _slotOffsets.Clear();
+    }
+
+    private void AddOrReplaceSlotOffset(int entityId, int offset)
+    {
+        for (int i = 0; i < _slotOffsets.Count; i++)
+        {
+            if (_slotOffsets[i].EntityId == entityId)
+            {
+                _slotOffsets[i] = new EntitySlotEntry(entityId, offset);
+                return;
+            }
+        }
+
+        _slotOffsets.Add(new EntitySlotEntry(entityId, offset));
     }
 
     private class FieldInfo
@@ -217,4 +216,6 @@ public sealed class BinSpace : IDisposable
             BinQueue = binQueue;
         }
     }
+
+    private readonly record struct EntitySlotEntry(int EntityId, int Offset);
 }

@@ -220,12 +220,12 @@ public class ClusterCullPass(
                 ?.Set(globalTransformView, SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(pso);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchComputeIndirect(
             new DispatchComputeIndirectAttribs
             {
                 AttribsBuffer = candArgs,
-                AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+                AttribsBufferStateTransitionMode = ResourceStateTransitionMode.None,
             }
         );
 

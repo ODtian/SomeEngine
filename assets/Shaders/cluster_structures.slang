@@ -28,10 +28,10 @@ struct GPUCluster
     uint PackedCounts;          // 44 — [VertexCount:8][TriangleCount:8][LODLevel:8][Pad:8]
     //  Total: 48 bytes
     
-    uint PackedMaterials;       // 48 — [mat0:8][mat1:8][mat2:8][Pad:8]
+    uint PackedMaterials;       // 48 — [mat0:8][mat1:8][mat2:8][SlowPathFlag:8] (0xFF = slow path)
     uint PackedRanges;          // 52 — [range0End:8][range1End:8][Pad:16]
-    uint Pad0;                  // 56
-    uint Pad1;                  // 60
+    uint MaterialTableOffset;   // 56 — slow path external table byte offset (0xFFFFFFFF = fast path)
+    uint VRBBatchInfo;          // 60 — VRB batch encoding (fast: ≤5 batches packed)
     //  Total: 64 bytes
 };
 
@@ -87,6 +87,49 @@ uint GetLocalMaterialIndex(GPUCluster c, uint triIdx)
         return (c.PackedMaterials >> 16) & 0xFF;
 }
 
+bool IsMaterialSlowPath(GPUCluster c)
+{
+    return (c.PackedMaterials >> 24) == 0xFF;
+}
+
+// ─── VRB Batch Decode ───
+
+struct VRBBatch
+{
+    uint start; // first triangle index in this batch
+    uint count; // number of triangles
+};
+
+uint DecodeVRBBatchCount(GPUCluster c)
+{
+    return ((c.VRBBatchInfo >> 25) & 0x7) + 1;
+}
+
+VRBBatch DecodeVRBBatch(GPUCluster c, uint batchIdx)
+{
+    VRBBatch batch;
+    batch.start = 0;
+    for (uint i = 0; i < batchIdx; i++)
+        batch.start += ((c.VRBBatchInfo >> (i * 5)) & 0x1F) + 1;
+    batch.count = ((c.VRBBatchInfo >> (batchIdx * 5)) & 0x1F) + 1;
+    return batch;
+}
+
+// Total triangles covered by encoded VRB batches (fast path portion)
+uint DecodeVRBTotalFastTris(GPUCluster c)
+{
+    uint batchCount = DecodeVRBBatchCount(c);
+    uint total = 0;
+    for (uint i = 0; i < batchCount; i++)
+        total += ((c.VRBBatchInfo >> (i * 5)) & 0x1F) + 1;
+    return total;
+}
+
+uint DecodeTriangleCount(GPUCluster c)
+{
+    return (c.PackedCounts >> 8) & 0xFF;
+}
+
 struct ClusterBVHNode
 {
     float4 BoundMin;
@@ -134,6 +177,51 @@ struct AABB
     uint Pad;
 };
 
+// ─── GPU-side typed struct definitions for eliminating manual byte offsets ───
 
+struct DispatchArgs
+{
+    uint GroupX;
+    uint GroupY;
+    uint GroupZ;
+};
+
+struct DrawInstancedArgs
+{
+    uint VertexCount;
+    uint InstanceCount;
+    uint StartVertex;
+    uint StartInstance;
+};
+
+// Cull output draw args: [0]=pad, [1]=swCount, [2]=hwCount
+struct CullDrawArgs
+{
+    uint Pad0;
+    uint SWCount;
+    uint HWCount;
+};
+
+// BVH traverse dispatch: {GroupX, GroupY, GroupZ, NodeCount}
+struct BVHDispatchArgs
+{
+    uint GroupX;
+    uint GroupY;
+    uint GroupZ;
+    uint NodeCount;
+};
+
+// Raster Bin metadata (32B = 8×uint)
+struct RasterBinEntry
+{
+    uint ClusterOffset;
+    uint BinCapacity;
+    uint BinSWCount;
+    uint BinHWCount;
+    uint SWCursor;
+    uint HWCursor;
+    uint SWOffset;     // Exclusive prefix sum of SW clusters only across bins
+    uint Pad;
+};
 
 #endif

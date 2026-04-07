@@ -1,0 +1,13 @@
+{
+  "asset_guid": "e5a08fcd-6f83-46be-b17b-c41dc35f3ef3",
+  "source_guid": "1073fef7-9918-44bc-9764-d0037ca7c3df",
+  "sub_asset_key": "shader:main",
+  "content_fingerprint": "989792a725259dacd926919960102ecb3d455c51341061a3b12c94def07d9cbf",
+  "dependencies": [
+    {
+      "path": "assets/Shaders/depth_merge.slang",
+      "hash": "daf38bee0583b055703ceb6593a14f7dc60c90f7e140d1ab6b5f59207591c043"
+    }
+  ],
+  "importer_version": 2
+}

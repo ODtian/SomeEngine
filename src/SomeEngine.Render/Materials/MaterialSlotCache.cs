@@ -1,17 +1,16 @@
 using System;
 using System.Collections.Generic;
+using Friflo.Engine.ECS;
 
 namespace SomeEngine.Render.Materials;
 
 /// <summary>
-/// Slot 区间共享缓存。相同 MaterialPass 组合的 instance 共享同一段 SlotBuffer 区间。
-/// 存储 pass 列表以支持 bin rebuild 后 patch。
+/// Slot 区间共享缓存。相同 Entity 组合共享同一段 SlotBuffer 区间。
 /// </summary>
 public sealed class MaterialSlotCache : IDisposable
 {
     private readonly MaterialSlotBuffer _buffer;
-    private readonly Dictionary<ulong, CacheEntry> _cache = new();
-    private readonly Dictionary<int, ulong> _offsetToHash = new();
+    private readonly List<CacheEntry> _cache = [];
 
     public MaterialSlotCache(MaterialSlotBuffer buffer)
     {
@@ -22,46 +21,49 @@ public sealed class MaterialSlotCache : IDisposable
     public int UniqueCount => _cache.Count;
 
     /// <summary>
-    /// 获取或分配 slot 区间。相同 pass 组合共享同一 offset。
+    /// 获取或分配 slot 区间。相同 Entity 组合共享同一 offset。
     /// </summary>
-    public int GetOrAllocate(ReadOnlySpan<MaterialPass> passes)
+    public int GetOrAllocate(ReadOnlySpan<Entity> entities)
     {
-        ulong hash = ComputeHash(passes);
+        ulong hash = ComputeHash(entities);
 
-        if (_cache.TryGetValue(hash, out var entry))
+        int existingIndex = FindCacheEntry(hash, entities);
+        if (existingIndex >= 0)
         {
+            var entry = _cache[existingIndex];
             entry.RefCount++;
-            _cache[hash] = entry;
+            _cache[existingIndex] = entry;
             return entry.Offset;
         }
 
-        int offset = _buffer.AllocateRange(passes.Length);
+        int offset = _buffer.AllocateRange(entities.Length);
 
-        // 存储 pass 列表用于后续 RebuildField
-        var storedPasses = new MaterialPass[passes.Length];
-        passes.CopyTo(storedPasses);
+        var storedEntities = new Entity[entities.Length];
+        entities.CopyTo(storedEntities);
 
-        _cache[hash] = new CacheEntry(offset, storedPasses, 1);
-        _offsetToHash[offset] = hash;
+        _cache.Add(new CacheEntry(hash, offset, storedEntities, 1));
         return offset;
     }
 
     /// <summary>释放引用。refcount 归零时释放 buffer 空间。</summary>
     public void Release(int offset)
     {
-        if (!_offsetToHash.TryGetValue(offset, out ulong hash)) return;
-        if (!_cache.TryGetValue(hash, out var entry)) return;
+        int index = FindCacheEntryByOffset(offset);
+        if (index < 0)
+        {
+            return;
+        }
 
+        var entry = _cache[index];
         entry.RefCount--;
         if (entry.RefCount <= 0)
         {
-            _buffer.FreeRange(offset, entry.Passes.Length);
-            _cache.Remove(hash);
-            _offsetToHash.Remove(offset);
+            _buffer.FreeRange(offset, entry.Entities.Length);
+            _cache.RemoveAt(index);
         }
         else
         {
-            _cache[hash] = entry;
+            _cache[index] = entry;
         }
     }
 
@@ -70,21 +72,25 @@ public sealed class MaterialSlotCache : IDisposable
     /// </summary>
     public void RebuildField(int fieldIndex, BinQueue binQueue)
     {
-        foreach (var (_, entry) in _cache)
+        for (int cacheIndex = 0; cacheIndex < _cache.Count; cacheIndex++)
         {
-            for (int i = 0; i < entry.Passes.Length; i++)
+            var entry = _cache[cacheIndex];
+            for (int i = 0; i < entry.Entities.Length; i++)
             {
                 ushort binKey;
                 try
                 {
-                    binKey = binQueue.GetBinForPass(entry.Passes[i]);
+                    binKey = binQueue.GetBinForEntity(entry.Entities[i]);
                 }
                 catch (KeyNotFoundException)
                 {
-                    binKey = 0; // pass 不在此 BinQueue 中
+                    binKey = 0;
                 }
 
-                _buffer.SetField(entry.Offset, i, fieldIndex, binKey);
+                if (_buffer.GetField(entry.Offset, i, fieldIndex) != binKey)
+                {
+                    _buffer.SetField(entry.Offset, i, fieldIndex, binKey);
+                }
             }
         }
     }
@@ -92,39 +98,87 @@ public sealed class MaterialSlotCache : IDisposable
     /// <summary>获取引用计数（测试用）。</summary>
     public int GetRefCount(int offset)
     {
-        if (!_offsetToHash.TryGetValue(offset, out ulong hash)) return 0;
-        return _cache.TryGetValue(hash, out var entry) ? entry.RefCount : 0;
+        int index = FindCacheEntryByOffset(offset);
+        return index >= 0 ? _cache[index].RefCount : 0;
     }
 
     public void Dispose()
     {
         _cache.Clear();
-        _offsetToHash.Clear();
     }
 
-    private static ulong ComputeHash(ReadOnlySpan<MaterialPass> passes)
+    private static ulong ComputeHash(ReadOnlySpan<Entity> entities)
     {
         ulong hash = 14695981039346656037UL; // FNV-1a
-        foreach (var pass in passes)
+        foreach (var entity in entities)
         {
-            hash ^= pass.MaterialID;
-            hash *= 1099511628211UL;
-            hash ^= (ulong)pass.Params.GetSignatureHash();
+            hash ^= (ulong)MaterialEntityUtility.ComputeSlotSignature(entity);
             hash *= 1099511628211UL;
         }
         return hash;
     }
 
+    private int FindCacheEntry(ulong hash, ReadOnlySpan<Entity> entities)
+    {
+        for (int i = 0; i < _cache.Count; i++)
+        {
+            if (_cache[i].Hash != hash)
+            {
+                continue;
+            }
+
+            if (Matches(_cache[i].Entities, entities))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private int FindCacheEntryByOffset(int offset)
+    {
+        for (int i = 0; i < _cache.Count; i++)
+        {
+            if (_cache[i].Offset == offset)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool Matches(Entity[] left, ReadOnlySpan<Entity> right)
+    {
+        if (left.Length != right.Length)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < left.Length; i++)
+        {
+            if (left[i].Id != right[i].Id)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private class CacheEntry
     {
+        public ulong Hash;
         public int Offset;
-        public MaterialPass[] Passes;
+        public Entity[] Entities;
         public int RefCount;
 
-        public CacheEntry(int offset, MaterialPass[] passes, int refCount)
+        public CacheEntry(ulong hash, int offset, Entity[] entities, int refCount)
         {
+            Hash = hash;
             Offset = offset;
-            Passes = passes;
+            Entities = entities;
             RefCount = refCount;
         }
     }

@@ -16,7 +16,6 @@ ConstantBuffer<ShadeBinUniforms> Uniforms;
 Texture2D<uint> VisBuffer;
 
 StructuredBuffer<DrawRequest> VisibleClusters;
-StructuredBuffer<GpuInstanceHeader> InstanceHeaders;
 StructuredBuffer<uint> MaterialSlotBuffer;
 ByteAddressBuffer PageHeap;
 
@@ -92,9 +91,7 @@ void CSBinReserve(uint tid : SV_GroupThreadID)
 
     // Write indirect dispatch args: {GroupX, 1, 1}
     uint groups = (count + 63) / 64;
-    BinIndirectArgs.Store(tid * 12 + 0, groups);
-    BinIndirectArgs.Store(tid * 12 + 4, 1);
-    BinIndirectArgs.Store(tid * 12 + 8, 1);
+    BinIndirectArgs.Store<DispatchArgs>(tid * 12, DispatchArgs(groups, 1, 1));
 }
 
 // ─── Pass 3: Scatter ─── Dispatch: ceil(W/8), ceil(H/8), 1 ───

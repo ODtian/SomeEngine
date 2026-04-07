@@ -29,7 +29,8 @@ struct CullingUniforms
     float4x4 View;
     float P00;
     float P11;
-    float2 Pad7;
+    uint ScreenWidth;
+    uint ScreenHeight;
 
     float3 QuantOrigin;
     float QuantStep;
@@ -45,14 +46,14 @@ ConstantBuffer<CullingUniforms> Uniforms;
 StructuredBuffer<GpuTransform> Instances;
 ByteAddressBuffer PageHeap;
 StructuredBuffer<uint3> CandidateClusters;
-RWByteAddressBuffer CandidateCount;
-RWByteAddressBuffer CandidateArgs;
-RWByteAddressBuffer DrawArgs;
+RWStructuredBuffer<uint> CandidateCount;
+RWByteAddressBuffer CandidateArgs;           // IndirectArgs: must stay raw
+RWByteAddressBuffer DrawArgs;                // IndirectArgs: must stay raw, layout = CullDrawArgs
 RWStructuredBuffer<uint4> VisibleClusters;
 Texture2D<float> HiZTexture;
 RWStructuredBuffer<uint3> Phase2CandidateClusters;
-RWByteAddressBuffer Phase2CandidateCount;
-RWByteAddressBuffer Phase2DrawArgs;  // bytes 0-15: DrawInstanced args, byte 16: Phase1 visible count (offset)
+RWStructuredBuffer<uint> Phase2CandidateCount;
+RWByteAddressBuffer Phase2DrawArgs;          // IndirectArgs: must stay raw, layout = CullDrawArgs
 
 // Debug: per-cluster HiZ test data. Layout:
 // [0]: atomic counter (uint)
@@ -99,9 +100,9 @@ GPUCluster LoadCluster(uint pageOffset, uint clusterIndex)
     // PackedRanges (52)
     c.PackedRanges = PageHeap.Load(offset + 52);
 
-    // Pad0 (56), Pad1 (60)
-    c.Pad0 = PageHeap.Load(offset + 56);
-    c.Pad1 = PageHeap.Load(offset + 60);
+    // MaterialTableOffset (56), VRBBatchInfo (60)
+    c.MaterialTableOffset = PageHeap.Load(offset + 56);
+    c.VRBBatchInfo = PageHeap.Load(offset + 60);
 
     return c;
 }
@@ -109,11 +110,9 @@ GPUCluster LoadCluster(uint pageOffset, uint clusterIndex)
 [numthreads(1, 1, 1)]
 void UpdateIndirectArgs(uint3 id: SV_DispatchThreadID)
 {
-    uint count = CandidateCount.Load(0);
+    uint count = CandidateCount[0];
     uint groups = (count + 63) / 64;
-    CandidateArgs.Store(0, groups);
-    CandidateArgs.Store(4, 1);
-    CandidateArgs.Store(8, 1);
+    CandidateArgs.Store<DispatchArgs>(0, DispatchArgs(groups, 1, 1));
 }
 
 bool PassesLODFilter(GPUCluster cluster, GpuTransform t)
@@ -142,7 +141,7 @@ bool PassesLODFilter(GPUCluster cluster, GpuTransform t)
     return visible;
 }
 
-bool BuildScreenBoundsAndNearDepth(
+void BuildScreenBoundsAndNearDepth(
     float3 worldCenter,
     float worldRadius,
     bool usePrev,
@@ -155,9 +154,6 @@ bool BuildScreenBoundsAndNearDepth(
     maxUv = 1.0.xx;
     nearDepth = 0.0;
     mipLevel = 0;
-
-    if (Uniforms.HiZMipCount == 0)
-        return false;
 
     // Select matrices based on phase
     float4x4 viewMat = usePrev ? Uniforms.PrevView : Uniforms.View;
@@ -232,7 +228,9 @@ bool BuildScreenBoundsAndNearDepth(
         }
     }
 
-    float2 onePixel = max(Uniforms.HiZInvSize, 1e-6.xx);
+    float2 onePixel = float2(1.0 / Uniforms.ScreenWidth, 1.0 / Uniforms.ScreenHeight);
+    if (Uniforms.HiZMipCount > 0)
+        onePixel = max(Uniforms.HiZInvSize, 1e-6.xx);
     maxUv = min(1.0.xx, max(maxUv, minUv + onePixel));
 
     float pixelDiameterX = (maxUv.x - minUv.x) / onePixel.x;
@@ -240,7 +238,7 @@ bool BuildScreenBoundsAndNearDepth(
     float pixelDiameter = max(1.0, max(pixelDiameterX, pixelDiameterY));
 
     float mipF = max(0.0, ceil(log2(pixelDiameter)));
-    uint maxMip = Uniforms.HiZMipCount - 1;
+    uint maxMip = Uniforms.HiZMipCount > 0 ? Uniforms.HiZMipCount - 1 : 0;
     mipLevel = (uint)clamp((int)mipF, 0, (int)maxMip);
 
     // Compute nearDepth by projecting the sphere point closest along the
@@ -253,8 +251,6 @@ bool BuildScreenBoundsAndNearDepth(
     nearDepth = (clipNear.w > 1e-5)
                     ? saturate(clipNear.z / clipNear.w)
                     : 0.0;
-
-    return true;
 }
 
 float SampleHiZMax(float2 minUv, float2 maxUv, uint mipLevel)
@@ -288,28 +284,14 @@ float SampleHiZMax(float2 minUv, float2 maxUv, uint mipLevel)
     return max(max(d0, d1), max(d2, d3));
 }
 
-bool IsOccludedByHiZ(GPUCluster cluster, GpuTransform t, bool usePrev)
+bool IsOccludedByHiZ(float3 worldCenter, float worldRadius, bool usePrev, out float2 minUv, out float2 maxUv)
 {
-    // Decode Center/Radius from packed quantized values
-    float3 worldCenter = ApplyTransform(
-        DecodeClusterCenter(cluster, Uniforms.QuantOrigin, Uniforms.QuantStep), t);
-    float maxScale = t.Scale * max(max(t.Stretch.x, t.Stretch.y), t.Stretch.z);
-    float worldRadius = DecodeClusterRadius(cluster, Uniforms.QuantStep) * maxScale;
-
-
-    float2 minUv;
-    float2 maxUv;
     float nearDepth;
     uint mipLevel;
-    bool valid = BuildScreenBoundsAndNearDepth(
-        worldCenter,
-        worldRadius,
-        usePrev,
-        minUv,
-        maxUv,
-        nearDepth,
-        mipLevel);
-    if (!valid)
+    BuildScreenBoundsAndNearDepth(
+        worldCenter, worldRadius, usePrev, minUv, maxUv, nearDepth, mipLevel);
+
+    if (Uniforms.HiZMipCount == 0)
         return false;
 
     float hizDepth = SampleHiZMax(minUv, maxUv, mipLevel);
@@ -342,20 +324,46 @@ bool IsOccludedByHiZ(GPUCluster cluster, GpuTransform t, bool usePrev)
     return result;
 }
 
-void AppendVisible(uint pageOffset, uint clusterID, uint instanceID)
+// SW/HW threshold: clusters with screen area smaller than this (in pixels^2) are SW rasterized.
+// roughly 45x45 pixels
+static const float SW_AREA_THRESHOLD = 2000.0; 
+static const uint ENABLE_SW_HW_SPLIT = 1;
+
+bool ShouldUseSWRaster(float2 minUv, float2 maxUv)
+{
+    if (ENABLE_SW_HW_SPLIT == 0)
+        return true;
+
+    float width = (maxUv.x - minUv.x) * Uniforms.ScreenWidth;
+    float height = (maxUv.y - minUv.y) * Uniforms.ScreenHeight;
+    float area = width * height;
+    return area < SW_AREA_THRESHOLD;
+}
+
+void AppendVisible(uint pageOffset, uint clusterID, uint instanceID, bool isSW)
 {
     uint outIdx;
-    DrawArgs.InterlockedAdd(4, 1, outIdx);
-    if (outIdx < Uniforms.MaxCandidates)
+    if (isSW)
     {
-        VisibleClusters[outIdx] = uint4(pageOffset, clusterID, instanceID, 0);
+        // SW clusters: write from front (CullDrawArgs.SWCount at byte 4)
+        DrawArgs.InterlockedAdd(4, 1, outIdx);
+        if (outIdx < Uniforms.MaxCandidates)
+            VisibleClusters[outIdx] = uint4(pageOffset, clusterID, instanceID, 0);
+    }
+    else
+    {
+        // HW clusters: write from back (CullDrawArgs.HWCount at byte 8)
+        DrawArgs.InterlockedAdd(8, 1, outIdx);
+        uint hwIdx = Uniforms.MaxCandidates - 1 - outIdx;
+        if (outIdx < Uniforms.MaxCandidates)
+            VisibleClusters[hwIdx] = uint4(pageOffset, clusterID, instanceID, 0);
     }
 }
 
 void AppendPhase2Candidate(uint pageOffset, uint clusterID, uint instanceID)
 {
     uint outIdx;
-    Phase2CandidateCount.InterlockedAdd(0, 1, outIdx);
+    InterlockedAdd(Phase2CandidateCount[0], 1, outIdx);
     if (outIdx < Uniforms.MaxCandidates)
     {
         Phase2CandidateClusters[outIdx] = uint3(pageOffset, clusterID, instanceID);
@@ -376,7 +384,7 @@ bool LoadAndFilterCandidate(
     cluster = (GPUCluster)0;
     t = (GpuTransform)0;
 
-    uint count = CandidateCount.Load(0);
+    uint count = CandidateCount[0];
     if (threadId >= count)
         return false;
 
@@ -401,8 +409,18 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
     GpuTransform t;
     if (!LoadAndFilterCandidate(dispatchThreadID.x, pageOffset, clusterID, instanceID, cluster, t))
         return;
+    // Decode spatial bounds directly
+    float3 worldCenter = ApplyTransform(DecodeClusterCenter(cluster, Uniforms.QuantOrigin, Uniforms.QuantStep), t);
+    float maxScale = t.Scale * max(max(t.Stretch.x, t.Stretch.y), t.Stretch.z);
+    float worldRadius = DecodeClusterRadius(cluster, Uniforms.QuantStep) * maxScale;
 
-    AppendVisible(pageOffset, clusterID, instanceID);
+    float2 minUv, maxUv;
+    float nearDepth;
+    uint mipLevel;
+    BuildScreenBoundsAndNearDepth(worldCenter, worldRadius, false, minUv, maxUv, nearDepth, mipLevel);
+
+    bool isSW = ShouldUseSWRaster(minUv, maxUv);
+    AppendVisible(pageOffset, clusterID, instanceID, isSW);
 }
 
 [numthreads(64, 1, 1)]
@@ -422,11 +440,47 @@ void main_phase1(uint3 dispatchThreadID: SV_DispatchThreadID)
         return;
     }
 
-    bool occluded = IsOccludedByHiZ(cluster, t, true);
+    float3 worldCenter = ApplyTransform(DecodeClusterCenter(cluster, Uniforms.QuantOrigin, Uniforms.QuantStep), t);
+    float maxScale = t.Scale * max(max(t.Stretch.x, t.Stretch.y), t.Stretch.z);
+    float worldRadius = DecodeClusterRadius(cluster, Uniforms.QuantStep) * maxScale;
+
+    float2 minUv, maxUv;
+    bool occluded = IsOccludedByHiZ(worldCenter, worldRadius, true, minUv, maxUv);
     if (occluded)
+    {
         AppendPhase2Candidate(pageOffset, clusterID, instanceID);
+    }
     else
-        AppendVisible(pageOffset, clusterID, instanceID);
+    {
+        bool isSW = ShouldUseSWRaster(minUv, maxUv);
+        AppendVisible(pageOffset, clusterID, instanceID, isSW);
+    }
+}
+
+// Phase 2: use Phase2DrawArgs for own counts, read Phase1's counts for global offset
+void AppendVisiblePhase2(uint pageOffset, uint clusterID, uint instanceID, bool isSW)
+{
+    uint localIdx;
+    CullDrawArgs phase1 = DrawArgs.Load<CullDrawArgs>(0);
+    uint phase1SWCount = phase1.SWCount;
+    uint phase1HWCount = phase1.HWCount;
+
+    if (isSW)
+    {
+        // Phase2 SW: write after Phase1 SW (CullDrawArgs.SWCount at byte 4)
+        Phase2DrawArgs.InterlockedAdd(4, 1, localIdx);
+        uint globalIdx = phase1SWCount + localIdx;
+        if (globalIdx < Uniforms.MaxCandidates)
+            VisibleClusters[globalIdx] = uint4(pageOffset, clusterID, instanceID, 0);
+    }
+    else
+    {
+        // Phase2 HW: write before Phase1 HW (CullDrawArgs.HWCount at byte 8)
+        Phase2DrawArgs.InterlockedAdd(8, 1, localIdx);
+        uint hwIdx = Uniforms.MaxCandidates - 1 - phase1HWCount - localIdx;
+        if (localIdx < Uniforms.MaxCandidates)
+            VisibleClusters[hwIdx] = uint4(pageOffset, clusterID, instanceID, 0);
+    }
 }
 
 [numthreads(64, 1, 1)]
@@ -440,21 +494,15 @@ void main_phase2(uint3 dispatchThreadID: SV_DispatchThreadID)
     if (!LoadAndFilterCandidate(dispatchThreadID.x, pageOffset, clusterID, instanceID, cluster, t))
         return;
 
-    bool occluded = IsOccludedByHiZ(cluster, t, false);
-    if (!occluded)
-        AppendVisiblePhase2(pageOffset, clusterID, instanceID);
-}
+    float3 worldCenter = ApplyTransform(DecodeClusterCenter(cluster, Uniforms.QuantOrigin, Uniforms.QuantStep), t);
+    float maxScale = t.Scale * max(max(t.Stretch.x, t.Stretch.y), t.Stretch.z);
+    float worldRadius = DecodeClusterRadius(cluster, Uniforms.QuantStep) * maxScale;
 
-// Phase 2: use Phase2DrawArgs for own InstanceCount, read Phase1's DrawArgs[4] for global offset
-void AppendVisiblePhase2(uint pageOffset, uint clusterID, uint instanceID)
-{
-    uint localIdx;
-    Phase2DrawArgs.InterlockedAdd(4, 1, localIdx);
-    uint phase1Count = DrawArgs.Load(4);  // Phase 1's finalized InstanceCount
-    uint globalIdx = phase1Count + localIdx;
-    if (globalIdx < Uniforms.MaxCandidates)
+    float2 minUv, maxUv;
+    bool occluded = IsOccludedByHiZ(worldCenter, worldRadius, false, minUv, maxUv);
+    if (!occluded)
     {
-        VisibleClusters[globalIdx] = uint4(pageOffset, clusterID, instanceID, 0);
+        bool isSW = ShouldUseSWRaster(minUv, maxUv);
+        AppendVisiblePhase2(pageOffset, clusterID, instanceID, isSW);
     }
 }
-

@@ -15,6 +15,20 @@ namespace SomeEngine.Render.Materials;
 /// 因为 capacity 保证偶数，GPU 按 uint 对齐读取。
 /// </para>
 /// </summary>
+public struct DirtyRange
+{
+    public int MinSlot;
+    public int MaxSlot;
+    public bool IsDirty => MinSlot <= MaxSlot;
+
+    public void Reset() { MinSlot = int.MaxValue; MaxSlot = -1; }
+    public void Add(int slotIdx)
+    {
+        if (slotIdx < MinSlot) MinSlot = slotIdx;
+        if (slotIdx > MaxSlot) MaxSlot = slotIdx;
+    }
+}
+
 public sealed class MaterialSlotBuffer : IDisposable
 {
     private ushort[] _data;
@@ -22,6 +36,9 @@ public sealed class MaterialSlotBuffer : IDisposable
     private int _capacity;    // 当前容量（保证偶数）
     private readonly int _stride;
     private readonly List<(int Offset, int Count)> _freeList = new();
+    
+    private readonly DirtyRange[] _dirtyRanges;
+    private bool _fullUploadRequired = true;
 
     public MaterialSlotBuffer(int stride, int initialCapacity = 256)
     {
@@ -30,6 +47,9 @@ public sealed class MaterialSlotBuffer : IDisposable
         // 保证容量为偶数（GPU uint 对齐）
         _capacity = (initialCapacity + 1) & ~1;
         _data = new ushort[_capacity * stride];
+
+        _dirtyRanges = new DirtyRange[stride];
+        for (int i = 0; i < stride; i++) _dirtyRanges[i].Reset();
     }
 
     /// <summary>Stride（字段数）。</summary>
@@ -40,6 +60,26 @@ public sealed class MaterialSlotBuffer : IDisposable
 
     /// <summary>当前容量（偶数，用于 GPU uniform）。</summary>
     public int Capacity => _capacity;
+
+    public bool RequiresFullUpload 
+    {
+        get => _fullUploadRequired;
+        set => _fullUploadRequired = value;
+    }
+
+    public void ClearDirty()
+    {
+        _fullUploadRequired = false;
+        for (int i = 0; i < _stride; i++) _dirtyRanges[i].Reset();
+    }
+
+    public bool TryGetDirtyRange(int fieldIndex, out int minSlot, out int maxSlot)
+    {
+        var r = _dirtyRanges[fieldIndex];
+        minSlot = r.MinSlot;
+        maxSlot = r.MaxSlot;
+        return r.IsDirty;
+    }
 
     /// <summary>分配连续 slot 区间，返回起始 slot offset。</summary>
     public int AllocateRange(int slotCount)
@@ -71,6 +111,8 @@ public sealed class MaterialSlotBuffer : IDisposable
         for (int f = 0; f < _stride; f++)
         {
             Array.Clear(_data, f * _capacity + offset, count);
+            _dirtyRanges[f].Add(offset);
+            _dirtyRanges[f].Add(offset + count - 1);
         }
         _freeList.Add((offset, count));
     }
@@ -79,6 +121,7 @@ public sealed class MaterialSlotBuffer : IDisposable
     public void SetField(int slotOffset, int localIdx, int fieldIndex, ushort value)
     {
         _data[fieldIndex * _capacity + slotOffset + localIdx] = value;
+        _dirtyRanges[fieldIndex].Add(slotOffset + localIdx);
     }
 
     /// <summary>读取单个 slot 的单个字段（SOA 寻址）。</summary>
@@ -117,6 +160,7 @@ public sealed class MaterialSlotBuffer : IDisposable
 
         _data = newData;
         _capacity = newCapacity;
+        _fullUploadRequired = true;
     }
 
     public void Dispose()

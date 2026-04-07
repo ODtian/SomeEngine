@@ -51,12 +51,7 @@ public static class ClusterCull
             ElementByteStride = 16,
         });
 
-        var hIndirectDrawArgs = graph.CreateBuffer("IndirectDrawArgs", new BufferDesc
-        {
-            Size = 256,
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
-            Mode = BufferMode.Raw,
-        });
+        var hIndirectDrawArgs = traverse.IndirectDrawArgs;
 
         // ─── HiZ mode management ───
         bool useHiZBuffers = config.HiZMode != HiZDebugMode.Legacy && config.HiZMode != HiZDebugMode.Phase1OnlyPassAll;
@@ -79,7 +74,7 @@ public static class ClusterCull
             {
                 Size = 4,
                 BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-                Mode = BufferMode.Raw,
+                Mode = BufferMode.Structured,
                 ElementByteStride = 4,
             });
             hPhase2CandidateArgs = graph.CreateBuffer("Phase2CandidateArgs", new BufferDesc
@@ -126,7 +121,7 @@ public static class ClusterCull
                     {
                         var ctx2 = rgCtx.RenderContext.ImmediateContext;
                         ReadOnlySpan<uint> zero = stackalloc uint[] { 0 };
-                        ctx2?.UpdateBuffer(buf, 0, zero, ResourceStateTransitionMode.Verify);
+                        ctx2?.UpdateBuffer(buf, 0, zero, ResourceStateTransitionMode.None);
                     }
                 }
             );

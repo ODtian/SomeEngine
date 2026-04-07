@@ -1,4 +1,4 @@
-#include "common.slang"
+#include "vertex_evaluate.slang"
 
 struct DrawUniforms
 {
@@ -14,35 +14,15 @@ struct DrawUniforms
 
 ConstantBuffer<DrawUniforms> Uniforms;
 
-// Hash Function for Cluster Visualization
-uint PCGHash(uint input)
-{
-    uint state = input * 747796405u + 2891336453u;
-    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    uint h = (word >> 22u) ^ word;
-    return h;
-}
-
-float3 ColorFromHash(uint hash)
-{
-    float r = float(hash & 255u) / 255.0;
-    float g = float((hash >> 8) & 255u) / 255.0;
-    float b = float((hash >> 16) & 255u) / 255.0;
-    return float3(r, g, b);
-}
-
-// Huge bindless heap
 ByteAddressBuffer PageHeap;
-
-// Debug/Impostor Instances if needed
-StructuredBuffer<GpuTransform> Instances;
+// Instances declared in cluster_common.slang (via vertex_evaluate.slang)
 
 // Points to original VisibleClusters index
-StructuredBuffer<uint> BinnedClusterIndexBuffer;
+StructuredBuffer<uint2> BinnedClusterIndexBuffer; // .x = visibleClusterIndex, .y = rangeStart<<16 | rangeEnd
 StructuredBuffer<uint4> VisibleClusters;  // {PageOffset, ClusterID, InstanceID, Pad}
 
-// Phase1 binds a zeroed buffer; Phase2 binds Phase2DrawArgs (offset at byte 16)
-ByteAddressBuffer VisibleClusterMeta;
+// Phase1 binds a zeroed buffer; Phase2 binds Phase2DrawArgs
+ByteAddressBuffer VisibleClusterMeta;        // IndirectArgs: must stay raw, layout = CullDrawArgs
 
 struct PSInput
 {
@@ -87,9 +67,11 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
     PSInput output;
 
     // 1. Decode Page and Cluster from Binned Index
-    uint clusterOffset = VisibleClusterMeta.Load(4);  // InstanceCount field of Phase1's DrawArgs
+    uint clusterOffset = VisibleClusterMeta.Load<CullDrawArgs>(0).SWCount;
     uint binnedIndex = clusterOffset + instanceID;
-    uint originalIndex = BinnedClusterIndexBuffer[binnedIndex];
+    uint2 binEntry = BinnedClusterIndexBuffer[binnedIndex];
+    uint originalIndex = binEntry.x;
+    uint packedRange = binEntry.y;
 
     uint4 req = VisibleClusters[originalIndex];
     uint pageOffset = req.x;
@@ -111,13 +93,17 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
     uint packedCounts;
     LoadClusterInfo(pageOffset, clusterID, intBase, vStart, tStart, packedCounts);
 
-    // 5. Get triangle count from packed cluster counts.
+    // 5. Get triangle count and decode VRB batch range
     // [VertexCount:8][TriangleCount:8][LODLevel:8][Pad:8]
     uint triCount = (packedCounts >> 8) & 0xFF;
+    uint rangeStart = (packedRange >> 16) & 0xFFFF;
+    uint rangeEnd = packedRange & 0xFFFF;
+    if (rangeEnd == 0) rangeEnd = triCount; // legacy fallback
+    uint batchTriCount = rangeEnd - rangeStart;
 
     output.ClusterID = clusterID; // Pass to PS for debug
 
-    if (vertexID >= triCount * 3)
+    if (vertexID >= batchTriCount * 3)
     {
         output.Pos = asfloat(uint4(0x7FC00000, 0x7FC00000, 0x7FC00000, 0x7FC00000)); // NaN -> Discard
         output.Normal = float3(0, 0, 0);
@@ -128,8 +114,8 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
 
     uint lodLevel = (packedCounts >> 16) & 0xFF;
 
-    // 6. Fetch Triangle Index
-    uint triIdx = vertexID / 3;
+    // 6. Fetch Triangle Index (offset by rangeStart)
+    uint triIdx = rangeStart + vertexID / 3;
     uint corner = vertexID % 3;
 
     // 6. Fetch Vertex Index (u8)
@@ -254,9 +240,11 @@ PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_Ins
 {
     PSVisBufferInput output;
 
-    uint clusterOffset = VisibleClusterMeta.Load(4);  // InstanceCount field of Phase1's DrawArgs
+    uint clusterOffset = VisibleClusterMeta.Load<CullDrawArgs>(0).SWCount;
     uint binnedIndex = clusterOffset + instanceID;
-    uint originalIndex = BinnedClusterIndexBuffer[binnedIndex];
+    uint2 binEntry = BinnedClusterIndexBuffer[binnedIndex];
+    uint originalIndex = binEntry.x;
+    uint packedRange = binEntry.y;
 
     uint4 req = VisibleClusters[originalIndex];
     uint pageOffset = req.x;
@@ -266,6 +254,7 @@ PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_Ins
     // Load header
     uint4 header1 = PageHeap.Load4(pageOffset + 16);
     uint posOffset = header1.y;
+    uint attrOffset = header1.z;
     uint idxOffset = header1.w;
 
     // Load cluster info
@@ -275,19 +264,24 @@ PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_Ins
     uint packedCounts;
     LoadClusterInfo(pageOffset, clusterID, intBase, vStart, tStart, packedCounts);
 
+    uint vertexCount = packedCounts & 0xFF;
     uint triCount = (packedCounts >> 8) & 0xFF;
+    uint rangeStart = (packedRange >> 16) & 0xFFFF;
+    uint rangeEnd = packedRange & 0xFFFF;
+    if (rangeEnd == 0) rangeEnd = triCount; // legacy fallback
+    uint batchTriCount = rangeEnd - rangeStart;
 
     output.VisibleClusterIndex = originalIndex;
-    output.TriangleID = vertexID / 3;
+    output.TriangleID = rangeStart + vertexID / 3;
 
-    if (vertexID >= triCount * 3)
+    if (vertexID >= batchTriCount * 3)
     {
         output.Pos = asfloat(uint4(0x7FC00000, 0x7FC00000, 0x7FC00000, 0x7FC00000));
         return output;
     }
 
-    // Fetch triangle index
-    uint triIdx = vertexID / 3;
+    // Fetch triangle index (offset by rangeStart)
+    uint triIdx = rangeStart + vertexID / 3;
     uint corner = vertexID % 3;
 
     uint indexByteAddr = pageOffset + idxOffset + tStart + triIdx * 3 + corner;
@@ -296,37 +290,103 @@ PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_Ins
     uint packedIndex = PageHeap.Load(alignedAddr);
     uint localVIdx = (packedIndex >> shift) & 0xFF;
 
-    // Fetch position (u16[3])
-    uint posByteAddr = pageOffset + posOffset + (vStart + localVIdx) * 6;
-    uint alignedPosAddr = posByteAddr & ~3;
-    uint offsetInWord = posByteAddr & 3;
+    // Use IVertexSource to fetch and deform position
+    VertexFetchArgs vfArgs;
+    vfArgs.pageHeap        = PageHeap;
+    vfArgs.pageOffset      = pageOffset;
+    vfArgs.posOffset       = posOffset;
+    vfArgs.attrOffset      = attrOffset;
+    vfArgs.totalVertexCount = vertexCount;
+    vfArgs.vStart          = vStart;
+    vfArgs.intBase         = intBase;
+    vfArgs.localVertIdx    = localVIdx;
+    vfArgs.instanceID      = realInstanceID;
+    vfArgs.transform       = Instances[realInstanceID];
+    vfArgs.quantOrigin     = Uniforms.QuantOrigin;
+    vfArgs.quantStep       = Uniforms.QuantStep;
+    vfArgs.viewProj        = Uniforms.ViewProj;
 
-    uint2 rawPosWords = PageHeap.Load2(alignedPosAddr);
+    vfArgs.visibleClusterIndex = originalIndex;
 
-    uint p0, p1, p2;
-    if (offsetInWord == 0)
+    InlineSource<WaveVertexEval> source;
+    output.Pos = source.fetchClipPosition(vfArgs);
+
+    return output;
+}
+
+// ── DeformCache resources (for cached entry points) ──
+ByteAddressBuffer DeformCache;
+StructuredBuffer<uint> CacheOffsets;
+
+[shader("vertex")]
+PSVisBufferInput VSVisBufferCached(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
+{
+    PSVisBufferInput output;
+
+    uint clusterOffset = VisibleClusterMeta.Load<CullDrawArgs>(0).SWCount;
+    uint binnedIndex = clusterOffset + instanceID;
+    uint2 binEntry = BinnedClusterIndexBuffer[binnedIndex];
+    uint originalIndex = binEntry.x;
+    uint packedRange = binEntry.y;
+
+    uint4 req = VisibleClusters[originalIndex];
+    uint pageOffset = req.x;
+    uint clusterID = req.y;
+    uint realInstanceID = req.z;
+
+    uint4 header1 = PageHeap.Load4(pageOffset + 16);
+    uint posOffset = header1.y;
+    uint attrOffset = header1.z;
+    uint idxOffset = header1.w;
+
+    int3 intBase;
+    uint vStart, tStart, packedCounts;
+    LoadClusterInfo(pageOffset, clusterID, intBase, vStart, tStart, packedCounts);
+
+    uint vertexCount = packedCounts & 0xFF;
+    uint triCount = (packedCounts >> 8) & 0xFF;
+    uint rangeStart = (packedRange >> 16) & 0xFFFF;
+    uint rangeEnd = packedRange & 0xFFFF;
+    if (rangeEnd == 0) rangeEnd = triCount;
+    uint batchTriCount = rangeEnd - rangeStart;
+
+    output.VisibleClusterIndex = originalIndex;
+    output.TriangleID = rangeStart + vertexID / 3;
+
+    if (vertexID >= batchTriCount * 3)
     {
-        p0 = rawPosWords.x & 0xFFFF;
-        p1 = (rawPosWords.x >> 16) & 0xFFFF;
-        p2 = rawPosWords.y & 0xFFFF;
-    }
-    else if (offsetInWord == 2)
-    {
-        p0 = (rawPosWords.x >> 16) & 0xFFFF;
-        p1 = rawPosWords.y & 0xFFFF;
-        p2 = (rawPosWords.y >> 16) & 0xFFFF;
-    }
-    else
-    {
-        p0 = 0; p1 = 0; p2 = 0;
+        output.Pos = asfloat(uint4(0x7FC00000, 0x7FC00000, 0x7FC00000, 0x7FC00000));
+        return output;
     }
 
-    int3 globalIntPos = int3(int(p0), int(p1), int(p2)) + intBase;
-    float3 position = float3(globalIntPos) * Uniforms.QuantStep + Uniforms.QuantOrigin;
+    uint triIdx = rangeStart + vertexID / 3;
+    uint corner = vertexID % 3;
+    uint indexByteAddr = pageOffset + idxOffset + tStart + triIdx * 3 + corner;
+    uint alignedAddr = indexByteAddr & ~3;
+    uint shift = (indexByteAddr & 3) * 8;
+    uint packedIndex = PageHeap.Load(alignedAddr);
+    uint localVIdx = (packedIndex >> shift) & 0xFF;
 
-    GpuTransform t = Instances[realInstanceID];
-    float3 worldPos = ApplyTransform(position, t);
-    output.Pos = mul(float4(worldPos, 1.0), Uniforms.ViewProj);
+    VertexFetchArgs vfArgs;
+    vfArgs.pageHeap        = PageHeap;
+    vfArgs.pageOffset      = pageOffset;
+    vfArgs.posOffset       = posOffset;
+    vfArgs.attrOffset      = attrOffset;
+    vfArgs.totalVertexCount = vertexCount;
+    vfArgs.vStart          = vStart;
+    vfArgs.intBase         = intBase;
+    vfArgs.localVertIdx    = localVIdx;
+    vfArgs.instanceID      = realInstanceID;
+    vfArgs.transform       = Instances[realInstanceID];
+    vfArgs.quantOrigin     = Uniforms.QuantOrigin;
+    vfArgs.quantStep       = Uniforms.QuantStep;
+    vfArgs.viewProj        = Uniforms.ViewProj;
+    vfArgs.visibleClusterIndex = originalIndex;
+
+    CachedSource<WaveVertexEval> source;
+    source.deformCache = DeformCache;
+    source.cacheOffsets = CacheOffsets;
+    output.Pos = source.fetchClipPosition(vfArgs);
 
     return output;
 }

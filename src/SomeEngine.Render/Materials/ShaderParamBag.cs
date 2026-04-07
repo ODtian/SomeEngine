@@ -73,6 +73,127 @@ public sealed class ShaderParamBag : IDisposable
     public bool Contains(string name) => _entries.ContainsKey(name);
 
     /// <summary>
+    /// Enumerate resource binding entries (name + kind). Used by signature builders
+    /// to discover material resources for PipelineResourceSignature creation.
+    /// </summary>
+    public IEnumerable<(string Name, ShaderResourceType Type)> EnumerateResources()
+    {
+        if (_entries.Count == 0)
+            yield break;
+
+        var sortedKeys = new string[_entries.Count];
+        int idx = 0;
+        foreach (var key in _entries.Keys)
+            sortedKeys[idx++] = key;
+        Array.Sort(sortedKeys, StringComparer.Ordinal);
+
+        foreach (var name in sortedKeys)
+        {
+            var entry = _entries[name];
+            var type = entry.Kind switch
+            {
+                EntryKind.TextureView => ShaderResourceType.TextureSrv,
+                EntryKind.BufferView => ShaderResourceType.BufferSrv,
+                EntryKind.Buffer => ShaderResourceType.ConstantBuffer,
+                EntryKind.Sampler => ShaderResourceType.Sampler,
+                _ => (ShaderResourceType?)null,
+            };
+            if (type.HasValue)
+                yield return (name, type.Value);
+        }
+    }
+
+    /// <summary>
+    /// 计算只反映资源布局（名字 + 类型）的 hash。
+    /// 与具体绑定值、标量值、插入顺序无关。
+    /// 适用于 PipelineResourceSignature / SRB cache key。
+    /// </summary>
+    public ulong GetResourceLayoutHash()
+    {
+        ulong hash = 14695981039346656037UL; // FNV-1a offset basis
+        foreach (var (name, type) in EnumerateResources())
+        {
+            foreach (char c in name)
+            {
+                hash ^= c;
+                hash *= 1099511628211UL;
+            }
+
+            hash ^= (ulong)type;
+            hash *= 1099511628211UL;
+        }
+
+        return hash;
+    }
+
+    /// <summary>
+    /// 只对指定资源名集合和全部标量参数计算签名。
+    /// 适用于基于 Shader metadata 的按-pass 绑定签名。
+    /// </summary>
+    public ulong GetFilteredSignatureHash(IEnumerable<string> resourceNames, bool includeScalars = true)
+    {
+        var names = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in resourceNames)
+        {
+            if (seen.Add(name))
+                names.Add(name);
+        }
+        names.Sort(StringComparer.Ordinal);
+
+        ulong hash = 14695981039346656037UL; // FNV-1a offset basis
+
+        foreach (var name in names)
+        {
+            HashName(ref hash, name);
+
+            if (_entries.TryGetValue(name, out var entry))
+            {
+                hash ^= (ulong)entry.Kind;
+                hash *= 1099511628211UL;
+                if (entry.Value != null)
+                {
+                    hash ^= (ulong)entry.Value.GetHashCode();
+                    hash *= 1099511628211UL;
+                }
+            }
+            else
+            {
+                // Preserve the declared binding slot in the hash even if this material
+                // currently leaves it unset.
+                hash ^= 255UL;
+                hash *= 1099511628211UL;
+            }
+        }
+
+        if (includeScalars)
+        {
+            var scalarKeys = new List<string>();
+            foreach (var (name, entry) in _entries)
+            {
+                if (entry.Kind == EntryKind.Scalar)
+                    scalarKeys.Add(name);
+            }
+
+            scalarKeys.Sort(StringComparer.Ordinal);
+            foreach (var name in scalarKeys)
+            {
+                var entry = _entries[name];
+                HashName(ref hash, name);
+                hash ^= (ulong)entry.Kind;
+                hash *= 1099511628211UL;
+                if (entry.Value != null)
+                {
+                    hash ^= (ulong)entry.Value.GetHashCode();
+                    hash *= 1099511628211UL;
+                }
+            }
+        }
+
+        return hash;
+    }
+
+    /// <summary>
     /// 将所有参数绑定到 SRB（Compute stage）。
     /// </summary>
     public void ApplyTo(IShaderResourceBinding srb, ShaderType stage = ShaderType.Compute)
@@ -82,6 +203,7 @@ public sealed class ShaderParamBag : IDisposable
             if (entry.Value == null) continue;
 
             var variable = srb.GetVariableByName(stage, name);
+                        
             if (variable == null) continue;
 
             switch (entry.Kind)
@@ -103,14 +225,26 @@ public sealed class ShaderParamBag : IDisposable
     }
 
     /// <summary>
-    /// 计算绑定签名 hash。相同资源绑定的 MaterialPass 会产生相同 hash，
-    /// 用于 BinQueue 去重。
+    /// 计算绑定签名 hash。相同资源绑定会产生相同 hash，用于 BinQueue 去重。
     /// </summary>
     public ulong GetSignatureHash()
     {
+        // Sort keys to ensure deterministic hash regardless of Dictionary enumeration order.
+        int count = _entries.Count;
+        if (count == 0) return 14695981039346656037UL;
+
+        var sortedKeys = new string[count];
+        int idx = 0;
+        foreach (var key in _entries.Keys)
+            sortedKeys[idx++] = key;
+        Array.Sort(sortedKeys, StringComparer.Ordinal);
+
         ulong hash = 14695981039346656037UL; // FNV-1a offset basis
-        foreach (var (name, entry) in _entries)
+        for (int i = 0; i < count; i++)
         {
+            string name = sortedKeys[i];
+            var entry = _entries[name];
+
             foreach (char c in name)
             {
                 hash ^= c;
@@ -141,6 +275,15 @@ public sealed class ShaderParamBag : IDisposable
     public void Dispose()
     {
         _entries.Clear();
+    }
+
+    private static void HashName(ref ulong hash, string name)
+    {
+        foreach (char c in name)
+        {
+            hash ^= c;
+            hash *= 1099511628211UL;
+        }
     }
 
     // ── Internal ──

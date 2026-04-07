@@ -84,6 +84,8 @@ internal static class HiZBuildPSOs
 /// </summary>
 internal sealed class HiZMip0Pass(RenderContext context, RenderGraphHandle hDepth, RenderGraphHandle hHiZ) : IRenderGraphPass
 {
+    private static int _debugFrameCount;
+
     public string Name => "HiZ Mip0";
 
     public void Setup(RenderGraphBuilder builder)
@@ -95,12 +97,13 @@ internal sealed class HiZMip0Pass(RenderContext context, RenderGraphHandle hDept
     public void Execute(RenderGraphContext rgCtx)
     {
         HiZBuildPSOs.EnsureInitialized(context);
-        if (HiZBuildPSOs.BuildMip0PSO == null) return;
+        if (HiZBuildPSOs.BuildMip0PSO == null) { Console.WriteLine("[HiZ Mip0] PSO is null!"); return; }
 
         var hiZTexture = rgCtx.GetTexture(hHiZ);
-        if (hiZTexture == null) return;
+        if (hiZTexture == null) { Console.WriteLine("[HiZ Mip0] HiZ texture is null!"); return; }
         var hiZDesc = hiZTexture.GetDesc();
 
+        var depthTex = rgCtx.GetTexture(hDepth);
         var depthSRV = rgCtx.GetTextureView(hDepth, TextureViewType.ShaderResource);
         var hiZUAV0 = rgCtx.GetOrCreateView(hHiZ, new TextureViewDesc
         {
@@ -113,6 +116,17 @@ internal sealed class HiZMip0Pass(RenderContext context, RenderGraphHandle hDept
             FirstSlice = 0,
             NumSlices = hiZDesc.ArraySizeOrDepth,
         });
+
+        if (_debugFrameCount++ % 120 == 0)
+        {
+            var depthDesc = depthTex?.GetDesc();
+            Console.WriteLine($"[HiZ Mip0] depthTex={depthTex != null} fmt={depthDesc?.Format} " +
+                $"size={depthDesc?.Width}x{depthDesc?.Height} " +
+                $"depthSRV={depthSRV != null} hiZUAV0={hiZUAV0 != null} " +
+                $"hiZ={hiZDesc.Width}x{hiZDesc.Height} mips={hiZDesc.MipLevels} " +
+                $"dispatch={HiZBuildPSOs.DispatchCount(hiZDesc.Width)}x{HiZBuildPSOs.DispatchCount(hiZDesc.Height)}");
+        }
+
         if (depthSRV == null || hiZUAV0 == null) return;
 
         var ctx = rgCtx.CommandList;
@@ -124,7 +138,7 @@ internal sealed class HiZMip0Pass(RenderContext context, RenderGraphHandle hDept
             ?.Set(hiZUAV0, SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(HiZBuildPSOs.BuildMip0PSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
             ThreadGroupCountX = HiZBuildPSOs.DispatchCount(hiZDesc.Width),
@@ -194,7 +208,7 @@ internal sealed class HiZDownsamplePass(RenderContext context, RenderGraphHandle
             ?.Set(dstMipView, SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(HiZBuildPSOs.DownsamplePSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
             ThreadGroupCountX = HiZBuildPSOs.DispatchCount(mipWidth),

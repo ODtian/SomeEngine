@@ -30,12 +30,31 @@ public static class BinSpaceExtensions
             {
                 var ctx = rgCtx.RenderContext.ImmediateContext;
                 var buf = rgCtx.GetBuffer(handle);
-                var slotData = binSpace.GetData();
-                if (ctx != null && buf != null && slotData.Length > 0)
+                var slotBuffer = binSpace.SlotBuffer;
+                
+                if (ctx == null || buf == null || slotBuffer == null || slotBuffer.Capacity == 0)
+                    return;
+
+                var slotData = slotBuffer.GetData();
+
+                if (slotBuffer.RequiresFullUpload)
                 {
-                    ctx.UpdateBuffer(buf, 0, (ReadOnlySpan<ushort>)slotData,
-                        ResourceStateTransitionMode.Verify);
+                    ctx.UpdateBuffer(buf, 0, (ReadOnlySpan<ushort>)slotData, ResourceStateTransitionMode.None);
                 }
+                else
+                {
+                    for (int i = 0; i < slotBuffer.Stride; i++)
+                    {
+                        if (slotBuffer.TryGetDirtyRange(i, out int min, out int max))
+                        {
+                            int count = max - min + 1;
+                            int offsetInUshorts = i * slotBuffer.Capacity + min;
+                            var dirtySpan = slotData.Slice(offsetInUshorts, count);
+                            ctx.UpdateBuffer(buf, (ulong)(offsetInUshorts * sizeof(ushort)), (ReadOnlySpan<ushort>)dirtySpan, ResourceStateTransitionMode.None);
+                        }
+                    }
+                }
+                slotBuffer.ClearDirty();
             }
         );
         return handle;

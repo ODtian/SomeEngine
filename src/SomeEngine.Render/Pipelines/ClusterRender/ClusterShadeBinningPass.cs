@@ -162,7 +162,7 @@ public class ClusterShadeBinCountPass(
         uint h = texDesc?.Height ?? 1;
 
         ctx.SetPipelineState(resources.CountPSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
             ThreadGroupCountX = (w + 7) / 8,
@@ -226,7 +226,7 @@ public class ClusterShadeBinReservePass(
             ?.Set(binIndirectArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(resources.ReservePSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
             ThreadGroupCountX = 1,
@@ -315,7 +315,7 @@ public class ClusterShadeBinScatterPass(
         uint h = texDesc?.Height ?? 1;
 
         ctx.SetPipelineState(resources.ScatterPSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
             ThreadGroupCountX = (w + 7) / 8,

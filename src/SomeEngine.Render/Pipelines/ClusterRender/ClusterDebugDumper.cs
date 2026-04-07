@@ -196,11 +196,11 @@ internal sealed class ClusterDebugDumpPass : IRenderGraphPass
                     SrcTexture = srcTexture,
                     SrcMipLevel = mipLevel,
                     SrcSlice = 0,
-                    SrcTextureTransitionMode = ResourceStateTransitionMode.Verify,
+                    SrcTextureTransitionMode = ResourceStateTransitionMode.None,
                     DstTexture = staging,
                     DstMipLevel = 0,
                     DstSlice = 0,
-                    DstTextureTransitionMode = ResourceStateTransitionMode.Verify,
+                    DstTextureTransitionMode = ResourceStateTransitionMode.None,
                 }
             );
 
@@ -261,7 +261,7 @@ internal sealed class ClusterDebugDumpPass : IRenderGraphPass
         var stagingBuffer = device.CreateBuffer(stagingDesc, null);
         try
         {
-            ctx.CopyBuffer(srcBuffer, 0, ResourceStateTransitionMode.Verify, stagingBuffer, 0, srcDesc.Size, ResourceStateTransitionMode.Verify);
+            ctx.CopyBuffer(srcBuffer, 0, ResourceStateTransitionMode.None, stagingBuffer, 0, srcDesc.Size, ResourceStateTransitionMode.None);
             ctx.WaitForIdle();
 
             var mapped = ctx.MapBuffer(stagingBuffer, MapType.Read, MapFlags.None);

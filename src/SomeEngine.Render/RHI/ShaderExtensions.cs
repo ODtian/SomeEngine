@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using Diligent;
 using SomeEngine.Assets.Schema;
 using SomeEngine.Render.RHI;
@@ -9,6 +10,8 @@ namespace SomeEngine.Render.RHI;
 
 public static class ShaderExtensions
 {
+    // Attach cached shader instances to the ShaderAsset lifetime
+    private static readonly ConditionalWeakTable<ShaderAsset, Dictionary<string, IShader>> _shaderCache = new();
     public static ShaderReflectionData? GetReflection(this ShaderAsset asset, RenderContext context)
     {
         if (context.Device == null)
@@ -108,48 +111,59 @@ public static class ShaderExtensions
     {
         if (context.Device == null)
             throw new ArgumentNullException(nameof(context));
-        // Determine backend
-        var deviceType = context.Device.GetDeviceInfo().Type;
-        string backend = deviceType == RenderDeviceType.D3D12 ? "dxil" : "spirv";
 
-        // Find variant
-        if (asset.Variants == null)
-            throw new Exception("Asset has no variants");
-
-        var variant =
-            asset.Variants.FirstOrDefault(v =>
-                v.Backend == backend && v.EntryPoint == entryPointName
-            )
-            ?? throw new Exception(
-                $"Shader variant not found for backend {backend} and entry point {entryPointName} in asset {asset.Name}"
-            );
-        ShaderType type = MapType(variant.Stage);
-
-        var shaderCI = new ShaderCreateInfo();
-        shaderCI.Desc.ShaderType = type;
-        shaderCI.Desc.Name = $"{asset.Name}_{entryPointName}";
-        shaderCI.SourceLanguage = ShaderSourceLanguage.Bytecode;
-        shaderCI.EntryPoint = entryPointName;
-
-        // Variant Data is Memory<byte>?
-        if (!variant.Data.HasValue)
-            throw new Exception("Variant has no data");
-        byte[] data = variant.Data.Value.ToArray();
-
-        shaderCI.ByteCode = data;
-
-        IShader shader;
-        try
+        var cacheDict = _shaderCache.GetOrCreateValue(asset);
+        lock (cacheDict)
         {
-            shader = context.Device.CreateShader(shaderCI, out var compilerOutput);
-        }
-        catch (Exception ex)
-        {
-            // Log error if possible, or rethrow with more info
-            throw new Exception($"Failed to create shader {shaderCI.Desc.Name}: {ex.Message}", ex);
-        }
+            if (cacheDict.TryGetValue(entryPointName, out var cachedShader))
+            {
+                return cachedShader;
+            }
 
-        return shader;
+            // Determine backend
+            var deviceType = context.Device.GetDeviceInfo().Type;
+            string backend = deviceType == RenderDeviceType.D3D12 ? "dxil" : "spirv";
+
+            // Find variant
+            if (asset.Variants == null)
+                throw new Exception("Asset has no variants");
+
+            var variant =
+                asset.Variants.FirstOrDefault(v =>
+                    v.Backend == backend && v.EntryPoint == entryPointName
+                )
+                ?? throw new Exception(
+                    $"Shader variant not found for backend {backend} and entry point {entryPointName} in asset {asset.Name}"
+                );
+            ShaderType type = MapType(variant.Stage);
+
+            var shaderCI = new ShaderCreateInfo();
+            shaderCI.Desc.ShaderType = type;
+            shaderCI.Desc.Name = $"{asset.Name}_{entryPointName}";
+            shaderCI.SourceLanguage = ShaderSourceLanguage.Bytecode;
+            shaderCI.EntryPoint = entryPointName;
+
+            // Variant Data is Memory<byte>?
+            if (!variant.Data.HasValue)
+                throw new Exception("Variant has no data");
+            byte[] data = variant.Data.Value.ToArray();
+
+            shaderCI.ByteCode = data;
+
+            IShader shader;
+            try
+            {
+                shader = context.Device.CreateShader(shaderCI, out var compilerOutput);
+            }
+            catch (Exception ex)
+            {
+                // Log error if possible, or rethrow with more info
+                throw new Exception($"Failed to create shader {shaderCI.Desc.Name}: {ex.Message}", ex);
+            }
+
+            cacheDict[entryPointName] = shader;
+            return shader;
+        }
     }
 
     private static ShaderType MapType(SomeEngine.Assets.Schema.ShaderStage stage)

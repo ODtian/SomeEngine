@@ -23,6 +23,11 @@ public class ImGuiRenderer : IDisposable
     public ITexture? FontTexture => _fontTexture;
     private ITextureView? _fontTextureView;
     private ISampler? _sampler;
+    private ISampler? _pointSampler;
+
+    // Per-texture SRB support
+    private int _nextTextureId = 2; // 1 is reserved for font
+    private readonly Dictionary<IntPtr, IShaderResourceBinding> _textureSrbs = new();
 
     public IBuffer? VertexBuffer => _vertexBuffer;
     public IBuffer? IndexBuffer => _indexBuffer;
@@ -99,6 +104,17 @@ public class ImGuiRenderer : IDisposable
             AddressW = TextureAddressMode.Wrap,
         };
         _sampler = device.CreateSampler(samDesc);
+
+        SamplerDesc pointSamDesc = new SamplerDesc
+        {
+            MinFilter = FilterType.Point,
+            MagFilter = FilterType.Point,
+            MipFilter = FilterType.Point,
+            AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp,
+        };
+        _pointSampler = device.CreateSampler(pointSamDesc);
 
         io.Fonts.SetTexID((IntPtr)1);
 
@@ -245,6 +261,35 @@ public class ImGuiRenderer : IDisposable
             ?.Set(_sampler, SetShaderResourceFlags.None);
     }
 
+    /// <summary>
+    /// Register an external ITextureView for use with ImGui.Image().
+    /// Returns an IntPtr that can be passed as the texture ID.
+    /// </summary>
+    public IntPtr RegisterTexture(ITextureView textureView)
+    {
+        if (_pso == null || _sampler == null)
+            return IntPtr.Zero;
+
+        var srb = _pso.CreateShaderResourceBinding(true);
+        srb.GetVariableByName(ShaderType.Pixel, "g_Texture")
+            ?.Set(textureView, SetShaderResourceFlags.None);
+        srb.GetVariableByName(ShaderType.Pixel, "g_Texture_sampler")
+            ?.Set(_pointSampler, SetShaderResourceFlags.None);
+
+        var id = (IntPtr)_nextTextureId++;
+        _textureSrbs[id] = srb;
+        return id;
+    }
+
+    /// <summary>
+    /// Unregister a previously registered texture.
+    /// </summary>
+    public void UnregisterTexture(IntPtr texId)
+    {
+        if (_textureSrbs.Remove(texId, out var srb))
+            srb.Dispose();
+    }
+
     public void EnsureBuffers(int vertexCount, int indexCount)
     {
         var device = _context.Device;
@@ -378,6 +423,16 @@ public class ImGuiRenderer : IDisposable
                     var scDesc = _context.SwapChain!.GetDesc();
                     context.SetScissorRects([rect], scDesc.Width, scDesc.Height);
 
+                    // Switch SRB for per-texture binding
+                    var texId = cmd.TextureId;
+                    IShaderResourceBinding? activeSrb = null;
+                    if (texId == (IntPtr)1 || texId == IntPtr.Zero)
+                        activeSrb = _srb;
+                    else
+                        _textureSrbs.TryGetValue(texId, out activeSrb);
+                    if (activeSrb != null)
+                        context.CommitShaderResources(activeSrb, ResourceStateTransitionMode.Transition);
+
                     DrawIndexedAttribs drawAttrs = new DrawIndexedAttribs
                     {
                         IndexType = Diligent.ValueType.UInt16,
@@ -428,5 +483,9 @@ public class ImGuiRenderer : IDisposable
 
         if (ImGui.GetCurrentContext() != IntPtr.Zero)
             ImGui.DestroyContext();
+
+        foreach (var srb in _textureSrbs.Values)
+            srb.Dispose();
+        _textureSrbs.Clear();
     }
 }

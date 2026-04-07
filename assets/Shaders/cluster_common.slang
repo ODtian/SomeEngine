@@ -107,6 +107,22 @@ uint FetchVertexIndex(ByteAddressBuffer pageHeap, uint pageOffset, uint idxOffse
     return (packedIndex >> shift) & 0xFF;
 }
 
+// ── Instance Data ──
+StructuredBuffer<GpuTransform> Instances;
+StructuredBuffer<GpuInstanceHeader> InstanceHeaders;
+ByteAddressBuffer InstanceDataHeap;
+
+float4 getInstancePropertyFloat4(uint instanceID, uint relativeOffset, float4 defaultValue)
+{
+    uint baseOffset = InstanceHeaders[instanceID].MetadataOffset;
+    uint count = InstanceHeaders[instanceID].MetadataCount;
+    if (count > 0)
+    {
+        return asfloat(InstanceDataHeap.Load4(baseOffset + relativeOffset));
+    }
+    return defaultValue;
+}
+
 // ── Screen-space utilities ──
 
 /// Project world position to screen space, returning (screenX, screenY, ndcDepth).

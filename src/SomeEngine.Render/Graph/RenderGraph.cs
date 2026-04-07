@@ -78,6 +78,7 @@ public class RenderGraph : IDisposable
     private readonly Queue<(ulong Fence, IDisposable Resource)> _deferredReleases = new();
     private readonly List<(string Name, double Ms)> _lastPassTimings = [];
     private int _executeFrameCount;
+    private bool _debugPassOrderOnce = true;
 
     // Physical resource resolution (per-frame, keyed by resource index)
     private ITexture?[] _resolvedTextures = [];
@@ -438,6 +439,23 @@ public class RenderGraph : IDisposable
             if (!compiledPass.Active)
                 continue;
 
+            if (_debugPassOrderOnce)
+            {
+                Console.Write($"  [{passIndex}]{compiledPass.Pass.Name}");
+            }
+        }
+        if (_debugPassOrderOnce)
+        {
+            Console.WriteLine();
+            _debugPassOrderOnce = false;
+        }
+
+        foreach (int passIndex in _executionOrder)
+        {
+            var compiledPass = _compiledPasses[passIndex];
+            if (!compiledPass.Active)
+                continue;
+
             passSw.Restart();
 
             if (deviceContext != null && compiledPass.PreBarriers.Count > 0)
@@ -544,11 +562,7 @@ public class RenderGraph : IDisposable
                 if (transitions.Count > 0)
                 {
                     // Unbind RTs before transitioning to avoid Diligent info spam
-                    deviceContext.SetRenderTargets(
-                        [],
-                        null,
-                        ResourceStateTransitionMode.None
-                    );
+                    deviceContext.SetRenderTargets([], null, ResourceStateTransitionMode.None);
                     deviceContext.TransitionResourceStates([.. transitions]);
                 }
             }
@@ -576,7 +590,7 @@ public class RenderGraph : IDisposable
             foreach (var (name, ms) in _lastPassTimings)
             {
                 if (ms >= 0.1)
-                    Console.WriteLine($"  {name,-40} {ms,6:F1}ms");
+                    Console.WriteLine($"  {name, -40} {ms, 6:F1}ms");
             }
         }
 
@@ -683,7 +697,7 @@ public class RenderGraph : IDisposable
 
     // ── Internal methods for Context (resource resolution) ──
 
-    internal ITexture? GetPhysicalTexture(RenderGraphHandle handle)
+    public ITexture? GetPhysicalTexture(RenderGraphHandle handle)
     {
         if (handle.Index >= 0 && handle.Index < _resolvedTextures.Length)
             return _resolvedTextures[handle.Index];
@@ -697,7 +711,7 @@ public class RenderGraph : IDisposable
         return null;
     }
 
-    internal ITextureView? GetPhysicalTextureView(RenderGraphHandle handle, TextureViewType type)
+    public ITextureView? GetPhysicalTextureView(RenderGraphHandle handle, TextureViewType type)
     {
         var texture = GetPhysicalTexture(handle);
         return texture?.GetDefaultView(type);

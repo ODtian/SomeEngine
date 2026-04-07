@@ -13,6 +13,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Silk.NET.Input;
 using Silk.NET.Maths;
 using Silk.NET.Windowing;
+using SomeEngine.Assets;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Assets.Pipeline;
 using SomeEngine.Assets.Schema;
@@ -121,6 +122,8 @@ class Program
 {
     static void Main(string[] args)
     {
+        AssetTypeRegistration.RegisterBuiltIns();
+
         var options = WindowOptions.Default;
         options.Size = new Vector2D<int>(1280, 720);
         options.Title = "SomeEngine Runtime - Cluster Rendering";
@@ -134,7 +137,7 @@ class Program
         RenderContext? context = null;
         ClusterResourceManager? resourceManager = null;
         ClusterPipeline? clusterPipeline = null;
-        MaterialRegistry? materialRegistry = null;
+        MaterialSystem? materialSystem = null;
         RenderGraph? renderGraph = null;
         SimpleMeshRenderPass? simplePass = null;
         ImGuiRenderer? imguiRenderer = null;
@@ -143,6 +146,10 @@ class Program
         InstanceSyncSystem? transformSystem = null;
         InstanceDataManager? instanceDataManager = null;
         IInputContext? input = null;
+
+        // HiZ visualization state
+        ITexture? lastHiZTexture = null;
+        List<IntPtr> hizMipTexIds = new();
         IKeyboard? keyboard = null;
         IMouse? mouse = null;
         int debugLOD = -1;
@@ -151,6 +158,7 @@ class Program
         bool _key3Pressed = false;
         bool _key4Pressed = false;
         bool _keyF5Pressed = false;
+        bool _keyF6Pressed = false;
         bool showEntityEditor = true;
         int spawnedEntityCount = 1;
         int selectedAvailableMeshIndex = 0;
@@ -160,6 +168,9 @@ class Program
         List<string> availableMeshes = new();
         var random = new Random();
         Dictionary<string, uint> MeshDefaultMaterialOffsets = new();
+        Material? defaultPbrMaterial = null;
+        Material? defaultUnlitMaterial = null;
+        AssetDatabase? assetDb = null;
 
         static string ResolveSamplesDirectory()
         {
@@ -191,7 +202,7 @@ class Program
 
             availableMeshes.AddRange(
                 Directory
-                    .EnumerateFiles(samplesDirectory, "*.mesh", SearchOption.TopDirectoryOnly)
+                    .EnumerateFiles(samplesDirectory, "*.mesh.asset", SearchOption.TopDirectoryOnly)
                     .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
             );
 
@@ -233,27 +244,42 @@ class Program
                 message =
                     $"Loaded mesh '{loadedName}' from {Path.GetFileName(meshFilePath)} (BVHRootIndex={rootIndex}).";
 
-                uint slotOffset = 0;
-                if (clusterPipeline != null && materialRegistry != null && meshAsset.DefaultMaterialSlots != null && meshAsset.DefaultMaterialSlots.Count > 0)
+                Material? ResolveDefaultMaterial(AssetGuid guid)
                 {
-                    var passes = new List<MaterialPass>();
-                    foreach (var matName in meshAsset.DefaultMaterialSlots)
+                    if (!guid.IsEmpty)
                     {
-                        var mat = materialRegistry.GetMaterial(matName);
-                        if (mat == null || mat.Passes.Length == 0)
+                        if (defaultUnlitMaterial != null && defaultUnlitMaterial.AssetGuid == guid)
                         {
-                            mat = materialRegistry.GetMaterial("DefaultPBR");
+                            return defaultUnlitMaterial;
                         }
-                        
-                        if (mat != null && mat.Passes.Length > 0)
+
+                        if (defaultPbrMaterial != null && defaultPbrMaterial.AssetGuid == guid)
                         {
-                            passes.Add(mat.Passes[0]);
+                            return defaultPbrMaterial;
                         }
                     }
-                    
-                    if (passes.Count > 0)
+
+                    return defaultPbrMaterial;
+                }
+
+                uint slotOffset = 0;
+                if (clusterPipeline != null)
+                {
+                    int slotCount = meshAsset.DefaultMaterialGuids?.Count ?? 0;
+                    for (int i = 0; i < slotCount; i++)
                     {
-                        slotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots(CollectionsMarshal.AsSpan(passes));
+                        AssetGuid guid = meshAsset.DefaultMaterialGuids != null &&
+                                         i < meshAsset.DefaultMaterialGuids.Count &&
+                                         AssetGuid.TryParse(meshAsset.DefaultMaterialGuids[i], out AssetGuid parsedGuid)
+                            ? parsedGuid
+                            : AssetGuid.Empty;
+
+                        Material? mat = ResolveDefaultMaterial(guid);
+                        if (mat != null && !mat.Entity.IsNull)
+                        {
+                            slotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots([mat.Entity]);
+                            break;
+                        }
                     }
                 }
                 
@@ -294,13 +320,28 @@ class Program
 
             try
             {
-                var importedMesh = ClusterBuilder.Process(resolvedPath);
+                AssetGuid ResolveMaterialGuidByName(string materialName)
+                {
+                    if (assetDb == null)
+                    {
+                        return AssetGuid.Empty;
+                    }
+
+                    AssetManifestRecord match = assetDb.List(nameof(MaterialAsset))
+                        .FirstOrDefault(asset =>
+                            string.Equals(asset.Name, materialName, StringComparison.Ordinal) &&
+                            asset.Path.EndsWith(".material.asset", StringComparison.OrdinalIgnoreCase));
+                    return match.Guid;
+                }
+
+                var importedMesh = ClusterBuilder.Process(resolvedPath, ResolveMaterialGuidByName);
                 string outBaseName = Path.GetFileNameWithoutExtension(resolvedPath);
                 importedMesh.Name = outBaseName;
 
                 Directory.CreateDirectory(samplesDirectory);
-                string outMeshPath = Path.Combine(samplesDirectory, outBaseName + ".mesh");
+                string outMeshPath = Path.Combine(samplesDirectory, outBaseName + ".mesh.asset");
                 MeshAssetSerializer.Save(importedMesh, outMeshPath);
+                assetDb?.Import(outMeshPath);
 
                 RefreshAvailableMeshes();
                 selectedAvailableMeshIndex = 0;
@@ -360,18 +401,12 @@ class Program
             // 2. Init Cluster Manager
             resourceManager = new ClusterResourceManager(context);
 
-            // 3. Init Pipeline (DI)
-            var services = new ServiceCollection();
-            services.AddSingleton(context);
-            services.AddSingleton(instanceDataManager!);
-            services.AddSingleton(resourceManager);
-            services.AddSingleton<MaterialRegistry>();
-
-            var provider = services.BuildServiceProvider();
-            materialRegistry = provider.GetRequiredService<MaterialRegistry>();
+            // 3. Init Pipeline
+            materialSystem = new MaterialSystem();
+            var psoCache = new GlobalPsoCache();
 
             clusterPipeline = ClusterPipeline.Opaque(
-                context, resourceManager, instanceDataManager!, materialRegistry);
+                context, resourceManager, instanceDataManager!, materialSystem, psoCache);
             clusterPipeline.Initialize(context);
 
             // ─── Create default textures + sampler ───
@@ -388,29 +423,10 @@ class Program
                 AddressW = Diligent.TextureAddressMode.Wrap,
             });
 
-            // ─── PBR material (via asset pipeline) ───
-            var pbrAsset = new MaterialAsset
-            {
-                Name = "DefaultPBR",
-                Passes = new List<PassEntry>
-                {
-                    new()
-                    {
-                        Shader = "cluster_shade_material",
-                        Tags = new List<TagEntry>
-                        {
-                            new() { Name = "opaque" },
-                            new() { Name = "cluster_shader" },
-                        }
-                    }
-                },
-                Textures = new List<TextureBinding>
-                {
-                    new() { Name = "AlbedoMap", Path = "default:white" },
-                    new() { Name = "NormalMap", Path = "default:normal" },
-                    new() { Name = "ARMMap", Path = "default:arm" },
-                },
-            };
+            // ─── Initialize Asset Database ───
+            string projectRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../"));
+            assetDb = new global::SomeEngine.Assets.AssetDatabase(projectRoot);
+            ShaderAsset? LoadShader(AssetGuid guid) => assetDb.Load<ShaderAsset>(guid);
 
             Diligent.ITextureView? LoadTexture(string path)
             {
@@ -423,47 +439,23 @@ class Program
                 };
             }
 
-            string assetsDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets"));
-
-            ShaderAsset? LoadShader(string name)
-            {
-                string shaderPath = Path.Combine(assetsDir, "Shaders", name + ".slang");
-                if (File.Exists(shaderPath))
-                    return SlangShaderImporter.Import(shaderPath);
-                return null;
-            }
+            // ─── PBR material (via asset pipeline) ───
+            MaterialAsset? pbrAsset = assetDb.Load<MaterialAsset>("assets/Materials/DefaultPBR.material.asset");
+            if (pbrAsset == null) throw new Exception("DefaultPBR material asset not found! Run tools/GenerateDefaultAssets or the GenerateDefaultMaterials test.");
 
             var matPBR = SomeEngine.Render.Assets.MaterialAssetLoader.LoadFromAsset(
-                pbrAsset, materialRegistry, LoadTexture, LoadShader);
+                pbrAsset, materialSystem, LoadTexture, LoadShader);
             matPBR.SetSampler("MaterialSampler", defaultSampler);
+            defaultPbrMaterial = matPBR;
 
             // ─── Unlit material (via asset pipeline) ───
-            var unlitAsset = new MaterialAsset
-            {
-                Name = "TestUnlit_1",
-                Passes = new List<PassEntry>
-                {
-                    new()
-                    {
-                        Shader = "cluster_shade_unlit",
-                        Tags = new List<TagEntry>
-                        {
-                            new() { Name = "opaque" },
-                            new() { Name = "cluster_shader" },
-                        }
-                    }
-                },
-                Textures = new List<TextureBinding>
-                {
-                    new() { Name = "AlbedoMap", Path = "default:white" },
-                    new() { Name = "NormalMap", Path = "default:normal" },
-                    new() { Name = "ARMMap", Path = "default:arm" },
-                },
-            };
+            MaterialAsset? unlitAsset = assetDb.Load<MaterialAsset>("assets/Materials/TestUnlit_1.material.asset");
+            if (unlitAsset == null) throw new Exception("TestUnlit_1 material asset not found! Run tools/GenerateDefaultAssets or the GenerateDefaultMaterials test.");
 
             var matUnlit = SomeEngine.Render.Assets.MaterialAssetLoader.LoadFromAsset(
-                unlitAsset, materialRegistry, LoadTexture, LoadShader);
+                unlitAsset, materialSystem, LoadTexture, LoadShader);
             matUnlit.SetSampler("MaterialSampler", defaultSampler);
+            defaultUnlitMaterial = matUnlit;
 
             // 4. Discover and optionally load mesh assets from samples/
             RefreshAvailableMeshes();
@@ -483,8 +475,8 @@ class Program
                             )
                             .First();
 
-                        uint pbrSlotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots(matPBR.Passes);
-                        uint unlitSlotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots(matUnlit.Passes);
+                        uint pbrSlotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots([matPBR.Entity]);
+                        uint unlitSlotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots([matUnlit.Entity]);
 
                         // Spawn 3 instances with different MaterialOverrides to test per-instance data
                         for (int i = -1; i <= 1; i++) 
@@ -561,6 +553,8 @@ class Program
 
         window.Render += (double delta) =>
         {
+          try
+          {
             if (
                 context == null
                 || clusterPipeline == null
@@ -666,6 +660,20 @@ class Program
                 else
                 {
                     _keyF5Pressed = false;
+                }
+
+                if (keyboard.IsKeyPressed(Key.F6))
+                {
+                    if (!_keyF6Pressed)
+                    {
+                        ClusterSWDraw.DebugDumpNextFrame = true;
+                        Console.WriteLine("[Debug] SW raster debug dump triggered for next frame...");
+                        _keyF6Pressed = true;
+                    }
+                }
+                else
+                {
+                    _keyF6Pressed = false;
                 }
 
                 if (move != Vector3.Zero)
@@ -780,6 +788,33 @@ class Program
                                         evicted++;
                                 }
                                 Console.WriteLine($"[Streaming Test] Evicted {evicted} pages");
+                            }
+                            ImGui.TreePop();
+                        }
+
+                        if (ImGui.TreeNode("HiZ Visualization"))
+                        {
+                            if (lastHiZTexture != null && hizMipTexIds.Count > 0)
+                            {
+                                var texDesc = lastHiZTexture.GetDesc();
+                                int mipCount = Math.Min(hizMipTexIds.Count, (int)texDesc.MipLevels);
+                                ImGui.Text($"HiZ: {texDesc.Width}x{texDesc.Height}, {texDesc.MipLevels} mips");
+
+                                float fixedW = 200f;
+                                float hizAspect = (float)texDesc.Height / Math.Max(texDesc.Width, 1);
+                                float fixedH = fixedW * hizAspect;
+
+                                for (int m = 0; m < mipCount; m++)
+                                {
+                                    uint mipW = Math.Max(1, texDesc.Width >> m);
+                                    uint mipH = Math.Max(1, texDesc.Height >> m);
+                                    ImGui.Text($"Mip {m}: {mipW}x{mipH}");
+                                    ImGui.Image(hizMipTexIds[m], new Vector2(fixedW, fixedH));
+                                }
+                            }
+                            else
+                            {
+                                ImGui.TextDisabled("HiZ not available (mode may be Legacy)");
                             }
                             ImGui.TreePop();
                         }
@@ -1127,6 +1162,46 @@ class Program
             renderGraph.Execute(context);
             var _tExecute = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
 
+            // Resolve HiZ texture after execute for ImGui visualization
+            if (clusterPipeline.LastHiZTextureHandle.IsValid && imguiRenderer != null)
+            {
+                var hizTex = renderGraph.GetPhysicalTexture(clusterPipeline.LastHiZTextureHandle);
+                if (hizTex != null && hizTex != lastHiZTexture)
+                {
+                    // Texture changed — unregister old SRVs
+                    foreach (var id in hizMipTexIds)
+                        imguiRenderer.UnregisterTexture(id);
+                    hizMipTexIds.Clear();
+
+                    // Create per-mip SRVs
+                    var desc = hizTex.GetDesc();
+                    int mipCount = (int)desc.MipLevels;
+                    for (int m = 0; m < mipCount; m++)
+                    {
+                        var viewDesc = new TextureViewDesc
+                        {
+                            ViewType = TextureViewType.ShaderResource,
+                            Name = $"HiZ_Mip{m}_SRV",
+                            Format = desc.Format,
+                            MostDetailedMip = (uint)m,
+                            NumMipLevels = 1,
+                        };
+                        var mipSrv = hizTex.CreateView(viewDesc);
+                        if (mipSrv != null)
+                            hizMipTexIds.Add(imguiRenderer.RegisterTexture(mipSrv));
+                    }
+                    lastHiZTexture = hizTex;
+                }
+            }
+            else if (lastHiZTexture != null)
+            {
+                if (imguiRenderer != null)
+                    foreach (var id in hizMipTexIds)
+                        imguiRenderer.UnregisterTexture(id);
+                hizMipTexIds.Clear();
+                lastHiZTexture = null;
+            }
+
             frameCount++;
 
             // Present handled by RenderContext helper or manually
@@ -1135,6 +1210,13 @@ class Program
 
             if (frameCount % 120 == 0)
                 Console.WriteLine($"[Profile] Update={_tUpdate:F1} ImGui={_tImGui:F1} Setup={_tSetup:F1} AddPass={_tAddPasses:F1} Compile={_tCompile:F1} Execute={_tExecute:F1} Present={_tPresent:F1}ms");
+          }
+          catch (Exception ex)
+          {
+              Console.Error.WriteLine($"[RENDER CRASH] {ex}");
+              Console.Error.Flush();
+              throw;
+          }
         };
 
         window.Resize += (Vector2D<int> size) =>

@@ -130,7 +130,7 @@ public class ClusterResolvePass : IRenderGraphPass, IDisposable
         uint height = desc.Height;
 
         ctx.SetPipelineState(ClusterResolvePSOs.PSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
             ThreadGroupCountX = (width + 7) / 8,

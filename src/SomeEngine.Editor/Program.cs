@@ -3,6 +3,7 @@ using Diligent;
 using Microsoft.Extensions.DependencyInjection;
 using Silk.NET.Maths;
 using Silk.NET.Windowing;
+using SomeEngine.Assets;
 using SomeEngine.Assets.Schema; // Added
 using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
@@ -29,6 +30,8 @@ class Program
 
     static void Main(string[] args)
     {
+        AssetTypeRegistration.RegisterBuiltIns();
+
         WindowOptions options = WindowOptions.Default;
         options.Size = new Vector2D<int>(1280, 720);
         options.Title = "SomeEngine Editor";
@@ -95,10 +98,11 @@ class Program
         _trianglePass.TransformSystem = _instanceDataManager;
         _trianglePass.InitPSO();
 
-        var materialRegistry = new SomeEngine.Render.Materials.MaterialRegistry();
+        var materialSystem = new SomeEngine.Render.Materials.MaterialSystem();
 
+        var globalPsoCache = new GlobalPsoCache();
         _clusterPipeline = ClusterPipeline.Opaque(
-            _renderContext, _clusterManager, _instanceDataManager!, materialRegistry);
+            _renderContext, _clusterManager, _instanceDataManager!, materialSystem, globalPsoCache);
         _clusterPipeline.Initialize(_renderContext);
     }
 

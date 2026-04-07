@@ -1,0 +1,29 @@
+{
+  "asset_guid": "ba3c012e-5d7c-4e46-baa3-f51e43d532c0",
+  "source_guid": "14ab8c88-4458-4ac6-9c99-7b2c74b9e5e4",
+  "sub_asset_key": "shader:main",
+  "content_fingerprint": "f45f0f3866bc287f43618b938b6ae2ca6a282f8ac942051f39dca02476b775a5",
+  "dependencies": [
+    {
+      "path": "assets/Shaders/cluster_common.slang",
+      "hash": "06307188f979e6288200add78b76f6699651a20a0905cb93fee75403a715d594"
+    },
+    {
+      "path": "assets/Shaders/cluster_draw.slang",
+      "hash": "2df132daaacc8cd7bfb6c2f650e551f777e44bde4c3bf3d85b8f4f0c6fc56cd5"
+    },
+    {
+      "path": "assets/Shaders/cluster_structures.slang",
+      "hash": "5bd548eb0e471af3befa58d629b0fb1c752eaab40d77c80eb2359fd097fdd2c8"
+    },
+    {
+      "path": "assets/Shaders/common.slang",
+      "hash": "647dfc235a333f99ae539ceb4bbeba07a2d396cc0e374d0e9ab8a9e05af278f4"
+    },
+    {
+      "path": "assets/Shaders/vertex_evaluate.slang",
+      "hash": "9e56559ba9a9ef3579b37427686aa83e6ac303e379cbac75f326f067779041c4"
+    }
+  ],
+  "importer_version": 2
+}

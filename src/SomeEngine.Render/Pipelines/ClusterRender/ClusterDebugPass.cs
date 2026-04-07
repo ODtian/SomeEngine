@@ -127,7 +127,7 @@ public class ClusterDebugPass : IDisposable
         srb.GetVariableByName(ShaderType.Compute, "DebugArgs")?.Set(debugIndirectArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(ClusterDebugPSOs.CopyPSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
 
         ClusterDebugPSOs.ReturnSRB(srb, ClusterDebugPSOs.CopySRBPool);
@@ -162,11 +162,11 @@ public class ClusterDebugPass : IDisposable
         srb.GetVariableByName(ShaderType.Vertex, "PageHeap")?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(ClusterDebugPSOs.SpherePSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DrawIndirect(new DrawIndirectAttribs
         {
             AttribsBuffer = debugIndirectArgs,
-            AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+            AttribsBufferStateTransitionMode = ResourceStateTransitionMode.None,
             DrawArgsOffset = 0,
             DrawCount = 1,
             Flags = DrawFlags.None,

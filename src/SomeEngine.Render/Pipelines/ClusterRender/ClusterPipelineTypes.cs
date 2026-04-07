@@ -1,9 +1,172 @@
 using System.Numerics;
+using System.Runtime.InteropServices;
 using Diligent;
+using SomeEngine.Assets.Importers;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.Systems;
 
 namespace SomeEngine.Render.Pipelines;
+
+// ────────────────────────────────────────────────────────────
+//  Enums (原 ClusterRenderFeature.cs)
+// ────────────────────────────────────────────────────────────
+
+public enum ClusterDebugMode
+{
+    None = 0,
+    ClusterID = 1,
+    LODLevel = 2,
+    MaterialID = 7,
+    Barycentric = 8,
+    Normal = 9,
+    UV = 10,
+    SWHWView = 11,
+}
+
+public enum HiZDebugMode
+{
+    Legacy,
+    Phase1Only,
+    Phase1OnlyPassAll,
+    Phase1ThenHiZ,
+    Full2Phase,
+}
+
+// ────────────────────────────────────────────────────────────
+//  GPU Uniform structs (原 ClusterRenderFeature.cs)
+// ────────────────────────────────────────────────────────────
+
+[StructLayout(LayoutKind.Sequential)]
+public struct CullingUniforms
+{
+    public Matrix4x4 ViewProj;
+    public Vector3 CameraPos;
+    public float LodThreshold;
+    public float LodScale;
+    public uint MaxQueueNodes;
+    public uint MaxCandidates;
+    public uint Pad2;
+    public int ForcedLODLevel;
+    public uint InstanceCount;
+    public uint DebugMode;
+    public uint Pad3;
+    public uint DumpHiZData;
+    public uint CurrentDepth;
+    public uint Pad5;
+    public uint Pad6;
+
+    public Matrix4x4 PrevViewProj;
+    public uint HasPrevHistory;
+    public uint HiZMipCount;
+    public Vector2 HiZInvSize;
+
+    public Matrix4x4 View;
+    public float P00;
+    public float P11;
+    public Vector2 Pad7;
+
+    public Vector3 QuantOrigin;
+    public float QuantStep;
+
+    public Matrix4x4 PrevView;
+    public float PrevP00;
+    public float PrevP11;
+    public Vector2 Pad8;
+
+    public static CullingUniforms Create(
+        in Matrix4x4 view, in Matrix4x4 proj, Vector3 cameraPos,
+        float lodThreshold, float lodScale, int forcedLODLevel,
+        uint instanceCount, bool bypassCulling, bool dumpHiZData, bool debugShowHiZAABBs,
+        in Matrix4x4 prevViewProjT, bool hasPrevHistory, uint hizMipCount, Vector2 hizInvSize,
+        in Matrix4x4 prevView, in Matrix4x4 prevProj,
+        Vector3 quantOrigin, float quantStep,
+        uint screenWidth = 0, uint screenHeight = 0
+    ) => new()
+    {
+        ViewProj = Matrix4x4.Transpose(view * proj),
+        CameraPos = cameraPos,
+        LodThreshold = lodThreshold,
+        LodScale = lodScale,
+        MaxQueueNodes = 4 * 1024 * 1024u,
+        MaxCandidates = ClusterLimits.MaxDraws,
+        ForcedLODLevel = forcedLODLevel,
+        InstanceCount = instanceCount,
+        DebugMode = bypassCulling ? 1u : 0u,
+        DumpHiZData = dumpHiZData ? 1u : 0u,
+        CurrentDepth = 0,
+        Pad5 = debugShowHiZAABBs ? 1u : 0u,
+        PrevViewProj = Matrix4x4.Transpose(Matrix4x4.Transpose(prevViewProjT)),
+        HasPrevHistory = hasPrevHistory ? 1u : 0u,
+        HiZMipCount = hizMipCount,
+        HiZInvSize = hizInvSize,
+        View = Matrix4x4.Transpose(view),
+        P00 = proj.M11,
+        P11 = proj.M22,
+        QuantOrigin = quantOrigin,
+        QuantStep = quantStep,
+        PrevView = Matrix4x4.Transpose(prevView),
+        PrevP00 = prevProj.M11,
+        PrevP11 = prevProj.M22,
+    };
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct DrawUniforms
+{
+    public Matrix4x4 ViewProj;
+    public Matrix4x4 View;
+    public uint PageTableSize;
+    public uint DebugMode;
+    public uint ScreenWidth;
+    public uint ScreenHeight;
+    public Vector3 QuantOrigin;
+    public float QuantStep;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct ShadeBinUniforms
+{
+    public uint ScreenWidth;
+    public uint ScreenHeight;
+    public uint MaterialCount;
+    public uint SlotCapacity;
+    public uint BinFieldIndex;
+    public uint Pad0;
+    public uint Pad1;
+    public uint Pad2;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct ShadeUniforms
+{
+    public Matrix4x4 ViewProj;
+    public Matrix4x4 View;
+    public uint PageTableSize;
+    public uint DebugMode;
+    public uint ScreenWidth;
+    public uint ScreenHeight;
+    public Vector3 QuantOrigin;
+    public float QuantStep;
+    public uint ShadingBin;
+    public uint MaterialCount;
+    public uint Pad0;
+    public uint Pad1;
+    public Vector3 LightDir;
+    public float LightIntensity;
+    public Vector3 AmbientColor;
+    public float Pad2;
+    public Vector3 CameraPos;
+    public float Pad3;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct CopyUniforms
+{
+    public uint SphereVertexCount;
+    public uint Pad0,
+        Pad1,
+        Pad2;
+}
 
 // ────────────────────────────────────────────────────────────
 //  Output types (Stage 产出 — positional records 支持解构)
@@ -28,7 +191,8 @@ public readonly record struct ClusterTraverseOutput(
     RenderGraphHandle CandidateClusters,
     RenderGraphHandle CandidateArgs,
     RenderGraphHandle CandidateCount,
-    RenderGraphHandle CullingUniforms
+    RenderGraphHandle CullingUniforms,
+    RenderGraphHandle IndirectDrawArgs
 );
 
 /// <summary>
@@ -50,8 +214,19 @@ public readonly record struct ClusterCullOutput(
 public readonly record struct ClusterRasterBinOutput(
     RenderGraphHandle BinnedClusterIndex,
     RenderGraphHandle BinnedDrawArgs,
+    RenderGraphHandle BinnedHWDrawArgs,
     RenderGraphHandle RasterBinMeta,
-    RenderGraphHandle BinningDispatchArgs
+    RenderGraphHandle BinningDispatchArgs,
+    RenderGraphHandle BinnedSWDispatchArgs
+);
+
+/// <summary>
+/// Deform Binning Stage 产出：按 VertexEvalKey 分组的 Cluster/Range 索引。
+/// </summary>
+public readonly record struct ClusterDeformBinOutput(
+    RenderGraphHandle DeformBinnedClusterIndex,
+    RenderGraphHandle DeformBinMeta,
+    RenderGraphHandle PreDeformDispatchArgs
 );
 
 /// <summary>
@@ -59,7 +234,8 @@ public readonly record struct ClusterRasterBinOutput(
 /// </summary>
 public readonly record struct ClusterRasterOutput(
     RenderGraphHandle VisBuffer,
-    RenderGraphHandle DepthTarget
+    RenderGraphHandle DepthTarget,
+    RenderGraphHandle RasterDepth
 );
 
 /// <summary>
@@ -204,10 +380,13 @@ public readonly record struct ClusterCullConfig
     public bool DebugShowHiZAABBs { get; init; }
     /// <summary>是否 dump 当前帧数据。</summary>
     public bool DumpNextFrame { get; init; }
+    /// <summary>是否启用 DeformCache 阶段，这会打开 VertexEval 相关 binning 和预变形缓存。</summary>
+    public bool UseDeformCache { get; init; }
 
     public static ClusterCullConfig Default() => new()
     {
         HiZMode = HiZDebugMode.Full2Phase,
+        UseDeformCache = false,
     };
 }
 
@@ -243,6 +422,9 @@ public readonly record struct ClusterDrawConfig
     public bool Overdraw { get; init; }
     public ClusterDebugMode DebugMode { get; init; }
 
+    /// <summary>是否使用 HW 专用的 indirect args（BinnedHWDrawArgs）。</summary>
+    public bool UseHWDrawArgs { get; init; }
+
     /// <summary>资源命名前缀（用于区分多个 Draw 实例的 RG 资源名）。</summary>
     public string? Tag { get; init; }
 
@@ -252,6 +434,7 @@ public readonly record struct ClusterDrawConfig
         ClearTargets = true,
         BinIndex = -1,
         UseVisBuffer = true,
+        UseHWDrawArgs = false,
     };
 }
 

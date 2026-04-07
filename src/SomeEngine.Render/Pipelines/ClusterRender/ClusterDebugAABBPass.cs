@@ -114,9 +114,9 @@ internal sealed class ClusterDebugAABBPass : IRenderGraphPass, IDisposable
         var srb = ClusterDebugAABBPSOs.RentSRB();
         srb.GetVariableByName(ShaderType.Vertex, "DebugHiZInput")?.Set(srv, SetShaderResourceFlags.None);
 
-        ctx.SetRenderTargets([colorRtv], null, ResourceStateTransitionMode.Verify);
+        ctx.SetRenderTargets([colorRtv], null, ResourceStateTransitionMode.None);
         ctx.SetPipelineState(ClusterDebugAABBPSOs.PSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
 
         // 4096 max entries × 8 vertices per rect (4 edges × 2 endpoints)
         ctx.Draw(new DrawAttribs { NumVertices = 4096 * 8, Flags = DrawFlags.VerifyAll });

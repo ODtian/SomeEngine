@@ -128,7 +128,6 @@ public class ClusterBVHTraversePass(
         HReadbackBuffer = RenderGraphHandle.Invalid;
 
     private readonly Queue<(uint Offset, uint Size, Action<uint[]> Callback)> _pendingReadbacks = new();
-    private uint _readbackOffset;
     private bool _pendingPageFaultReadback;
 
     public RenderGraphHandle HCandidateClusters = RenderGraphHandle.Invalid,
@@ -172,12 +171,12 @@ public class ClusterBVHTraversePass(
 
     public void SetupReadbackPass(RenderGraphBuilder builder)
     {
-        builder.Write(HReadbackBuffer, ResourceState.CopyDest);
+        builder.ReadWrite(HReadbackBuffer, ResourceState.CopyDest);
         builder.Read(HCandidateCount, ResourceState.CopySource);
         builder.Read(HArgsA, ResourceState.CopySource);
         builder.Read(HArgsB, ResourceState.CopySource);
         if (HPageFaultReadbackBuffer.IsValid)
-            builder.Read(HPageFaultReadbackBuffer, ResourceState.CopyDest);
+            builder.ReadWrite(HPageFaultReadbackBuffer, ResourceState.CopyDest);
     }
 
     public void ExecuteReadbackPass(RenderContext renderContext, RenderGraphContext rgCtx)
@@ -186,13 +185,20 @@ public class ClusterBVHTraversePass(
         if (ctx == null) return;
 
         var readback = rgCtx.GetBuffer(HReadbackBuffer);
+        var pageFaultReadbackBuf = HPageFaultReadbackBuffer.IsValid ? rgCtx.GetBuffer(HPageFaultReadbackBuffer) : null;
         var candCount = rgCtx.GetBuffer(HCandidateCount);
         var argsA = rgCtx.GetBuffer(HArgsA);
         var argsB = rgCtx.GetBuffer(HArgsB);
 
         ProcessReadbacks(ctx, readback);
-        var pageFaultReadbackBuf = HPageFaultReadbackBuffer.IsValid ? rgCtx.GetBuffer(HPageFaultReadbackBuffer) : null;
         ProcessPageFaultReadback(ctx, pageFaultReadbackBuf);
+
+        if (readback == null || candCount == null || argsA == null || argsB == null)
+            return;
+
+        ctx.CopyBuffer(candCount, 0, ResourceStateTransitionMode.None, readback, 0, 4, ResourceStateTransitionMode.None);
+        ctx.CopyBuffer(argsA, 0, ResourceStateTransitionMode.None, readback, 4, 16, ResourceStateTransitionMode.None);
+        ctx.CopyBuffer(argsB, 0, ResourceStateTransitionMode.None, readback, 20, 16, ResourceStateTransitionMode.None);
     }
 
     public void SetupClearArgsPass(RenderGraphBuilder builder, bool clearArgsA)
@@ -214,7 +220,7 @@ public class ClusterBVHTraversePass(
             ?.Set(args.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(ClusterBVHTraversePSOs.ClearArgsPSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
 
         ClusterBVHTraversePSOs.ReturnSRB(srb, ClusterBVHTraversePSOs.ClearArgsSRBPool);
@@ -251,7 +257,7 @@ public class ClusterBVHTraversePass(
         srb.GetVariableByName(ShaderType.Compute, "NextDispatchArgs")?.Set(argsA.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(ClusterBVHTraversePSOs.InitQueuePSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = groups, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
 
         ClusterBVHTraversePSOs.ReturnSRB(srb, ClusterBVHTraversePSOs.InitQueueSRBPool);
@@ -317,11 +323,11 @@ public class ClusterBVHTraversePass(
         }
 
         ctx.SetPipelineState(ClusterBVHTraversePSOs.TraversePSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchComputeIndirect(new DispatchComputeIndirectAttribs
         {
             AttribsBuffer = currentArgs,
-            AttribsBufferStateTransitionMode = ResourceStateTransitionMode.Verify,
+            AttribsBufferStateTransitionMode = ResourceStateTransitionMode.None,
         });
 
         ClusterBVHTraversePSOs.ReturnSRB(srb, ClusterBVHTraversePSOs.TraverseSRBPool);
@@ -347,7 +353,7 @@ public class ClusterBVHTraversePass(
             ?.Set(targetArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(ClusterBVHTraversePSOs.UpdateArgsPSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
 
         ClusterBVHTraversePSOs.ReturnSRB(srb, ClusterBVHTraversePSOs.UpdateArgsSRBPool);
@@ -376,8 +382,8 @@ public class ClusterBVHTraversePass(
 
         if (readbackBuffer == null) return;
 
-        ctx.CopyBuffer(pageFaultBuffer, 0, ResourceStateTransitionMode.Verify,
-            readbackBuffer, 0, clusterManager.PageFaultBufferSize, ResourceStateTransitionMode.Verify);
+        ctx.CopyBuffer(pageFaultBuffer, 0, ResourceStateTransitionMode.None,
+            readbackBuffer, 0, clusterManager.PageFaultBufferSize, ResourceStateTransitionMode.None);
 
         _pendingPageFaultReadback = hPageFaultReadback.IsValid;
     }
@@ -428,25 +434,24 @@ public class ClusterBVHTraversePass(
 
     private void ProcessReadbacks(IDeviceContext ctx, IBuffer? readbackBuffer)
     {
-        if (readbackBuffer == null || _pendingReadbacks.Count == 0) return;
+        if (readbackBuffer == null)
+            return;
+
         var map = ctx.MapBuffer<uint>(readbackBuffer, MapType.Read, MapFlags.DoNotWait);
-        if (map.Length == 0) return;
+        if (map.Length == 0)
+            return;
+
         try
         {
-            while (_pendingReadbacks.Count > 0)
+            if (map.Length >= 9)
             {
-                var (off, size, cb) = _pendingReadbacks.Peek();
-                int idx = (int)(off / 4);
-                int words = (int)(size / 4);
-                if (idx + words <= map.Length) cb(map.Slice(idx, words).ToArray());
-                _pendingReadbacks.Dequeue();
+                // [0] candidateCount, [1..4] argsA, [5..8] argsB
             }
         }
         finally
         {
             ctx.UnmapBuffer(readbackBuffer, MapType.Read);
         }
-        if (_pendingReadbacks.Count == 0) _readbackOffset = 0;
     }
 
     private void ProcessPageFaultReadback(IDeviceContext ctx, IBuffer? pageFaultReadbackBuffer)

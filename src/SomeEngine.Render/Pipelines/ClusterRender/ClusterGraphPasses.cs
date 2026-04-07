@@ -143,7 +143,7 @@ internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
             ?.Set(patchBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(s_patchPSO);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         
         uint groups = ((uint)Patches.Count + 63) / 64;
         ctx.DispatchCompute(new DispatchComputeAttribs
@@ -190,14 +190,14 @@ internal sealed class ClusterUploadInstanceDataPass(
             globalTransformBuffer,
             0,
             (ReadOnlySpan<GpuTransform>)transformSystem.CpuTransforms,
-            ResourceStateTransitionMode.Verify
+            ResourceStateTransitionMode.None
         );
 
         graphContext.CommandList.UpdateBuffer(
             globalInstanceHeaderBuffer,
             0,
             (ReadOnlySpan<GpuInstanceHeader>)transformSystem.CpuHeaders,
-            ResourceStateTransitionMode.Verify
+            ResourceStateTransitionMode.None
         );
 
         if (transformSystem.MetadataByteCount > 0)
@@ -206,7 +206,7 @@ internal sealed class ClusterUploadInstanceDataPass(
                 globalInstanceDataHeapBuffer,
                 0,
                 (ReadOnlySpan<byte>)transformSystem.CpuMetadata,
-                ResourceStateTransitionMode.Verify
+                ResourceStateTransitionMode.None
             );
         }
     }
@@ -250,13 +250,13 @@ internal sealed class ClusterClearBuffersPass(
         var candidateCountBuffer = candidateCount.IsValid ? graphContext.GetBuffer(candidateCount) : null;
         var pageFault = pageFaultBuffer.IsValid ? graphContext.GetBuffer(pageFaultBuffer) : null;
 
-        Span<uint> resetDrawArgs = [372, 0, 0, 0];
+        Span<uint> resetDrawArgs = [96, 0, 0, 0, 0]; // [0]=VertexCount (96=32tris*3 per VRB batch), [4]=swCount(InstanceCount), [8]=hwCount, rest=unused
         if (drawArgsBuffer != null)
             graphContext.CommandList.UpdateBuffer(
                 drawArgsBuffer,
                 0,
                 resetDrawArgs,
-                ResourceStateTransitionMode.Verify
+                ResourceStateTransitionMode.None
             );
 
         Span<uint> resetCandidateArgs = [1, 1, 1, 0];
@@ -265,7 +265,7 @@ internal sealed class ClusterClearBuffersPass(
                 candidateArgsBuffer,
                 0,
                 resetCandidateArgs,
-                ResourceStateTransitionMode.Verify
+                ResourceStateTransitionMode.None
             );
 
         Span<uint> zeroCount = [0u];
@@ -274,14 +274,14 @@ internal sealed class ClusterClearBuffersPass(
                 candidateCountBuffer,
                 0,
                 zeroCount,
-                ResourceStateTransitionMode.Verify
+                ResourceStateTransitionMode.None
             );
         if (pageFault != null)
             graphContext.CommandList.UpdateBuffer(
                 pageFault,
                 0,
                 zeroCount,
-                ResourceStateTransitionMode.Verify
+                ResourceStateTransitionMode.None
             );
 
         if (phase2CandidateCount.IsValid)
@@ -292,7 +292,7 @@ internal sealed class ClusterClearBuffersPass(
                     phase2CountBuffer,
                     0,
                     zeroCount,
-                    ResourceStateTransitionMode.Verify
+                    ResourceStateTransitionMode.None
                 );
         }
 
@@ -304,7 +304,7 @@ internal sealed class ClusterClearBuffersPass(
                     phase2DrawArgsBuffer,
                     0,
                     resetDrawArgs,
-                    ResourceStateTransitionMode.Verify
+                    ResourceStateTransitionMode.None
                 );
         }
 
@@ -316,7 +316,7 @@ internal sealed class ClusterClearBuffersPass(
                     phase2CandArgsBuf,
                     0,
                     resetCandidateArgs,
-                    ResourceStateTransitionMode.Verify
+                    ResourceStateTransitionMode.None
                 );
         }
 
@@ -327,7 +327,7 @@ internal sealed class ClusterClearBuffersPass(
             {
                 Span<uint> zero4 = [0u, 0u, 0u, 0u];
                 graphContext.CommandList.UpdateBuffer(
-                    zeroBuf, 0, zero4, ResourceStateTransitionMode.Verify);
+                    zeroBuf, 0, zero4, ResourceStateTransitionMode.None);
             }
         }
 
@@ -602,7 +602,7 @@ internal sealed class ClusterCullUpdateArgsPass : IRenderGraphPass, IDisposable
         }
 
         ctx.SetPipelineState(s_pso);
-        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.Verify);
+        ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
             ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1,
@@ -626,14 +626,19 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
     private byte[]? _lastDebugHiZData;
 
     public uint CandidateCount => _lastCandidateCount[0];
-    public uint DrawVertexCount => _lastDrawArgs[0];
-    public uint DrawInstanceCount => _lastDrawArgs[1];
-    public uint DrawStartVertex => _lastDrawArgs[2];
-    public uint DrawStartInstance => _lastDrawArgs[3];
+    // DrawArgs layout = CullDrawArgs: [Pad0, SWCount, HWCount]
+    public uint DrawVertexCount => _lastDrawArgs[0]; // Pad0 (legacy VertexCount)
+    public uint DrawSWCount => _lastDrawArgs[1];
+    public uint DrawHWCount => _lastDrawArgs[2];
+    public uint DrawInstanceCount => _lastDrawArgs[1] + _lastDrawArgs[2]; // Total visible = SW + HW
+    public uint DrawStartVertex => _lastDrawArgs[2]; // legacy compat
+    public uint DrawStartInstance => _lastDrawArgs[3]; // legacy compat
     public uint[] CandidateArgs => _lastCandidateArgs;
     public uint Phase2CandidateCount => _lastPhase2Count[0];
+    public uint Phase2DrawSWCount => _lastPhase2DrawArgs[1];
+    public uint Phase2DrawHWCount => _lastPhase2DrawArgs[2];
     public uint Phase2DrawVertexCount => _lastPhase2DrawArgs[0];
-    public uint Phase2DrawInstanceCount => _lastPhase2DrawArgs[1];
+    public uint Phase2DrawInstanceCount => _lastPhase2DrawArgs[1] + _lastPhase2DrawArgs[2];
     public byte[]? DebugHiZData => _lastDebugHiZData;
 
     public RenderGraphHandle HCandidateCount = RenderGraphHandle.Invalid;
@@ -717,7 +722,7 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
             return;
 
         var map = ctx.MapBuffer<uint>(readbackBuffer, MapType.Read, MapFlags.DoNotWait);
-        if (map.Length >= 10)
+        if (map.Length >= 14)
         {
             _lastCandidateCount[0] = map[0];
             _lastDrawArgs[0] = map[1];
@@ -729,7 +734,7 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
             _lastCandidateArgs[2] = map[7];
             _lastCandidateArgs[3] = map[8];
             _lastPhase2Count[0] = phase2Count != null ? map[9] : 0;
-            if (map.Length >= 14 && phase2DrawArgs != null)
+            if (phase2DrawArgs != null)
             {
                 _lastPhase2DrawArgs[0] = map[10];
                 _lastPhase2DrawArgs[1] = map[11];
@@ -746,56 +751,16 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
         }
         ctx.UnmapBuffer(readbackBuffer, MapType.Read);
 
-        ctx.CopyBuffer(
-            candidateCount,
-            0,
-            ResourceStateTransitionMode.Verify,
-            readbackBuffer,
-            0,
-            4,
-            ResourceStateTransitionMode.Verify
-        );
-        ctx.CopyBuffer(
-            drawArgs,
-            0,
-            ResourceStateTransitionMode.Verify,
-            readbackBuffer,
-            4,
-            16,
-            ResourceStateTransitionMode.Verify
-        );
-        ctx.CopyBuffer(
-            candidateArgs,
-            0,
-            ResourceStateTransitionMode.Verify,
-            readbackBuffer,
-            20,
-            16,
-            ResourceStateTransitionMode.Verify
-        );
+        ctx.CopyBuffer(candidateCount, 0, ResourceStateTransitionMode.None, readbackBuffer, 0, 4, ResourceStateTransitionMode.None);
+        ctx.CopyBuffer(drawArgs, 0, ResourceStateTransitionMode.None, readbackBuffer, 4, 16, ResourceStateTransitionMode.None);
+        ctx.CopyBuffer(candidateArgs, 0, ResourceStateTransitionMode.None, readbackBuffer, 20, 16, ResourceStateTransitionMode.None);
         if (phase2Count != null)
         {
-            ctx.CopyBuffer(
-                phase2Count,
-                0,
-                ResourceStateTransitionMode.Verify,
-                readbackBuffer,
-                36,
-                4,
-                ResourceStateTransitionMode.Verify
-            );
+            ctx.CopyBuffer(phase2Count, 0, ResourceStateTransitionMode.None, readbackBuffer, 36, 4, ResourceStateTransitionMode.None);
         }
         if (phase2DrawArgs != null)
         {
-            ctx.CopyBuffer(
-                phase2DrawArgs,
-                0,
-                ResourceStateTransitionMode.Verify,
-                readbackBuffer,
-                40,
-                16,
-                ResourceStateTransitionMode.Verify
-            );
+            ctx.CopyBuffer(phase2DrawArgs, 0, ResourceStateTransitionMode.None, readbackBuffer, 40, 16, ResourceStateTransitionMode.None);
         }
 
         // Readback DebugHiZOutput
@@ -824,11 +789,11 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
                 ctx.CopyBuffer(
                     debugSrc,
                     0,
-                    ResourceStateTransitionMode.Verify,
+                    ResourceStateTransitionMode.None,
                     debugDst,
                     0,
                     srcDesc.Size,
-                    ResourceStateTransitionMode.Verify
+                    ResourceStateTransitionMode.None
                 );
             }
         }
