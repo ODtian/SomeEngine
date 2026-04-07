@@ -49,7 +49,7 @@
 
 ### Phase 1: GPU Culling & LOD (Compute)
 1.  **Instance Culling**: 粗粒度视锥剔除。
-2.  **DAG Traversal (Persistent Threads)**:
+2.  **DAG Traversal (当前：Queue-Driven Multi-Dispatch / 计划：Persistent Threads 双架构)**:
     *   遍历 Hierarchy Buffer。
     *   计算屏幕误差，决定细分 (Visit Children) 还是选中 (Emit Cluster)。
     *   **Streaming Feedback**: 如果选中的 Cluster 未加载 (Page Not Resident)，写入请求队列回传 CPU。
@@ -83,7 +83,8 @@
     -   使用 **Sparse Grid** 或 **Linear BVH** 进行空间索引，加速查询。
 2.  **Cluster Culling**:
     -   对可见 Instance 启动 DAG 遍历。
-    -   **Persistent Threads**: 使用持久线程模型在 GPU 上高效遍历树结构，避免频繁 Dispatch。
+    -   **当前实现**：Queue-Driven Multi-Dispatch（双缓冲队列 + 多次 dispatch）。
+    -   **未来计划**：Persistent Threads 持久线程版本，见 `rendering/persistent_thread_bvh_traversal.md`。
 
 ## 实现路线图
 
@@ -93,7 +94,7 @@
     *   **3.1 资产预处理**: Mesh Cluster化 (Meshlets)，LOD 简化，DAG 构建与序列化。
     *   **3.2 GPU 数据架构**: Hierarchy Index/Payload Buffer 管理，Bindless Vertex Pulling。
     *   **3.3 Compute Culling 基础**: 并行视锥剔除，Indirect Draw 参数生成。
-    *   **3.4 DAG 遍历与 LOD**: Persistent Threads 遍历，LOD 误差度量与选择逻辑。
+    *   **3.4 DAG 遍历与 LOD**: 当前为 Queue-Driven Multi-Dispatch；Persistent Threads 为后续演进方向。
 4.  **Visibility Buffer 管线 (Visibility Buffer Pipeline)**
     *   **4.1 VisBuffer 写入**: 硬件光栅化写入 Packed ID (InstanceID + TriangleID)。
     *   **4.2 材质解析**: Tile-based Material Binning，Bindless 材质数据访问。

@@ -153,148 +153,64 @@ void CSPreDeform(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID)
 
 ## Phase 3.5：软光栅基础设施（★★★★）
 
-**目标**：实现 CS 软光栅器核心，直接通过 Compute Shader 将三角形写入 VisBuffer（`RWTexture2D<uint>`），为 Masked/PDO/Tess 等可编程路径打基础。
-
-### 为什么需要软光栅
-
-| 场景 | HW 光栅 | SW 光栅 |
-|------|---------|---------|
-| **纯不透明静态** | ✅ 最优（固定管线加速） | ❌ 不需要 |
-| **Masked / Alpha Test** | ⚠️ 需要 PS discard，打断 Early-Z | ✅ CS 中采样纹理 → 条件写入 |
-| **PDO（Pixel Depth Offset）** | ⚠️ 需要修改深度输出，更慢 | ✅ CS 直接计算偏移深度 |
-| **Tessellation Dice** | ❌ 微三角形无固定 128-tri/cluster 结构，无法 DrawIndirect | ✅ 必须走 CS |
-| **小三角形（<2px）** | ❌ quad overshading 严重 | ✅ 逐像素扫描，无浪费 |
-| **WPO** | ⚠️ 可走 HW 但需变体 | ✅ 变形后顶点已在 DeformedBuffer |
-| **Two-Sided** | ⚠️ 需要禁用背面剔除 | ✅ CS 中 skip backface cull |
-
-> [!TIP]
-> Nanite 的经验：同一个 RasterBin 内的 Cluster 按屏幕面积分流——**小 Cluster（<N px²）走 SW**，**大 Cluster 走 HW**。我们在 Phase 4 Bin 系统中实现这个分流。Phase 3.5 先独立实现 SW 光栅核心。
-
-### 软光栅核心架构
-
-```
-1 Group = 1 Cluster (64 threads)
-    │
-    ├── Stage 1: Vertex Transform (读 DeformedBuffer 或 PageHeap)
-    │   └── 结果存 groupshared float3 GroupVerts[256]
-    │
-    ├── Stage 2: Triangle Setup (每线程处理 ≤2 个三角形)
-    │   ├── 反量化 → Clip Space → Subpixel (8x8 子像素精度)
-    │   ├── 背面剔除 (可选 Two-Sided skip)
-    │   └── 输出 FRasterTri { 边方程, Bounding Box }
-    │
-    └── Stage 3: Scanline Rasterize (自适应策略)
-        ├── 微三角形 (≤2px): 逐像素测试
-        ├── 中三角形: 扫描线 (edge function evaluation)
-        ├── 大三角形: 分块写入
-        └── 深度测试 + 原子写入 VisBuffer
-            InterlockedMax(VisBuffer[pixel], (depth << 7) | triangleID)
-            或
-            InterlockedMax(Depth64[pixel], pack(depth, visData))
-```
-
-### VisBuffer 原子写入策略
-
-当前 HW 路径用硬件深度测试，SW 路径需要自行实现。两种方案：
-
-**方案 A：单 `RWTexture2D<uint>` (32-bit)**
-```hlsl
-// VisBuffer 编码: (VisibleClusterIndex+1) << 7 | TriangleID
-// 深度测试: 单独的 RWTexture2D<uint> DepthUint 存 floatBitsToUint(depth)
-// 两次原子操作: 先 InterlockedMin(DepthUint, depthBits), 再有条件写 VisBuffer
-```
-- 优点：与现有 HW 路径共享 VisBuffer 格式
-- 缺点：两次原子操作有竞争窗口
-
-**方案 B：`RWTexture2D<uint64>` 打包 (推荐)**
-```hlsl
-// 64-bit: [Depth:32][VisData:32]
-// 单次 InterlockedMax 保证原子性
-// 最终拆分: VisBuffer = lower 32 bits, Depth = upper 32 bits
-```
-- 优点：单原子操作，无竞争
-- 缺点：需要 64-bit atomic 支持（D3D12 Shader Model 6.6 / Vulkan atomicUint64）
+**目标**：实现 CS 软光栅器核心（32 线程 + VRB + WaveQueue），为所有可编程光栅化路径打基础。
 
 > [!IMPORTANT]
-> **建议先用方案 A**（32-bit 双缓冲），兼容性最好。64-bit atomic 作为可选优化路径。
+> 架构已从最初设计的 "64 线程 + LDS GroupVerts[256]" 改为 **"32 线程 + VRB 去重 + WaveQueue 负载均衡"**。
+> 详细设计见 [sw_raster.md](file:///f:/SomeEngine/docs/raster/sw_raster.md)。
 
-### 新增文件
+### 核心架构
 
-#### [NEW] `assets/Shaders/cluster_sw_raster.slang` — 软光栅核心
-
-```hlsl
-// 子像素精度常量
-static const uint SUBPIXEL_BITS = 8;
-static const uint SUBPIXEL_SAMPLES = 1 << SUBPIXEL_BITS;
-
-groupshared float3 GroupVerts[256];  // 顶点缓存
-
-struct FRasterTri
-{
-    int2  MinPixel, MaxPixel;   // 像素级 Bounding Box
-    float3 Edge0, Edge1, Edge2; // 边方程 (A,B,C) for Ax+By+C >= 0
-    float  InvArea;             // 1/2倍面积（用于重心坐标）
-    bool   bIsValid;
-};
-
-FRasterTri SetupTriangle(int4 scissor, float4 v0_sub, float4 v1_sub, float4 v2_sub, bool cullBackface)
-{
-    // 子像素坐标三角形设置
-    // 计算边方程、背面剔除、Bounding Box 裁剪
-    ...
-}
-
-void RasterizeTriangle(FRasterTri tri, uint pixelValue, float3 depths,
-                       RWTexture2D<uint> outVisBuffer, RWTexture2D<uint> outDepth)
-{
-    // 自适应扫描：小三角形逐像素，中三角形扫描线
-    for (int y = tri.MinPixel.y; y <= tri.MaxPixel.y; y++)
-    for (int x = tri.MinPixel.x; x <= tri.MaxPixel.x; x++)
-    {
-        // Edge function 测试 → 重心坐标 → 插值深度
-        // InterlockedMin(outDepth[xy], depthBits) → 有条件写 outVisBuffer
-    }
-}
-
-[numthreads(64, 1, 1)]
-void CSSWRaster(uint3 gid : SV_GroupID, uint tid : SV_GroupThreadIndex)
-{
-    // 1. 从 BinnedClusterBuffer 读取本 Group 对应的 Cluster
-    // 2. Vertex Transform → GroupVerts[]
-    // 3. GroupMemoryBarrierWithGroupSync()
-    // 4. 每线程负责 ceil(triCount/64) 个三角形
-    //    SetupTriangle → RasterizeTriangle
-}
+```
+1 Wave = 1 VRB Batch (32 threads)
+  Stage 1: DeduplicateVertIndexes（256-bit bitmask，≤32 unique verts）
+  Stage 2: Vertex Transform（寄存器，零 LDS）
+  Stage 3: Triangle Setup（WaveReadLaneAt 拉取顶点）
+  Stage 4: WaveQueue 像素分发 + 原子深度写入
 ```
 
-#### [NEW] `src/SomeEngine.Render/Pipelines/ClusterRender/ClusterSWRasterPass.cs`
+### 与 Nanite 的关键区别
 
-```csharp
-// Compute Pass，DispatchIndirect 基于 SW Bin 的 Cluster 数量
-// 绑定: VisibleClusters, PageHeap, DeformedBuffers, VisBuffer(UAV), DepthUAV
-```
+| | Nanite SW | 我们 |
+|--|--|--|
+| THREADGROUP_SIZE | 64 | **32** |
+| 顶点缓存 | LDS / Streaming Register Cache | **Wave 寄存器（零 LDS）** |
+| VRB | SW 不用（streaming cache 隐式复用） | **DeduplicateVertIndexes** |
+| 像素分发 | 1 thread = 1 tri（SIMD 利用率低） | **WaveQueue 负载均衡** |
+| Occupancy | MAX_OCCUPANCY（堆 wave 数补偿） | **WaveQueue 提升 intra-wave 利用率** |
+
+### VRB Fast/Slow Path
+
+- **Fast Path**（batch ≤ 5）：VRBBatchInfo 存 GPUCluster header（1 uint），Binning 拆为 per-batch entries
+- **Slow Path**（batch > 5，极罕见）：不做 VRB 去重，每 lane 独立 fetch 3 顶点
+- 与 material fast/slow path 理念相同：builder 尽力保证，runtime 兜底
+
+### 已完成
+
+- [sw_raster.slang](file:///f:/SomeEngine/assets/Shaders/sw_raster.slang)：SW 光栅核心 + DeduplicateVertIndexes
+- [wave_queue.slang](file:///f:/SomeEngine/assets/Shaders/wave_queue.slang)：WaveQueue 泛型分发器
+- [ClusterBuilder.cs](file:///f:/SomeEngine/src/SomeEngine.Assets/Importers/ClusterBuilder.cs)：VRB build-time（ReorderForVRB + degenerate padding）
+- [cluster_binning.slang](file:///f:/SomeEngine/assets/Shaders/cluster_binning.slang)：4-pass Raster Binning
+- [BinSpace.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Materials/BinSpace.cs) + [MaterialSlotBuffer.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Materials/MaterialSlotBuffer.cs)：Material Bin 映射
+
+### 待完成
+
+- VRB build-time：贪心 reorder → Nanite 式线性扫描 + fast/slow path
+- DeduplicateVertIndexes：64-bit → 256-bit bitmask（适配 MaxVertices=256）
+- Cluster 参数：128 tri / 256 vert
+- GPUCluster header 新增 VRBBatchInfo（1 uint）
+- Binning shader：per-batch entries + uint → uint2
+- Mesh Shader 路径复用 DeduplicateVertIndexes
+- DeformCache 集成：顶点变换与光栅化解耦
+
+### VisBuffer 原子写入
+
+- Phase 3.5 初期：32-bit 双原子
+- 终态：64-bit 单原子（SM 6.6）
 
 ### 与 HW 路径共存
 
-SW 和 HW 路径写入**同一个 VisBuffer**——两者的 VisBuffer 编码完全一致：`(VisibleClusterIndex+1) << 7 | TriangleID`。
-
-```
-Phase1 Cull → (Phase 3.5 开始生效后)
-├── HW Draw (大 Cluster, 不透明) → VisBuffer + HW Depth
-├── SW Raster CS (小 Cluster / Masked / PDO) → VisBuffer + SW DepthUAV
-│   └── 需要 Copy SW DepthUAV → HW Depth (或 Max merge)
-└── Resolve CS 统一读 VisBuffer
-```
-
-> [!WARNING]
-> **HW Depth Buffer 和 SW DepthUAV 的合并**是关键细节。Nanite 用 64-bit atomic 在 UAV 上做所有深度测试，完全绕开 HW Depth。我们可以：
-> 1. **Phase 3.5 初期**：纯 SW 路径使用独立 `DepthUAV`，渲染完后 copy 到 HW Depth 供 HiZ 使用
-> 2. **Phase 4 后**：统一用 UAV Depth（完全放弃 HW Depth），HW 路径也写 UAV
-
-### 依赖
-- Phase 2（DeformedBuffer）— 如果只测试静态 Cluster 的 SW 路径，可与 Phase 2 并行
-- **不依赖 Phase 3**（可独立用静态 Cluster 测试）
-- Phase 4（Bin 系统）提供 SW/HW 分流后才真正投入生产
+SW/HW 写入同一 VisBuffer（编码一致）。初期用 Depth Merge Pass；终态统一 UAV Depth。
 
 ---
 

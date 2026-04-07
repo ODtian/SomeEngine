@@ -1,5 +1,248 @@
 # Development Log
 
+## [2026-03-28] BATCH-01: 文档同步与清理
+- **Workstream 转换**：完成 Full Conversion，产出 BASELINE-REVIEW / DESIGN / TASK-DETAIL / TASK-TRACKER / DEBT-TRACKER / ONBOARDING / BATCH-01-INSTRUCTIONS
+- **文档修正 8 处 DRIFT**：cluster_pipeline.md (GPUCluster 64B / MaterialSlotOffset / 9 Stage)、materials/architecture.md (SOA)、overview.md (BVH 双架构)
+- **标注待实现文档**：material_pipeline_full_chain.md、gpu_pipeline_tag_integration_plan.md（合并自 gpu_pipeline_remaining_plan + material_tag_migration_plan）
+- **删除废弃代码**：ClusterRenderFeature.cs (91KB) → 类型提取至 ClusterPipelineTypes.cs；ClusterRenderPass.cs.bak (80KB)
+- **发现 Pre-existing 错误**：AssetResolverTests.cs / MaterialAssetPipelineTests.cs 有 3 个编译错误（与本次修改无关）
+
+
+## [2026-03-26] Dual-Signature Shade Pipeline Binding
+- **新建 `ShadeSignatures.cs`**：Sig0 全局缓存（12 管线 Dynamic 资源），Sig1 按 shader 反射懒创建（从 `ShaderParamBag.EnumerateResources()` 推导材质资源）。
+- **重写 `ShadePSOBuilder.cs`**：PSO 使用 `ResourceSignatures = [Sig0, Sig1]`；SRBs 从 Sig1 创建（仅含材质纹理 + Uniforms）。
+- **重写 `ClusterMaterialShadePass.cs`**：分层 Commit — Sig0 per-pass SRB 绑 1 次/PSO group，Sig1 material SRB 绑 N 次/bin。
+- **`ShaderParamBag`**：新增 `EnumerateResources()` 方法。
+- **`ClusterShadePipelineParams`**：移除 `Uniforms`（已迁移至 Sig1）。
+
+## [2026-03-25] ClusterPipeline 无状态 Stage 重构
+- **静态 `ClusterShade`**：合并 ShadeBin + MaterialShade 为无状态 static class。
+- **`ShadePSOBuilder`**：抽取 PSO 组构建为纯工具类。
+- **`ClusterStageUtils`**：抽取 `AddDynamicUniformPass<T>` 共享逻辑。
+- **删除 `ClusterShadeStage.cs`、`ClusterShadeBinStage.cs`**。
+- **消除 `useDeformCache` 布尔开关**：全部使用 `RenderGraphHandle.IsValid` 驱动路径选择。
+
+## [2026-03-24] 修复 ShaderParamBag.GetSignatureHash 确定性
+- `GetSignatureHash()` 遍历 `Dictionary<string, Entry>` 时顺序不确定，导致相同绑定集的两个 bag 可能产出不同签名 hash → BinQueue 无法正确合并 bin。
+- 修复：先按 key 排序（`StringComparer.Ordinal`）再做 FNV-1a 哈希。
+
+## [2026-03-24] IVertexEvaluate 可编程顶点变形接口
+- **新建 `vertex_evaluate.slang`**：定义 `IVertexEvaluate`（`associatedtype DeformedVertex` + 实例方法 `evaluate`/`getPosition`）、`IVertexSource`、`InlineSource<T>`、`StaticVertexEval`、`VertexEvalContext`（含 PageHeap/StreamCursor 属性访问）。
+- **泛型化 `sw_raster.slang`**：提取 `SWRasterKernel<VS : IVertexSource>` 泛型函数，`CSSWRaster` 入口通过 `InlineSource<StaticVertexEval>` 调用。`LoadClusterGeometry` 扩展输出 `attrOffset` 和 `totalVertexCount`。旧 `FetchAndTransformVertex` 标记 deprecated 保留。
+- **编译测试**：新建 `VertexEvaluateCompilationTest.cs`，包含 (1) 默认 `InlineSource<StaticVertexEval>` 路径 (2) 自定义 `WPOVertexEval`（含 `StructuredBuffer<float4>` 资源绑定）路径。3/3 测试通过（含原有 `SWRasterCompilationTest` 回归）。
+
+## [2026-03-23] 修复 ParameterBlock 材质变量绑定问题
+- **资源名称扁平化映射**: 修改 `ShaderParamBag.cs`，在匹配不到直接参数名时，自动降级去匹配 Slang 编译器对 `ParameterBlock` 扁平化生成的 `Material_{name}_0` 和 `Material_{name}`，使得 C# 端材质对象（Textures/Samplers）无需关心底层的 Name Mangling 即可正确绑定。
+- **Dummy ConstantBuffer 静默验证**: 对于 `ParameterBlock` 中的标量属性所自动生成的 `Material_0` 常量缓冲区，在 `ClusterPipeline` 中引入了一个全局 256 字节 `_dummyMaterialBuffer`。在创建 SRB 时自动以 `AllowOverwrite` 绑定到 `Material_0`，并在析构时安全释放，完美消除了 Diligent Engine 关于该缓冲必须被绑定的报错。
+- **无需侵入式修改**: 成功保留了 Slang 相关的 `ParameterBlock` 声明语义与原结构体形式，全面满足用户关于声明方式的要求。
+
+## [2026-03-23] MeshAsset 接入 Manifest 资产管线
+- **自动 GUID + Meta**: `MeshAssetSerializer.Save()` 在保存时若 `AssetGuid` 为空则自动生成，并通过 `AssetMetaManager` 自动创建 `.mesh.asset.meta` 文件。
+- **后缀统一**: `Program.cs` 中 mesh 文件枚举模式和导入输出路径从 `.mesh` 统一为 `.mesh.asset`，使 `AssetManifestScanner` 的 `LooksLikeMeshPath` 能正确识别。
+- 现有 `IcoSphere.mesh` 重命名为 `IcoSphere.mesh.asset`。
+## [2026-03-22] 软光栅解除 Dispatch 上限与支持间接分发（Indirect Dispatch）
+- **动态派发消除闪烁**: 根除了 `ClusterSWRasterPass.cs` 中 `MaxClustersPerBin = 4096` 的硬编码上限。该限制曾导致高密度丛集环境下（如100lod0球）超额簇被意外截断从而产生严重的成块闪烁。
+- **软硬分箱隔离**: 在 `cluster_binning.slang` 借由 GroupShared Memory 对软硬件 `swCount`/`hwCount` 分别执行并行前缀和（Prefix Scan），精准获取各类几何专属的偏移量。
+- **突破 D3D11 尺寸限制**: 在分箱阶段统计全局 SW 总请求量并输出至 `BinnedSWDispatchArgs`，由于 `totalSW` 极易超出 65535，统一压平折算为 `DispatchX = min(totalSW, 65535), DispatchY = totalSW / 65535` 的二维按需派发大小空间。
+- **着色器维度解包**: 改造 `sw_raster.slang` 线性映射 `GroupID`，配合查表快速定位当前线程所属的 `binIdx`，保证 C# 侧彻底解耦，改用 `DispatchComputeIndirect` 高效流转渲染负载。
+
+## [2026-03-22] Slang 强类型重构 — 消除手动 Offset
+- `cluster_structures.slang`：新增 5 个 GPU 结构体（`DispatchArgs`、`DrawInstancedArgs`、`CullDrawArgs`、`BVHDispatchArgs`、`RasterBinEntry`），为 typed `Load<T>/Store<T>` 和 `RWStructuredBuffer<T>` 提供基础。
+- `cluster_cull.slang`：`CandidateCount`/`Phase2CandidateCount` → `RWStructuredBuffer<uint>`（支持 `InterlockedAdd(buf[0], ...)`）；`DrawArgs`/`Phase2DrawArgs`/`CandidateArgs` 保持 `RWByteAddressBuffer`（IndirectArgs 绑定要求 Raw），但使用 typed `Load<CullDrawArgs>(0)` / `Store<DispatchArgs>(0, ...)` 替代手动 `Load(4)/Store(8, ...)` 偏移。
+- `cluster_binning.slang`：`RasterBinMeta` → `RWStructuredBuffer<RasterBinEntry>`，通过 `InterlockedAdd(RasterBinMeta[binKey].BinSWCount, ...)` 替代 `InterlockedAdd(binKey*24+8, ...)`；`DrawArgs`/`ClusterReadOffsetArgs` 保持 Raw + typed `Load<CullDrawArgs>(0)`；`BinningDispatchArgs`/`BinnedDrawArgs`/`BinnedHWDrawArgs` 保持 Raw + typed `Store<DispatchArgs/DrawInstancedArgs>()`。
+- `cluster_bvh_traverse.slang`：`CandidateCount` → `RWStructuredBuffer<uint>`；`NextDispatchArgs`/`CurrentDispatchArgs` 保持 Raw + typed `Load/Store<BVHDispatchArgs>()`。
+- `cluster_draw.slang`：`VisibleClusterMeta` 保持 `ByteAddressBuffer` + typed `Load<CullDrawArgs>(0).SWCount`；增加 `#include "cluster_structures.slang"`。
+- `sw_raster.slang`：`RasterBinMeta` → `StructuredBuffer<RasterBinEntry>`，通过 `.ClusterOffset`/`.BinSWCount` 语义访问替代 `Load(addr+0/addr+8)`。
+- `cluster_shade_binning.slang`：`BinIndirectArgs.Store<DispatchArgs>(tid*12, ...)` 替代 3 行手动 Store。
+- C# 侧同步：`ClusterTraverseStage.cs`（CandidateCount）、`ClusterCullStage.cs`（Phase2CandidateCount）、`ClusterRasterBinStage.cs`（RasterBinMeta 24B stride）、`ClusterRenderFeature.cs`（CandidateCount/Phase2CandidateCount/RasterBinMeta/P2 全部 → `BufferMode.Structured`；RasterBinMeta Size 从 `MaxBins*16` 修正为 `MaxBins*24`）。
+- 编译测试通过（`ClusterCullCompilationTest` + `ClusterBinningCompilationTest`，0 errors）。
+
+## [2026-03-22] VRB + Material 溢出管线改造
+- **SW 微三角闪烁修复**: 调整 `sw_raster.slang` 中 `SetupTriangle` 的像素包围盒取整公式，去掉额外的 `-1` 偏移，并对像素级插值深度做 `saturate(depth)` 钳制。之前极小三角在屏幕边界附近会因为 bbox/深度量化抖动产生时序性破片闪烁。
+- **BVH / HiZ Readback 修复**: `ClusterDebugReadbackPass` 与 `ClusterBVHTraversePass` 的 staging readback 先前都是“本帧先 map 再 copy”，导致调试 UI 永远读到旧值或空值。现在统一改成读取上一次 copy 结果、随后拷贝本帧数据供下一帧消费；同时去掉了 `ClusterBVHTraversePass` 内已失效的 `_readbackOffset` 字段。
+- **HW Draw 接线起步**: `ClusterHiZStage.cs` 在 `UseSWRaster=true` 时不再是纯 SW 路径，而是同 phase 先跑 `ClusterSWDraw` 再追加一条 `ClusterDraw`（`UseHWDrawArgs=true`）消费 `BinnedHWDrawArgs`，两者共享同一 `VisBuffer`。目前 HW 仍写真实 `depthTarget`，SW 继续写 `RasterDepth`(`R32_UINT`)；这还不是最终统一深度方案，但已把 HW 调度骨架接上。
+- **Raster 输出扩展**: `ClusterRasterOutput` 新增 `RasterDepth`，用于在 hybrid 路径里让 SW phase2 复用 phase1 的 `DepthUAV`；`ClusterSWDrawStage.cs` 已支持复用已有 `VisBuffer/DepthUAV`。
+- **重新开启分类**: `cluster_cull.slang` 的 `ENABLE_SW_HW_SPLIT` 已重新打开；`sw_raster.slang` 读取 `RasterBinMeta` 的 bin count 偏移同步改为新的 24B layout（`BinSWCount` at +8）。
+- **Binning SRB 修复**: 修正 `ClusterBinningPass.cs` 中 `BindSRB(...)` 调用参数错位。`Count/Scatter` 漏传了 `dispatchArgs` 槽位的占位 `null`，导致 `MaterialSlotBuffer` 被错误绑定到 shader 的 `PageHeap` 位置、`PageHeap` 反而未绑定，运行时触发 Diligent 关于 structured/raw view 不匹配和缺失资源绑定的错误。
+- **SW/HW Binning 起步**: `cluster_binning.slang` 现支持同时读取 SW/HW 可见区间：`DrawArgs[4]` 作为 swCount、`DrawArgs[8]` 作为 hwCount，按 `ClusterReadOffsetArgs` 解码 Phase1/Phase2 的全局区间。SW 仍按 per-VRB-batch 拆 entry，HW 先按每 cluster 1 entry 进入同一 `BinnedClusterIndexBuffer`。
+- **RasterBinMeta 扩展**: per-bin 元数据从 16B 扩到 24B，现保存 `ClusterOffset / BinCapacity / BinSWCount / BinHWCount / SWCursor / HWCursor`，并在 `CSBinningReserve` 同时生成 `BinnedDrawArgs`（SW）与 `BinnedHWDrawArgs`（HW，StartInstance 指向 bin 内 HW 起始）。
+- **C# 管线结构同步**: `ClusterRasterBinOutput` 新增 `BinnedHWDrawArgs`；`ClusterRasterBinStage.cs` / `ClusterBinningPass.cs` / 旧 `ClusterRenderFeature.cs` helper 已同步资源创建与传递，便于下一步真正接通 HW draw 调度。
+- **测试**: 新增 `ClusterBinningCompilationTest`，当前与 `ClusterCullCompilationTest` / `SWRasterCompilationTest` / `WaveQueueCompilationTest` 共 4 项定向测试通过。
+- **Cull Debug**: 临时关闭 `cluster_cull.slang` 的 SW/HW split 分类（`ENABLE_SW_HW_SPLIT = 0`）。当前 binning/draw 仍只消费 SW 区间，分类开启会把大多数 cluster 写到 HW 尾部导致整帧无物体渲染；等第 3 步 SW/HW 双路径 binning 接通后再删掉该硬编码。
+- **GPUCluster.cs**: `Pad0` → `MaterialTableOffset`, `Pad1` → `VRBBatchInfo`，保持 64B 布局不变。
+- **ClusterBuilder.cs**: 删除贪心 O(n²) `ReorderForVRB` + degenerate padding。新增 `BuildVRBBatches` 线性扫描（ulong bitmask，unique>32 关 batch），输出 packed uint（5 batch tri-counts + batchCount）。重写 `EmitSplitMeshlet` 直接使用原始三角形顺序（保持 meshopt 空间局部性），调用 `BuildVRBBatches` 编码 `VRBBatchInfo`。
+- **cluster_structures.slang**: 新增 `VRBBatch` struct + `DecodeVRBBatchCount` / `DecodeVRBBatch` / `DecodeVRBTotalFastTris` / `DecodeTriangleCount` / `IsMaterialSlowPath` 解码函数。
+- **Binning 管线**: `BinnedClusterIndexBuffer` 从 `StructuredBuffer<uint>` → `StructuredBuffer<uint2>`（.x=visibleIndex, .y=rangeStart<<16|rangeEnd）。`cluster_binning.slang`、`sw_raster.slang`、`cluster_draw.slang`、`ClusterRenderFeature.cs`、`ClusterRasterBinStage.cs` 全部适配。
+- 编译 0 errors。ClusterBuilderTests 通过。SWRasterCompilationTest SPIR-V 通过。
+
+## [2026-03-21] 资产系统扁平 facade API 起步
+- 新增 `src/SomeEngine.Assets/AssetCatalog.cs`：落地 `AssetNode`、`IAssetCatalog`、`ManifestAssetCatalog`，把 manifest/source/dependency/referencer 装配成更扁平的编辑器查询视图。
+- 新增 `src/SomeEngine.Assets/AssetWorkspace.cs`：落地 `AssetProblem`、`AssetValidationReport`、`IAssetWorkspace`、`ManifestAssetWorkspace`，统一提供 `Validate()`、`PreDeleteCheck()`、`FindImpact()`、`RebuildIndex()` 四类上层入口。
+- 继续收敛入口：`IAssetWorkspace` 现同时继承 `IAssetResolver`，`ManifestAssetWorkspace` 直接支持 `Load<T>()` / `ListAssets<T>()`，上层可只拿一个 workspace 服务同时完成查询、校验、删除前检查与资产解析。
+- 调整 `src/SomeEngine.Assets/ManifestAssetResolver.cs`：抽出 `ManifestAssetSupport` 共享 manifest 解析逻辑，避免 resolver/workspace 各自复制一套 asset load/list 行为。
+- 继续完善 facade 数据模型：在 `src/SomeEngine.Assets/AssetGuid.cs` 新增 `AssetId` 作为上层正式资产 ID 别名；`AssetNode`/`AssetProblem` 改为面向 `AssetId`，并补充 `HasSource`、`HasAsset`、`HasRelatedAsset` 等便捷属性。
+- 扩展 `src/SomeEngine.Assets/AssetManifest.cs`：新增 `GetDependencyClosure()` 与 `GetReferencerClosure()`，为后续 impact 分析、递归删除检查、引用树 UI 提供统一底层图遍历能力。
+- 扩展 `src/SomeEngine.Assets/AssetCatalog.cs`：新增 `AssetCatalogExtensions.List<TAsset>()`，并保留 `TryGetPath(AssetGuid, ...)` 兼容重载，方便旧 resolver 路径逐步过渡。
+- `ManifestAssetWorkspace.FindImpact()` 现改为直接复用 manifest 的 referencer closure，而不再自己维护一套 BFS。
+- 新增 `src/SomeEngine.Assets/AssetAnalysisReports.cs`：落地 `AssetImpactReport`、`AssetDeleteReport`，作为更稳定的底层/上层通用分析结果对象，不依赖编辑器存在。
+- 继续增强底层索引能力：`AssetManifest` 新增 `TryGetAssetByPath()`、`TryGetSourceGuid()`、`GetTransitiveDependencies()`、`GetTransitiveReferencers()`；`IAssetCatalog` 新增 `TryGetId(assetPath, out AssetId)`。
+- `ManifestAssetWorkspace` 新增 `AnalyzeImpact()` 与 `AnalyzeDelete()`，把 direct/transitive 影响与删除阻塞者显式区分，后续 CLI / 调试输出 / UI 都可以直接复用。
+- 继续补齐一源多产物：`AssetManifest` 新增 `AssetsBySource`、`GetAssetsBySource()`、`GetAssetsBySourcePath()`、`TryGetAssetBySourceAndSubAssetKey()`；可直接通过 `(SourceGuid, sub_asset_key)` 做稳定反查。
+- `IAssetCatalog` / `ManifestAssetCatalog` 新增 source 维度查询：`TryGetSourcePath()`、`TryGetSourceGuid()`、`GetAssetsBySource()`、`GetAssetsBySourcePath()`。
+- `AssetAnalysisReports.cs` 新增 `SourceAssetsReport`；`ManifestAssetWorkspace` 新增 `AnalyzeSource(SourceGuid|string)`，把 source 对应的全部产物汇总为统一报告对象。
+- 继续补 workflow 真正需要的摘要：`AssetAnalysisReports.cs` 新增 `SourceImportSummary` 与 `AssetDeleteConsequenceReport`，前者汇总 importer / fingerprint / importerVersion / dependency 摘要，后者汇总删除目标的 dangling/orphan 风险。
+- `ManifestAssetWorkspace` 新增 `AnalyzeSourceImport(SourceGuid|string)` 与 `AnalyzeDeleteConsequences(AssetId)`；source 摘要当前优先从 `SourceMeta` + `AssetMeta` 读取，不依赖编辑器或额外工具层。
+- 继续精细化删除后果分析：`AssetDeleteConsequenceReport` 新增 `DirectDanglingRiskAssets`、`TransitiveDanglingRiskAssets`、`RemovalSet`、`HasDanglingRisk`、`HasOrphanRisk`，把“谁会立即断引用”和“谁在级联删除链上受影响”明确拆开。
+- `ManifestAssetWorkspace.AnalyzeDeleteConsequences()` 现会同时输出 direct/transitive dangling 集合、完整 removal set，以及 orphan risk 集合，便于后续 CLI / 调试流程进一步做 force delete 或风险确认。
+- 本轮继续补测试：新增 `AnalyzeSourceImport()` 的缺失 source 路径覆盖，以及 `AnalyzeDeleteConsequences()` 的 orphan risk 覆盖，避免当前分析逻辑只在正向 happy path 上有断言。
+- 扩展 `src/SomeEngine.Assets/AssetProjectValidator.cs`：新增 `ValidateFlat()`，把既有 `AssetValidationIssue` 映射为上层 facade 使用的 `AssetProblem`，保持旧校验 API 兼容。
+- 扩展 `tests/SomeEngine.Tests/Assets/AssetManifestTests.cs` 与 `tests/SomeEngine.Tests/Assets/AssetProjectValidatorTests.cs`：覆盖 catalog 节点投影视图、workspace 影响分析、workspace 直接解析资产、flat validation report 映射。
+- 新增 source→assets / sub-asset 反查测试覆盖；定向测试 `AssetManifestTests` + `AssetProjectValidatorTests` + `AssetResolverTests` 共 18 项全部通过。
+- 新增 source import 摘要与删除后果分析测试覆盖；定向测试 `AssetManifestTests` + `AssetProjectValidatorTests` + `AssetResolverTests` 共 19 项全部通过。
+- 当前定向测试 `AssetManifestTests` + `AssetProjectValidatorTests` + `AssetResolverTests` 共 21 项全部通过。
+
+## [2026-03-21] Manifest 基础设施与运行时 resolver 起步
+- 新增 `src/SomeEngine.Assets/AssetManifest.cs`：落地 `source_index.json`、`asset_index.json`、`dependency_graph.json` 三份 manifest 文件的 JSON 读写；补充 `AssetManifestRecord`，统一承载 `AssetGuid`、`SourceGuid`、`SubAssetKey`、路径与类型信息。
+- 新增 `src/SomeEngine.Assets/AssetManifestBuilder.cs`：提供最小 manifest 构建器，可登记 source、asset 与依赖关系，并自动去重 dependency graph，作为后续全量扫描 / 增量构建的装配入口。
+- 新增 `src/SomeEngine.Assets/ManifestAssetResolver.cs`：基于 manifest 实现 `IAssetResolver`，支持按 `AssetGuid` 加载 `ShaderAsset` / `MaterialAsset` / `MaterialInstanceAsset` / `MeshAsset`，并支持 `ListAssets<T>` 与 `TryGetPath`。
+- 新增 `tests/SomeEngine.Tests/Assets/AssetManifestTests.cs`：覆盖 manifest 三索引 roundtrip、`ManifestAssetResolver` 的 shader 加载与列表查询、以及 `AssetManifestBuilder` 依赖去重行为。
+- 定向测试 `AssetResolverTests` + `AssetManifestTests` 共 7 项全部通过。
+
+## [2026-03-21] Manifest 全量扫描生成器起步
+- 新增 `src/SomeEngine.Assets/AssetManifestScanner.cs`：支持全项目扫描 source `.meta` 与 `*.asset`，自动构建 `AssetManifest`，并可直接输出到 `Library/AssetManifest/`。
+- 扫描器当前可识别 `ShaderAsset`、`MaterialAsset`、`MaterialInstanceAsset`、`MeshAsset`，并自动提取 guid 依赖边：
+  - `MaterialAsset.PassEntry.shader_guid`
+  - `MaterialInstanceAsset.parent_guid`
+  - `MeshAsset.default_material_guids`
+- 新增 `tests/SomeEngine.Tests/Assets/AssetManifestScannerTests.cs`：覆盖 source/asset 扫描、依赖图生成，以及 `ScanAndSave()` 的 manifest 文件写出。
+- 通过 `dotnet test --filter "FullyQualifiedName~AssetManifestTests|FullyQualifiedName~AssetManifestScannerTests|FullyQualifiedName~MemoryAssetResolverTests|FullyQualifiedName~ResolverIntegrationTests"` 验证，9 项定向测试全部通过。
+
+## [2026-03-21] 项目校验器 / orphan / dangling 检测起步
+- 新增 `src/SomeEngine.Assets/AssetProjectValidator.cs`：基于 `AssetManifestScanner` 提供最小项目校验入口，当前可产出三类 issue：`OrphanSourceMeta`、`DanglingReference`、`OrphanAsset`。
+- 校验逻辑已覆盖：
+  - 源 `.meta` 存在但源文件缺失
+  - manifest 依赖图中的引用 guid 不存在
+  - 没有任何入边的资产（当前按设计先仅报告，不自动删除）
+- 新增 `tests/SomeEngine.Tests/Assets/AssetProjectValidatorTests.cs`：覆盖 orphan source meta、dangling shader guid、orphan asset，以及“被引用资产不应误报 orphan”的行为。
+- 通过 `dotnet test --filter "FullyQualifiedName~AssetProjectValidatorTests|FullyQualifiedName~AssetManifestScannerTests|FullyQualifiedName~AssetManifestTests"` 验证，7 项定向测试全部通过。
+
+## [2026-03-21] 反向引用图与 PreDeleteCheck 基础能力
+- 扩展 `src/SomeEngine.Assets/AssetManifest.cs`：在 manifest 构造阶段自动建立 reverse reference map，新增 `Referencers`、`GetReferencers(AssetGuid)` 与 `PreDeleteCheck(AssetGuid)`。
+- `PreDeleteCheck` 当前返回直接引用方列表，作为未来 `IAssetDatabase.PreDeleteCheck` 的最小底层实现。
+- 扩展 `tests/SomeEngine.Tests/Assets/AssetManifestTests.cs` 与 `tests/SomeEngine.Tests/Assets/AssetProjectValidatorTests.cs`：覆盖反向引用图构建与 `PreDeleteCheck` 行为。
+- 通过 `dotnet test --filter "FullyQualifiedName~AssetManifestTests|FullyQualifiedName~AssetProjectValidatorTests"` 验证，7 项定向测试全部通过。
+
+## [2026-03-21] 资产系统扁平 API 重构方向草案
+- 新增 `docs/design/asset_flat_api_direction_20260321.md`。
+- 说明了当前资产系统的实际进度、为何复杂感主要来自上层暴露面过多，而不是底层 identity 设计错误。
+- 提出保持底层 `source` / `asset` 分离，同时在上层新增 `AssetNode`、`IAssetCatalog`、`IAssetWorkspace` 等扁平 facade 的重构方向。
+
+## [2026-03-21] 资产标识阶段总结文件
+- 新增 `docs/design/asset_identity_and_source_tracking_session_summary_20260321.md`。
+- 汇总了本轮围绕 `asset_identity_and_source_tracking.md` 已完成的修改、尚未完成的修改，以及从阅读设计稿到逐步落地 `SlangShaderImporter` 依赖追踪的对话推进经历。
+
+## [2026-03-21] WaveQueue — Wave-Level 泛型任务分发
+- 新建 `assets/Shaders/wave_queue.slang`：`IWaveTask` 接口（`[mutating] GetTaskCount()` / `[mutating] ExecuteTask(srcLane, localIdx)`）+ `WaveQueue::Distribute<T>` 静态泛型分发器。纯 wave intrinsics（`WavePrefixSum`/`WaveActiveBitOr`/`countbits`/`WaveReadLaneAt`），零 LDS/barrier，boundary bitmask O(1) producer 查找。
+- 新建 `tests/SomeEngine.Tests/WaveQueueCompilationTest.cs`：内联 Slang source 实现 trivial `IWaveTask`，通过 `SlangShaderImporter.Import()` 验证编译。SPIR-V 编译通过，DXIL 跳过（测试环境无 DXC）。
+
+## [2026-03-21] SW Raster — 软光栅化 Compute Shader
+- 新建 `assets/Shaders/sw_raster.slang`（~320 行）：采用 Nanite `VERT_REUSE_BATCH` 模式，32 threads/group，零 LDS。
+  - **Stage 1**: `DeduplicateVertIndexes` 通过 `WaveActiveBitOr`/`FindNthSetBit`/`MaskedBitCount` wave 去重顶点，只变换唯一顶点，`WaveReadLaneAt` 广播 clip-space 位置。
+  - **Stage 2**: `SetupTriangle` 8-bit 子像素边方程 + top-left fill rule（匹配 Nanite `NaniteRasterizer.ush`）。
+  - **Stage 3**: `PixelRasterTask : IWaveTask` + `WaveQueue::Distribute` 像素分发，InterlockedMax 原子深度测试 + VisBuffer 写入。
+- 新建 `tests/SomeEngine.Tests/SWRasterCompilationTest.cs`：SPIR-V 编译通过。
+- 新建 `src/SomeEngine.Render/Pipelines/ClusterRender/ClusterSWRasterPass.cs`：compute PSO（static 缓存）+SRB pool，绑定 VisBuffer/DepthUAV 为 UAV，DispatchCompute(MaxClustersPerBin × MaxBins)。
+- 新建 `src/SomeEngine.Render/Pipelines/ClusterRender/Stages/ClusterSWDrawStage.cs`：无状态 Stage，创建 VisBuffer + DepthUAV (R32_UINT) 纹理、ClearRenderTarget、上传 SWRasterUniforms、调度 ClusterSWRasterPass。返回 `ClusterRasterOutput` 与 HW draw 接口一致。
+- 修改 `ClusterHiZStage.cs`：`HiZConfig.UseSWRaster` 开关，Phase1/Phase2 draw 分支路由到 `ClusterSWDraw.AddPasses` 或 `ClusterDraw.AddPasses`。
+- 修改 `ClusterPipeline.cs`：新增 `UseSWRaster` 属性，传入 `HiZConfig`（含 `QuantStep`/`QuantOrigin`）。
+- `ClusterBuilder.cs`：新增 VRB 断言（每 32 三角形窗口顶点跨度 <64）。
+
+## [2026-03-20] 资产GUID最小闭环（Phase 0 + 1 + 2 起步）
+- 新增 `AssetGuid`、`SourceGuid`、`AssetRef<T>`、`IAssetRecord`、`IImportedAsset`、`IShaderAssetRecord` 与 `ImportTraceData`，作为资产标识与导入追踪基础类型。
+- 新增 `SourceMetaManager` / `AssetMetaManager`，支持源文件 `.meta` 与 `.asset.meta` 的最小读写闭环。
+- 扩展 `shader_asset.fbs`：新增 `asset_guid`、`ImportTrace`、`DependencyEntry`；扩展 `material_asset.fbs`：新增 `asset_guid` 与 `PassEntry.shader_guid`，保留旧字符串字段兼容。
+- 改造 `SlangShaderImporter`：旧 `Import(path)` 继续可用，内部自动创建/读取 `.meta`、计算主文件 fingerprint、复用已有 `AssetGuid`、写出 `ImportTrace` 与 `.asset.meta`。
+- 改造 `Material` / `MaterialPass` / `MaterialRegistry` / `MaterialAssetLoader`：新增 `Material.AssetGuid`、`ShaderRef`、`ResolvedShader`，`ComputeSignature()` 优先使用 GUID，`MaterialRegistry` 支持按 `AssetGuid` 查找，loader 支持 `shader_guid` 优先、字符串回退。
+- 扩展 `material_instance_asset.fbs` 与 `mesh_asset.fbs`：新增 `asset_guid`、`parent_guid`、`default_material_guids`；`MaterialInstanceLoader` 新增按父材质 GUID 解析入口，`MeshMaterialResolver` 支持 material guid 优先、旧字符串槽位回退。
+- 新增 `IAssetResolver`、`AssetEntry` 与 `MemoryAssetResolver`，并为 `ShaderAsset` / `MaterialAsset` / `MaterialInstanceAsset` / `MeshAsset` 生成类型补充 `IAssetRecord` 实现；`Material` 也实现 `IAssetRecord`，可被统一注册到内存 resolver。
+- `MaterialAssetLoader` / `MaterialInstanceLoader` / `MeshMaterialResolver` 新增可选 `IAssetResolver` 入口，GUID 解析不再只能依赖零散委托。
+- 新增测试覆盖：shader 导入 GUID 稳定性、material loader 的 guid 优先 / legacy name 回退、material instantiate 保留 guid/ref、registry 按 guid 查询。
+- 新增测试覆盖：`MaterialInstanceAsset` 新字段 roundtrip、按 `ParentGuid` 解析实例父材质、`MeshMaterialResolver` 的 GUID 优先与 legacy fallback；相关定向测试全部通过。
+- 新增测试覆盖：`MemoryAssetResolver` 的 register/load/list/path 行为，以及通过 resolver 加载 material、material instance、mesh 默认材质的集成路径；定向测试通过。
+- `SlangShaderImporter` 继续按设计稿推进：重导入前优先使用历史 `Dependencies` 重新计算 fingerprint 做快速跳过；真正编译后改为从 `IModule.GetDependencyFileCount/GetDependencyFilePath` 提取精确依赖列表，覆盖 `#include` / `import` 的实际解析结果，并写回 `ImportTrace` 与 `.asset.meta`。
+- 新增 include 依赖跟踪测试：公共 include 文件变更会导致 `ContentFingerprint` 更新，同时 `AssetGuid` 保持稳定。
+- 相关定向测试通过；仍存在一个旧的 `SlangIntegrationTests.TestSlangCompilation` 失败，原因是本机缺少 DXC，当前只生成到 2 个 SPIR-V 变体，不属于本轮改动引入。
+
+## [2026-03-20] 资产标识与源文件追踪设计草案
+- 新增 `docs/design/asset_identity_and_source_tracking.md`，整理 `AssetGuid` / `SourceGuid` / `AssetRef<T>` 的分层语义。
+- 明确 `ShaderAsset` 应保存 `SourceGuid + SourcePath + Hash + ImporterVersion` 作为导入来源追踪，而 `Material` 等正式资产只依赖 `AssetGuid`。
+- 给出 schema 调整方向、`.meta` 与 manifest 职责划分，以及一版最小 C# 参考实现草案。
+
+## [2026-03-20] Phase 5: 材质资产打包与解析流程强化
+- **FlatBuffer Schema**: 新增 `common_types.fbs`（ParamValue union: float/int/bool/Vec2/Vec3/Vec4），`material_asset.fbs` 新增 ScalarParam，`material_instance_asset.fbs` 新增 ScalarOverride + TagOverride。FlatSharp 通过 `include` + `IncludePath` 机制引用共享类型。
+- **ShaderParamBag**: 新增 `SetScalar`/`GetScalar` 支持标量参数存储（float, int, Vector4）。
+- **TagStore**: 新增 `CopyAllTags(from, to)` 和 `RemoveAllTags(item)` 方法。
+- **MaterialAssetLoader**: 新增 `ApplyScalarParam` 方法，从 FlatBuffer 解析标量参数到 ShaderParamBag。
+- **MaterialInstanceLoader**: 重写为通用 `CopyAllTags` 替代硬编码的 6 个 tag 复制，新增 scalar/tag override 支持。
+- **MeshMaterialResolver**: 新增静态类，消费 `MeshAsset.default_material_slots` → `MaterialPass?[]`。
+- 14 个测试全部通过。
+- **Runtime 接入**: `Program.cs` 中 PBR/Unlit 材质创建改为 `MaterialAssetLoader.LoadFromAsset()`，通过 `MaterialAsset` 对象描述 shader 名称、纹理绑定、tags，走完整加载管线。提供 `LoadTexture` / `LoadShader` 回调复用现有 Diligent 纹理和 SlangShaderImporter。
+
+## [2026-03-20] 材质 Mock 从管线层提取到应用层
+- `ClusterMaterials.RegisterDefaults` 删除（创建 mat0、PSO、默认纹理、Sampler）。`ClusterMaterials` 仅保留 `SetupDefaultSlots` 和 `CreateDefault1x1Texture` 两个静态工具方法。
+- `ClusterPipeline` 删除 `_defaultShadePSO`、`_defaultTextures`、`_defaultSampler`、`SetupMaterialWithDefaults`。`FindOrCreatePSO` 不再有 `shader == null` 的 fallback 分支（要求所有 MaterialPass 必须有 ShaderAsset）。
+- `Program.cs` 显式创建默认纹理 + Sampler、PBR 材质、Unlit 材质，分别注册 + 打标签 + 分配 BinSpace slots。
+
+## [2026-03-20] 材质全变 Unlit 的真正根因剖析与修复
+- 现象：即使 PSO 分组正确且 `FindOrCreatePSO` 工作正常，所有球体仍然全部显示为 Unlit 材质。
+- 根因：`Program.cs` 在加载网格为其分配默认材质时，错误地请求了名为 `"Default"` 的材质，但 `ClusterMaterials.RegisterDefaults` 注册的名称是 `"DefaultPBR"`。这导致 `mat0` 查找失败，返回空 pass 列表。
+- 连锁反应：空 pass 列表传递给 `BinSpace.AllocateSlots` 会“分配”长度为 0 的块（假设返回 `offset = 0`）。之后 `mat1` 也被分配（返回 `offset = 0`），并正确地写入了它的 BinIndex（1，也就是 Unlit Bin）。由于 `defaultSlotOffset` 和 `mat1SlotOffset` 都指向 0，它们在着色时读取了相同的 Slot 数据，**导致所有球体都读取到 BinIndex = 1，并因此被派发给 Unlit Shader 进行求值**！
+- 修复 1：将 `Program.cs` 中请求的默认材质名字修正为 `"DefaultPBR"`。
+- 修复 2（隐含的安全漏洞）：发现在 `cluster_shade_material.slang` 和 `cluster_shade_unlit.slang` 中，基于 ThreadID (`tid.x`) 的 Dispatch **完全没有进行 Bounds Check（越界检查）**。这会导致 Dispatch 中多余的线程（为了凑够 64 的整数倍）去错误地着色相邻 Bin 里的像素（或者内存垃圾）。
+  - 为此，将 `BinCounts` Buffer 引入了 `ClusterMaterialShadePass`、`ClusterShadePipelineParams` 并在着色器代码中补上了 `if (tid.x >= BinCounts[Uniforms.ShadingBin]) return;`。这彻底避免了相邻材质之间的越界覆盖问题。
+
+- `ClusterPipeline.FindOrCreatePSO` 此前始终返回 `_defaultShadePSO`（硬编码），导致即使材质携带不同的 `ShaderAsset`，实际 Dispatch 时仍使用默认 PBR 着色器。
+- 修改为：当 Shader 不为 null 时，使用 `shader.CreateShader(_context, "CSMaterialShade")` 编译真正的 Compute Shader 并创建独立的 PSO；抽取了共享的 `ShadePSOLayout` 静态字段。
+- 修复后，BinSpace 中不同 ShaderAsset 的材质将各自拥有独立的 PSO，Dispatch 时执行对应的着色逻辑。
+
+## [2026-03-20] Unlit Shading Model (第二个材质)
+- 为 `mat1` 编写并分配了一个自定义的 Shader：`cluster_shade_unlit.slang`，复用管线数据布局，但剥离了法线贴图和 PBR 光照，实现了直观的无光泽基础色 (Unlit) 渲染。
+- `Program.cs` 在加载时动态提取并应用该全新着色器资产，并在小球阵列中混合使用 PBR 和 Unlit。这直观展示了基于 ShaderAsset 的不同着色管线的运行时无缝集成能力。
+
+## [2026-03-20] 第二个材质集成与验证
+- 验证并通过了 Cluster Pipeline 对多材质的支持：在 `Program.cs` 运行时通过 `BinSpace.AllocateSlots(mat1.Passes)` 将新创建的 `mat1` 材质成功注入。
+- 在网格实体创建循环中，为不同索引的 Sphere 实例关联了不同的 `MaterialSlotOffset`（`mat1SlotOffset` 和 `defaultSlotOffset`），验证了通过材质管线添加并使用第二个材质的完整工作流。
+
+## [2026-03-20] Shade Pass PSOGroup 重构
+- 新建 `ShadePSOGroup` struct（PSO + SRBs + Passes + BinStart/BinCount），Feature 持有。
+- `BinQueue.Rebuild()` 按 ShaderAsset 排序，保证同 shader bins 连续。
+- `ClusterMaterialShadePass.Execute()` 改为分组 dispatch：外层循环 PSOGroup（set PSO），内层循环 bins（commit SRB + dispatch），消除 per-bin PSO 比较。
+- `MaterialPass` 移除 `SRB` 属性和 `CommitBindings()` 方法，SRB 归 Feature 管理。
+- `ClusterPipeline` 新增 `RebuildShadePSOGroups()`：从 BinSpace 扫描 bins，break-on-change 分组，flat list PSO 缓存（引用比较），per-bin SRB 创建 + 材质参数绑定。
+- 移除 `CreateSRBForMaterial()` 公开 API，SRB 生命周期完全内聚。
+- 编译 0 错误，46 个材质相关测试全通过。
+
+## [2026-03-19] ShaderAsset 元数据扩展与材质管线集成 (Phase A + C)
+- **ShaderAsset 元数据抽取**：升级 Slang 编译器至 v2026.4.2，利用全新的 module reflection 在 `SlangShaderImporter` 中提取基于 `[PipelineTag("xxx")]` 的 user-defined attributes，同时自动抽取 `ParameterBlock<T>` 中定义的资源作为 `ShaderMaterialBinding`，完全解耦底层反射与高层材质绑定硬编码逻辑。
+- **自动 Tag 推导与签名**：在 `MaterialRegistry.Register` 中，从 `ShaderAsset.Metadata.PipelineTags` 自动为材质通道推导并注册如 `OpaqueTag` 等兼容性 Tag；更新 `BinQueue` 处的特征签名函数 `ComputeSignature`，将其由仅计算 Params 改为 `ShaderAsset Hash ^ Params Hash`，实现按着色器资产维度的精确渲染状态装箱 (Binning)。
+- **资产层小修与默认槽位集成**：扩展 `MaterialAssetLoader` 以支持多 pass 独立 ShaderAsset 的加载；在 Runtime `Program.cs` 层，为 `MeshAsset` 及其 `default_material_slots` 集成了 `BinSpace.AllocateSlots`，通过提取并将 `MaterialSlotOffset` 挂接到 `MeshInstance`，完成了实例化网格与多材质状态的正确映射。
+
+## [2026-03-19] ClusterPipeline 瘦身重构（498→299 行）
+- `RenderGraph` 新增非泛型 `AddPass(name, setup, execute)` 重载 + `LambdaRenderGraphPass`。
+- 新增 `ClusterCameraData` record 打包相机参数（View/Proj/Pos/LOD/Screen/PrevHistory）。
+- 新增 `ClusterMaterials` 静态类，从 `ClusterRenderFeature` 提取材质注册/默认纹理/PSO 创建，断绝依赖。
+- `ClusterTraverse.AddPasses` 重构：内化 CullingUniforms 构建和上传，接受 `ClusterCameraData`（8 参数），输出 `CullingUniforms` handle。
+- 新增 `ClusterHiZ.Add2PhasePipeline` 静态 Stage：封装 HiZ PingPong + Cull + RasterBin + Draw + HiZ Build 全部 2-phase 编排。
+- `ClusterPipeline.cs` 重写：`AddPasses` 方法体 ~60 行纯 Stage 组装，Camera 状态用 `ClusterCameraData`，`FreezeCullingCamera` 直接存快照。
+- 新增 `TestAddPassNonGeneric` 单元测试。
+
+## [2026-03-18] ClusterPipeline 功能拆分瘦身（615→519 行）
+- `BinSpaceExtensions.AddUploadPass` 扩展方法：MaterialSlotBuffer 上传逻辑从 Pipeline 移至 Pipelines 层扩展方法，BinSpace (Materials) 不依赖 RenderGraph。
+- `CullingUniforms.Create` 工厂方法：30 行字段填充移入 struct 自身，Pipeline 只需一行调用。
+- `ClusterShade` facade：合并 `ClusterShadeBinStage` + `ClusterShadeStage` 为统一入口，Pipeline 不再知道 ShadeBin+MaterialShade 两步过程。
+- `ClusterDebugReadbackPass.AddPasses`：buffer 创建 + handle wiring 封装入 pass 内部。
+- `AddDynamicUniformPass<T>` helper：CullingUniforms/DrawUniforms buffer 创建+upload 泛化为一行调用。
+
 ## [2026-03-15] Cluster Draw Meta Handle 修复
 - 保持现有新架构与 Draw metadata 设计不变，为 `ClusterDrawConfig` 增加 `VisibleClusterMeta` 显式传递入口，避免 `ClusterDrawStage` 私有 zero-buffer 截断后续 phase/deform/shade 依赖的 draw meta 协议。
 - `ClusterPipeline` 现显式把 `traverse.ZeroOffsetBuffer` 传给 Phase1 / Phase2 / Transparent Draw stage，回退路径仍保留本地 0 偏移缓冲，避免 draw request 膨胀。
@@ -113,12 +356,14 @@
 - Updated `ClusterCullPass`, `ClusterDrawPass`, `ClusterPipeline`, `TriangleRenderPass` and dependent test environments.
 
 ## [2026-02-28] Render Pass Fine-Grained Refactoring
+- **栅格化切换算法优化**：重构了 `ShouldUseSWRaster` 方法，通过从 `BuildScreenBoundsAndNearDepth` 预计算的屏幕空间 AABB 信息中提取当前 instance 对应的像素面积信息，准确决定是进入软光栅（微小三角形）还是硬件光栅（常规三角形），避免了之前的重复计算，显著提高了算法精度和运行性能。
+- **资产重构**：重构了导入和构建流程，将原有生成的 `.slang.asset` 和 `.mat.asset` 分别更改为更加明确清晰的 `.shader.asset` 与 `.material.asset`！同时去除了所有原先累赘的 `.asset.meta` 双重后缀，直接映射为 `.shader.meta` 等简洁统一的 `.meta` 格式（符合资产与元数据的分离规范），更新了所有的 Scanner 以及 Test 验证框架。
 - Refactored `HiZBuildPass` and `ClusterDebugPass` into multiple fine-grained passes to eliminate manual resource state transitions.
 - Implemented `HiZMip0Pass` and `HiZDownsamplePass` for iterative HiZ pyramid construction.
 - Implemented `ClusterDebugBVHPass`, `ClusterDebugSphereCopyPass`, and `ClusterDebugSphereDrawPass`.
 - Updated `ClusterBVHTraversePass` to support granular setup and execute methods for different traversal stages.
 - Moved `ClusterBVHReadbackPass` to the end of the BVH traversal sequence to correctly handle transient readback buffers.
-- Replaced all occurrences of `ResourceStateTransitionMode.Transition` and `ResourceStateTransitionMode.None` with `Verify` in all Pass Execute methods, delegating all barrier management to the `RenderGraph`.
+- Replaced all occurrences of `ResourceStateTransitionMode.Transition` and `ResourceStateTransitionMode.None` with `Verify` delegating all barrier management to the `RenderGraph`.
 - Temporarily disabled HiZ logic in `ClusterPipeline` to address rendering issues (triangles missing).
 - Fixed `ImGui Font Texture` and `SimpleMesh` buffer initialization states by adding explicit transitions in `Init` methods.
 - Refactored `ClusterClearBuffersPass` and `ClusterBVHClearArgsPass` for discrete clear operations.
@@ -312,3 +557,127 @@
 - **PSO 缓存策略**：bin key = PSO 索引。Stage 维护扁平数组 `_psoByBin[binKey]`，Dictionary 仅在低频 `RebuildDispatchTable` 中做 ShaderAsset 去重，热路径零 hash 开销。
 - **Pull 模型**：去除 `OnMaterialRegistered` 回调。兼容性 Tag 由 `MaterialRegistry.Register()` 根据 ShaderAsset 元数据自动打标；bin key 和 PSO 由 Stage 在 Setup 阶段 Pull 查询后按需构建。
 - **底部对照表修正**：`ShaderAsset` 标记为已有类，去除过时的 `ModulePath + StructName` 描述。
+
+## [2026-03-18] 材质系统 Phase 2+3 直接替换 + 资产链路
+- **Phase 2**：删除 `MaterialBase`/`MaterialShaderType`/`StandardPBRMaterial`/`PBRParams`，新建 `ShaderParamBag`/`MaterialPass`/`Material`/`TagStore`/`BinQueue`。重写 `MaterialRegistry`/`MaterialTag`/`ClusterMaterialShadePass`。适配 `ClusterRenderFeature`/`ClusterShadeStage`/`ClusterPipeline`/`MaterialBindingGenerator`/`Runtime Program`。
+- **Phase 3**：新增 `.mat`/`.matinst` FlatBuffer schema + Serializer/Loader。`mesh_asset.fbs` 添加 `default_material_slots`。新建 `MaterialSlot`/`MaterialSlotBuffer`/`MaterialTagAttribute` + 源生成器。
+- 编译 0 错误，26 个 Material 单元测试全通过，Runtime 渲染不变。
+
+## [2026-03-18] 材质系统 Phase 4 GPU 路径改造
+- `GpuInstanceHeader.MaterialID` / `MeshInstance.MaterialID` → `MaterialSlotOffset`（C# + Slang）。
+- Slang 新增 `MaterialSlot` struct（PackedBins/PackedExtra 各 uint）+ decode helpers（`GetShadingBin`/`GetRasterBin`/`GetShadowBin`）。
+- `cluster_shade_binning.slang`：Count/Scatter 3 个 pass 绑定 `MaterialSlotBuffer`，bin key 改为 `MaterialSlotBuffer[slotOffset].ShadingBin` 间接查找。
+- `cluster_shade_material.slang`：`ShadeUniforms.MaterialID` → `ShadingBin`，dispatch 按 binKey 索引。
+- CPU 端：`ClusterRenderFeature` 创建 Dynamic StructuredBuffer + mock 上传 pass（`ShadingBin = pass.MaterialID`）；`ClusterShadeBinCountPass`/`ScatterPass` 添加 `HMaterialSlotBuffer` SRB 绑定。
+- `ClusterMaterialShadePass` dispatch 改用 `uniformData.ShadingBin`。`ClusterShadeStage` / `Program.cs` 适配。
+- 编译 0 错误，26 个 Material 单元测试全通过。
+
+## [2026-03-18] 材质系统多 Pass / Overlay 支持 + Slot 共享缓存
+- `MultiPassTag` 添加 `OverlayCount` 字段，`OverlayTag` 添加 `LayerIndex` + `PrimaryPass` 引用。两者均为自动推导不序列化。
+- `MaterialRegistry.Register()` 自动推导：多 pass Material 的 primary pass 打 `MultiPassTag`，后续 pass 打 `OverlayTag`。
+- 新建 `OverlayMapping.cs`：静态工具类，从 OverlayTag 查询 + BinQueue 映射构建排序后的 `OverlayEntry` 列表，供 Feature dispatch 时遍历。
+- 新建 `MaterialSlotCache.cs`：hash + refcount 共享缓存，相同 pass 组合的 instance 共享同一段 `MaterialSlotBuffer` 区间。
+- `Material.AddPass()` 方法：支持运行时追加 overlay pass。
+- 编译 0 错误，37 个 Material 单元测试全通过（新增 11 个）。
+
+## [2026-03-18] BinSpace 重构 — 动态字段 SlotBuffer + 统一入口
+- 删除 `MaterialSlot.cs` 固定 struct。
+- `MaterialSlotBuffer.cs` 重写为 `ushort[]` + 动态 stride，通用 `SetField`/`GetField` 替代具名方法。
+- `MaterialSlotCache.cs` 重写：存储 `MaterialPass[]` 列表，新增 `RebuildField(fieldIndex, binQueue)` 支持 bin rebuild 后 patch。
+- 新建 `BinSpace.cs`：统一入口，内部持有多 BinQueue（per-field）、SlotBuffer、SlotCache。纯 CPU 数据层，不管 GPU dispatch。
+- 适配 `ClusterRenderFeature.cs` / `ClusterPipeline.cs`：GPU 上传从 `MaterialSlot[]` 改为 `ushort[]`。
+- 新增 BinSpace + RebuildField 测试。编译 0 错误，全部测试通过。
+
+## [2026-03-18] GPU 侧 MaterialSlot → SOA SlotBuffer
+- 删除 GPU `MaterialSlot` struct 和 `GetShadingBin/GetRasterBin/GetShadowBin` helpers。
+- 新增通用 SOA 访问函数 `GetSlotField(slotBuffer, slotOffset, fieldIndex, slotCapacity)`。
+- `MaterialSlotBuffer.cs` 改为 SOA 布局（`_data[fieldIndex * capacity + slotOffset]`），capacity 保证偶数，扩容逐段搬运。
+- GPU `StructuredBuffer<MaterialSlot>` → `StructuredBuffer<uint>`，shade/raster binning 均通过 SOA 读。
+- 删除 `GpuInstanceHeader.RasterBinKey`，raster binning 改为从 SlotBuffer 读。
+- `ShadeBinUniforms` 增加 `SlotCapacity`/`ShadingBinFieldIndex`；`BinningUniforms` 增加 `SlotCapacity`/`RasterBinFieldIndex`。
+- `ClusterBinningScatterPass` 新增 `HMaterialSlotBuffer` 绑定。
+- 编译 0 错误，全部测试通过。
+
+## [2026-03-18] BinSpace 接入渲染管线，移除 Mock Upload
+- 将全局 `BinSpace` 实例作为属性集成到 `MaterialRegistry` (`Bins`)，并管理生命周期。
+- 新增 `MaterialRegistry.FreezeBinLayout()`。在被调用时或之后的 `Register` 操作中，自动为 `MaterialPass` 分配真实的 `SlotOffset`。
+- 修改 `MaterialPass` 和 `Material`，增加 `SlotOffset` 供 `MeshInstance` 组件使用（替代原有的 MaterialID 假映射）。
+- 升级 `ClusterUploadConfig` 和 `BinningUniforms`，补充 `SlotCapacity` 和 `RasterBinFieldIndex`，修复了 Raster Binning 期间因缺少 SOA 配置导致 offset 错乱。
+- 在 `ClusterPipeline.Initialize` 中统一注册 `"RasterBin"` 和 `"ShadingBin"` 字段，并冻结 BinSpace。
+- 在 `ClusterPipeline.AddPasses` 中移除了遍历 registry 生成 `MaterialSlotBuffer` mock 数据的逻辑，改为调用 `_registry.Bins.RebuildIfDirty()` 获取真实的 `GetData()` 数组成果并上传到 GPU。
+- 编译通过且 43 个涉及 Material 相关的核心单元测试维持全数绿灯。
+
+## [2026-03] Cluster 多材质支持 (Phase B)
+- `GPUCluster` 结构体扩容至 64 字节，新增 `PackedMaterials` (支持最多3种材质的 ID) 和 `PackedRanges` (支持2个分界点)。
+- `ClusterBuilder` 重构 `Process` 逻辑，合并输入 mesh 的 primitives 并生成内部的 `_MATERIAL_INDEX` 属性。
+- `Clusterize` 内部按材质对三角形进行排序，强制拆分材质数量超过 3 种的 cluster。
+- 增加 HLSL `GetLocalMaterialIndex` 方法，通过 `triIdx` 从 `PackedRanges` 解码材质 ID。
+- `ClusterShadeBinCountPass` / `ClusterShadeBinScatterPass` 结合 `ClusterBuffer` / `HPageHeap` 使用 `GetLocalMaterialIndex` 确定材质 Bin。
+- `Program.cs` / AssetLoader 模型加载时正确使用 `DefaultMaterialSlots` 构建 MaterialSlotBuffer。
+- 修复并更新单元测试，全数绿灯（排除原有的 5 个环境与无关报错）。
+
+## Phase 5: Final Optimization and Polish
+- **全局 PSO Cache**: 实现了 `GlobalPsoCache` 根据 `ShaderAsset` 字典与状态参数生成哈希缓存 Compute PSO，并移除了 ClusterPipeline 和 RenderFeature 中冗余的死代码和自身 _psoCache。
+- **动态 Bin 数**: 去除了 `ClusterLimits.MaxBins` (16) 限制。管线的 BinnedDrawArgs 和 Meta 等预分配内存现在全数由 `BinSpace` 生成的准确 `TotalBinCount` 作为参数去构造，实现了显存占用的随需扩展与上限解除。
+- **MaterialSlotBuffer 增量 Patch**: 依靠 CPU 内部的 DirtyTracker 对象针对修改动作精确圈出最小操作范围。结合 Diligent Engine 的 UpdateBuffer 和 RenderGraph，彻底屏蔽了 MaterialSlotCache 对没发生改变的项引起的反复重建；现由脏范围直接推算出字节偏移做局部更新。
+
+## [2026-03-23] 优化软硬件光栅化切换算法
+- 废弃了 `EstimateScreenArea` 中使用 `LODCenter` 及其投影面积的粗略计算逻辑。
+- 提取并复用 `BuildScreenBoundsAndNearDepth`，使软硬件光栅化路径切换的预估与剔除操作相统一，完全建立在对 Cluster 高精度紧凑空间几何包围盒投影的计算上。
+- 在 Shader 侧增加和应用了通过精确屏幕像素长宽求得的 2D 包围盒面积阈值（2000 px²），大幅消除原先因包围球体积高估导致的判断失准。
+- 修正了 C# 端向 RenderGraph 提供 CullingUniforms 时发生的成员越界截断问题，并正确补充了主框架传递下来的屏幕尺寸属性。
+
+## [2026-03-24] 材质 Shader 泛型重构与运行时资产集成
+- **Slang 泛型着色管线**: 抽离核心的 cluster shading 逻辑至全新的 `cluster_shade_pipeline.slang`。利用 `CSShade<TMaterial : ISurfaceEvaluate>` 泛型函数将光照计算、调试可视化、PixelContext 重构与具体材质属性解耦。
+- **PBR 与 Unlit 材质打通**: 
+  - `standard_pbr.slang` 实现完整 `ISurfaceEvaluate`，内部按需绑定 `Texture2D` (`AlbedoMap`, `NormalMap`, `ARMMap`) 和 `MaterialSampler`，取代了之前的硬编码固定色。 
+  - `cluster_shade_unlit.slang` 与 `cluster_shade_material.slang` 均改写为简单的入口声明，调用统一泛型流水线。
+- **实例访问规范化**: 将 `getInstancePropertyFloat4` 以及 Instance 数据相关的 Buffer 集中到 `cluster_common.slang` 中，以解决在分离不同 Material 特化模块时的声明缺失及重复声明冲突。
+- **资产序列化测试**: 添加 `MaterialCreationTests.cs` 通过 FlatSharp 正确生成真实的 `ShaderAsset` (`.slang.asset`) 和 `MaterialAsset` (`.mat.asset`) 以持久化到文件系统，为 `ManifestAssetScanner` 扫描出真实的 GUID 提供数据源。
+- **运行时 Manifest 接入**: 移除 `Program.cs` 中的 Mock API 注册流程（原先直接通过代码注册 PBR/Unlit Defaults）。改为调用 `AssetManifestScanner.ScanAndSave` 构建本地缓存后实例化 `ManifestAssetDatabase`，并配合 `MaterialAssetLoader.LoadFromAsset` 使用真实 GUID/Name 在运行时动态抽取和装配管线资源。
+- 修复了 `ManifestAssetDatabase` 的保护可见性问题，利用标准 `assetDb.List()` 扁平索引接口查阅并注册材质。
+
+## [2026-03-24] 文档整理
+- 按领域重组 docs/：core/ rendering/ materials/ assets/ rhi/ future/ archive/
+- 归档 18 份旧版/被替代文档到 archive/
+- 新增合并文档：render_graph.md, cluster_pipeline.md, rasterization.md, shading_pipeline.md
+- 新增 README.md 文档索引
+- 更新 project_structure.md 反映实际代码结构
+- 新增 rendering/degradation_strategies.md：SW/HW 深度降级、Tess 架构（Nanite 风格 + HW DrawInstancedIndirect）、DeformCache/Inline、动画 BVH、Binning 耦合、SlotBuffer 3-field 设计
+
+## [2026-03-25] DeformCache 预变形缓存接入
+- **Shader 层**：
+  - `vertex_evaluate.slang`：`IVertexEvaluate` 接口新增 `getCacheStride()`/`writeCache()`/`readCache()` 三个 cache 序列化方法（half3 packed = 8B/顶点），`VertexFetchArgs` 新增 `visibleClusterIndex` 字段，新增 `CachedSource<TVE : IVertexEvaluate>` 泛型结构体实现 `IVertexSource`（从 DeformCache + 单独的 CacheOffsets 寻址 buffer 读取）。
+  - `cluster_deform.slang`（新建）：DeformCS kernel，32 threads/group = 1 cluster。Lane 0 通过 `CacheAllocCounter` 原子分配 cache 空间写入 `CacheOffsets[visibleIdx]`，所有 lane 执行 `evaluate()` → `writeCache()` 写压缩数据。入口：`CSDeformStatic`/`CSDeformWave`。
+  - `sw_raster.slang`：新增 `CSSWRasterCached` 入口点 + `DeformCache`/`CacheOffsets` 资源声明。
+  - `cluster_draw.slang`：新增 `VSVisBufferCached` 入口点 + `DeformCache`/`CacheOffsets` 资源声明。
+  - `cluster_shade_pipeline.slang`：新增 `buildPixelContextCached<TVE>()` 从 cache 读取 3 个顶点的 DeformedVertex 替代 3× `evaluate()` 调用。
+- **C# 层**：
+  - `ClusterDeformPass.cs`（新建）：PSO 缓存（CSDeformStatic/CSDeformWave）+ SRB pool + `IRenderGraphPass` 实现。
+  - `ClusterHiZStage.cs`：`HiZConfig` 新增 `UseDeformCache`；Phase1 中 RasterBin 后插入 DeformCache buffer 创建（RWByteAddressBuffer 48MB + CacheOffsets + CacheAllocCounter）+ `ClusterDeformPass`。
+  - `ClusterPipeline.cs`：新增 `UseDeformCache` 属性。
+- **测试**：`DeformCacheCompilationTest.cs`（3 tests: CSSWRasterCached/CSDeformStatic+Wave/VSVisBufferCached），全部通过。修复 `VertexEvaluateCompilationTest` 中自定义 evaluator 缺失 cache 方法的回归。
+- **Shade API 统一重构**：
+  - 删除 `buildPixelContextCached`，引入 `TriangleInfo` struct + `decodeTriangle()` + `evaluateTrianglePositions<TVE>()` + `fetchCachedTrianglePositions<TVE>()` 共享解码/位置获取 helper。
+  - `buildPixelContext()` 改为接收 `TriangleInfo + 3 float3 worldPos`，由调用方决定位置来源（inline evaluate 或 cache read），消除 ~80 行重复代码。
+- `handleDebugMode` 的 barycentric/normal/UV/deformation debug 模式全部改用 `decodeTriangle` + `evaluateTrianglePositions`，不再内联手动构造 `VertexEvalContext`。
+- Phase2 DeformPass 已挂入 `ClusterHiZStage.cs`，与 Phase1 共用 `DeformCache`/`CacheOffsets` buffer。
+
+## [2026-04-03] BATCH-07 Asset Pipeline Destructive Rework
+- 删除 `AssetId`、`IAssetRecord`、`IAssetResolver`、`IAssetDatabase`、`IAssetWorkspace`、`AssetNode`、`ManifestAssetDatabase` 等 legacy facade，顶层统一为 `IAsset + AssetManifest + AssetDatabase + AssetTypeRegistry + MetaManagers`。
+- `AssetManifestScanner` 改为 registry 分发；`AssetDatabase` 统一承担 load/import/resolve/list/validate/watch/rebuild。
+- `MaterialAssetLoader` / `MaterialInstanceLoader` / `MeshMaterialResolver` 删除 resolver 重载，Runtime 默认资产查找改走 `AssetDatabase`。
+- 验证结果：`dotnet test tests/SomeEngine.Tests/SomeEngine.Tests.csproj -- RunConfiguration.MaxCpuCount=1` → `124 passed, 0 failed, 1 skipped`；`dotnet build SomeEngine.slnx` 通过。
+
+## [2026-04-03] BATCH-07 Task 5 Corrective Follow-up
+- `AssetTypeRegistry` 改为宿主显式注册 builtin handlers/importers；`SlangSourceImporter` 从 registry 内部拆出。
+- `AssetDatabase.Load<T>(path)` 增加 `IsUpToDate()`，只在 source 过期时触发导入；watcher 只发 `SourceChanged`，不再内建自动 reimport。
+- `AssetManifestScanner` 删除 `is ShaderAsset` 分支，仅依赖 `.asset.meta`；`ShouldSkip` / registry 配置检查 / path helper / JSON options 去重。
+- `Validate()` 不再输出根资产 `OrphanAsset`；验证结果更新为 `127 passed, 0 failed, 1 skipped`。
+
+## [2026-04-03] BATCH-07 Task 5i-5j Root-Cause Fix
+- 扫描策略从“项目根全盘递归 + skip”改为 `assetRoots` 定向扫描；`AssetDatabase` 新增 `assetRoots:` 构造参数，默认只扫 `assets/`。
+- `ShouldSkip` 相关路径排除逻辑已删除；manifest 输出目录不再靠硬编码前缀规避，而是天然不在扫描根内。
+- watcher 暂时降级为空实现：`AssetDatabase` 不再实现 `IDisposable`，`StartWatching()` / `StopWatching()` 为 no-op。
+- 验证结果更新为 `129 passed, 0 failed, 1 skipped`；`dotnet build SomeEngine.slnx` 通过。
+

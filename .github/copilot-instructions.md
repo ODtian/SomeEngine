@@ -9,7 +9,7 @@
 - 完成功能后简短记录在log.md中
 - 禁止unsafe，必须使用Span Api，如果库没有span api，立即停止并告诉用户。meshopt、diligent所有api都有span版本。
 - 目前测试项目应使用Runtime项目
-- shell环境为bash
+- shell环境为git bash，使用正斜杠而非反斜杠
 ## Goal
 查询 docs\goal.md
 

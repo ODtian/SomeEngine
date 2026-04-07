@@ -53,9 +53,15 @@ var cullOut     = ClusterCull.AddPasses(..., traverseOut, ...);
 // Feature 自己的 BinSpace — 完全独立的 bin 逻辑
 var _myBinSpace = new BinSpace();
 int _myFieldIdx = _myBinSpace.RegisterField("ShadowBin");
-_myBinSpace.RegisterRegion(_myFieldIdx, "AlphaTest",
-    () => registry.QueryPasses(p => p.Tags.Has<AlphaTestTag>()),
-    p => p.ShaderAsset.Id);
+_myBinSpace.RegisterGroup(_myFieldIdx,
+    new BinQueue.BinGroup
+    {
+        Query = QueryMaskedShadowEntities,
+        OrderKey = static _ => 1,
+        SignatureFunc = static entity => MaterialEntityUtility.ComputeMaterialSignature(
+            entity,
+            entity.GetComponent<ClusterRaster>().HWPS),
+    });
 _myBinSpace.FreezeLayout();
 
 // Feature 想和主管线共享？直接用同一个 BinSpace 实例
@@ -88,14 +94,24 @@ public class CascadedShadowFeature : IRenderFeature
 
     public void Initialize(RenderContext ctx)
     {
-        // 独立 BinSpace：阴影只关心 "是否 alpha test"
+        // 独立 BinSpace：阴影只关心 "opaque vs masked"
         _binFieldIdx = _binSpace.RegisterField("ShadowBin");
-        _binSpace.RegisterRegion(_binFieldIdx, "Opaque",
-            () => registry.QueryPasses(p => !p.Tags.Has<AlphaTestTag>()),
-            p => 0);  // 所有不透明共享 bin 0
-        _binSpace.RegisterRegion(_binFieldIdx, "AlphaTest",
-            () => registry.QueryPasses(p => p.Tags.Has<AlphaTestTag>()),
-            p => p.ShaderAsset.Id);
+        _binSpace.RegisterGroup(_binFieldIdx,
+            new BinQueue.BinGroup
+            {
+                Query = QueryOpaqueShadowEntities,
+                OrderKey = static _ => 0,
+                SignatureFunc = static _ => 0,
+            });
+        _binSpace.RegisterGroup(_binFieldIdx,
+            new BinQueue.BinGroup
+            {
+                Query = QueryMaskedShadowEntities,
+                OrderKey = static _ => 1,
+                SignatureFunc = static entity => MaterialEntityUtility.ComputeMaterialSignature(
+                    entity,
+                    entity.GetComponent<ClusterRaster>().HWPS),
+            });
         _binSpace.FreezeLayout();
     }
 

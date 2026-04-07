@@ -64,16 +64,22 @@ MaterialSlotBuffer 填充时:
 > slot 的最小单位是一个 `MaterialPass`。
 > `Material` 在资产层持有贴图引用和 pass 配置，运行时保留 source textures 用于 Instantiate / 热重载；dispatch 路径只读 `MaterialPass`。
 
-### MaterialSlot — GPU 侧扁平结构
+### MaterialSlotBuffer — GPU 侧 SOA 布局
+
+GPU 端材质 slot 使用 `ushort[]` SOA 布局（而非 struct），通过 `MaterialSlotBuffer` 管理：
 
 ```csharp
-[StructLayout(LayoutKind.Sequential, Size = 8)]
-public struct MaterialSlot
+// CPU 端 SOA 布局：ushort[] flat array，按字段分段存储
+// [ field0: s0,s1,...,s(cap-1) | field1: s0,s1,... | ... ]
+// 访问: _data[fieldIndex * _capacity + slotOffset + localIdx]
+
+public sealed class MaterialSlotBuffer : IDisposable
 {
-    public ushort RasterBin;
-    public ushort ShadingBin;
-    public ushort ShadowBin;
-    public ushort Padding;
+    public void SetField(int slotOffset, int localIdx, int fieldIndex, ushort value);
+    public ushort GetField(int slotOffset, int localIdx, int fieldIndex);
+    public int AllocateRange(int slotCount);
+    public void FreeRange(int offset, int count);
+    public ReadOnlySpan<ushort> GetData();  // GPU 上传用
 }
 ```
 
