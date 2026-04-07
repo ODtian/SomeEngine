@@ -1,117 +1,94 @@
 using System;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Text;
-using NUnit.Framework;
 using SlangShaderSharp;
+using SomeEngine.Assets.Importers;
 
 namespace SomeEngine.Tests;
 
 public class SlangNoMangleTests
 {
-    private IGlobalSession? _globalSession;
-
-    [OneTimeSetUp]
-    public void Setup()
+    [Fact]
+    public void TestSlangNoMangleHlslExport()
     {
-        Slang.CreateGlobalSession(Slang.ApiVersion, out _globalSession!);
-    }
+        var globalSession = SlangShaderImporter.GlobalSession;
+            string shaderDir = Path.GetFullPath(Path.Combine(
+                AppContext.BaseDirectory,
+                "..", "..", "..", "..", "..", "..", "assets", "Shaders"));
+            string slangFilePath = Path.Combine(shaderDir, "simple_mesh.slang");
 
-    [Test]
-    public unsafe void TestSlangNoMangleHlslExport()
-    {
-        string slangFilePath = @"d:\SomeEngine\assets\Shaders\simple_mesh.slang";
+            Assert.True(File.Exists(slangFilePath), $"Slang file not found at {slangFilePath}");
 
-        Assert.That(
-            File.Exists(slangFilePath),
-            Is.True,
-            $"Slang file not found at {slangFilePath}"
-        );
+            var profile = globalSession.FindProfile("sm_6_5");
 
-        // 1. Setup TargetDesc with NoMangle
-        // var hlslProfile = _globalSession!.FindProfile("sm_6_5");
-        var profile = _globalSession.FindProfile("sm_6_5");
+            var options = new[]
+            {
+                new CompilerOptionEntry(CompilerOptionName.NoMangle, CompilerOptionValue.FromInt(1, 0)),
+                new CompilerOptionEntry(
+                    CompilerOptionName.VulkanEmitReflection,
+                    CompilerOptionValue.FromInt(1, 0)
+                ),
+            };
 
-        var options = new[]
-        {
-            new CompilerOptionEntry(CompilerOptionName.NoMangle, CompilerOptionValue.FromInt(1, 0)),
-            new CompilerOptionEntry(
-                CompilerOptionName.VulkanEmitReflection,
-                CompilerOptionValue.FromInt(1, 0)
-            ),
-        };
+            var target = new TargetDesc
+            {
+                Format = SlangCompileTarget.Hlsl,
+                Profile = profile,
+                CompilerOptionEntries = options,
+            };
 
-        var target = new TargetDesc
-        {
-            Format = SlangCompileTarget.Hlsl,
-            Profile = profile,
-            CompilerOptionEntries = options,
-        };
+            var sessionDesc = new SessionDesc
+            {
+                Targets = [target],
+                SearchPaths = [Path.GetDirectoryName(slangFilePath)!],
+                CompilerOptionEntries = options,
+            };
 
-        // 2. Create Session
-        var sessionDesc = new SessionDesc
-        {
-            Targets = [target],
-            SearchPaths = [Path.GetDirectoryName(slangFilePath)!],
-            CompilerOptionEntries = options,
-        };
+            var res = globalSession.CreateSession(sessionDesc, out var session);
+            Assert.NotNull(session);
 
-        var res = _globalSession.CreateSession(sessionDesc, out var session);
-        Assert.That(session, Is.Not.Null);
-
-        // 3. Load Module
-        var source = File.ReadAllText(slangFilePath);
-        var blob = Slang.CreateBlob(Encoding.UTF8.GetBytes(source));
-        var module = session.LoadModuleFromSource(
-            "simple_mesh",
-            slangFilePath,
-            blob,
-            out var diagnostics
-        );
-
-        if (module == null)
-        {
-            string? diagStr = GetString(diagnostics);
-            Assert.Fail($"Failed to load module: {diagStr}");
-        }
-
-        // 4. Link for VSMain and PSMain
-        string[] entryPoints = ["VSMain", "PSMain"];
-        foreach (var epName in entryPoints)
-        {
-            module!.FindEntryPointByName(epName, out var entryPoint);
-            Assert.That(entryPoint, Is.Not.Null, $"Entry point {epName} not found");
-
-            session.CreateCompositeComponentType(
-                [module, entryPoint],
-                out var composedLine,
-                out var diag1
-            );
-            Assert.That(
-                composedLine,
-                Is.Not.Null,
-                $"Failed to compose {epName}: {GetString(diag1)}"
+            var source = File.ReadAllText(slangFilePath);
+            var blob = Slang.CreateBlob(Encoding.UTF8.GetBytes(source));
+            var module = session.LoadModuleFromSource(
+                "simple_mesh",
+                slangFilePath,
+                blob,
+                out var diagnostics
             );
 
-            composedLine.Link(out var linkedProgram, out var diag2);
-            Assert.That(linkedProgram, Is.Not.Null, $"Failed to link {epName}: {GetString(diag2)}");
+            if (module == null)
+            {
+                string? diagStr = GetString(diagnostics);
+                throw new Xunit.Sdk.XunitException($"Failed to load module: {diagStr}");
+            }
 
-            // 5. Get compiled asm
-            linkedProgram.GetEntryPointCode(0, 0, out var codeBlob, out var diag3);
-            Assert.That(
-                codeBlob,
-                Is.Not.Null,
-                $"Failed to get code for {epName}: {diag3?.AsString}"
-            );
+            string[] entryPoints = ["VSMain", "PSMain"];
+            foreach (var epName in entryPoints)
+            {
+                module.FindEntryPointByName(epName, out var entryPoint);
+                Assert.NotNull(entryPoint);
 
-            var hlslCode = codeBlob.AsString;
+                session.CreateCompositeComponentType(
+                    [module, entryPoint],
+                    out var composedLine,
+                    out var diag1
+                );
+                Assert.NotNull(composedLine);
 
-            TestContext.Out.WriteLine($"--- Decompiled ASM Code for {epName} ---");
-            TestContext.Out.WriteLine(hlslCode);
-            TestContext.Out.WriteLine("------------------------------------------");
+                composedLine.Link(out var linkedProgram, out var diag2);
+                Assert.NotNull(linkedProgram);
 
-            Assert.That(hlslCode.Contains(epName) || hlslCode.Contains("OpFunction"), Is.True);
-        }
+                linkedProgram.GetEntryPointCode(0, 0, out var codeBlob, out var diag3);
+                Assert.NotNull(codeBlob);
+
+                var hlslCode = codeBlob.AsString;
+
+                Console.WriteLine($"--- Decompiled ASM Code for {epName} ---");
+                Console.WriteLine(hlslCode);
+                Console.WriteLine("------------------------------------------");
+
+                Assert.True(hlslCode.Contains(epName) || hlslCode.Contains("OpFunction"));
+            }
     }
 
     private static string? GetString(ISlangBlob? blob)

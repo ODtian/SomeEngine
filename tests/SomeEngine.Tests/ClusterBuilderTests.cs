@@ -2,7 +2,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
-using NUnit.Framework;
 using SomeEngine.Assets.Data;
 using SomeEngine.Assets.Importers;
 using ValueType = SomeEngine.Assets.Data.ValueType;
@@ -11,7 +10,7 @@ namespace SomeEngine.Tests;
 
 public class ClusterBuilderTests
 {
-    [Test]
+    [Fact]
     public void TestClusterGeneration()
     {
         // 1. Create a 32x32 plane
@@ -20,7 +19,7 @@ public class ClusterBuilderTests
         var positions = new Vector3[w * h];
         var normals = new float[w * h * 3];
         var uvs = new float[w * h * 2];
-        
+
         for (int y = 0; y < h; y++)
         {
             for (int x = 0; x < w; x++)
@@ -33,7 +32,7 @@ public class ClusterBuilderTests
                 uvs[(y * w + x) * 2 + 1] = y / (float)h;
             }
         }
-        
+
         var indicesList = new List<uint>();
         for (int y = 0; y < h - 1; y++)
         {
@@ -43,17 +42,17 @@ public class ClusterBuilderTests
                 uint i1 = (uint)(y * w + x + 1);
                 uint i2 = (uint)((y + 1) * w + x);
                 uint i3 = (uint)((y + 1) * w + x + 1);
-                
+
                 indicesList.Add(i0);
                 indicesList.Add(i2);
                 indicesList.Add(i1);
-                
+
                 indicesList.Add(i1);
                 indicesList.Add(i2);
                 indicesList.Add(i3);
             }
         }
-        
+
         var indices = indicesList.ToArray();
 
         var rawAttributes = new List<RawAttribute>
@@ -64,19 +63,19 @@ public class ClusterBuilderTests
 
         // 2. Run Builder
         var asset = ClusterBuilder.ProcessRaw(positions, rawAttributes, indices, new List<string>(), "TestPlane");
-        
+
         // 3. Assertions
-        Assert.That(asset.Payload, Is.Not.Null);
-        Assert.That(asset.Payload.Value.Length, Is.GreaterThan(0));
+        Assert.NotNull(asset.Payload);
+        Assert.True(asset.Payload.Value.Length > 0);
 
         // Check if we have at least one page
         var span = asset.Payload.Value.Span;
         var header = MemoryMarshal.Read<MeshPageHeader>(span.Slice(0, MeshPageHeader.Size));
-        Assert.That(header.ClusterCount, Is.GreaterThan(0));
-        Assert.That(header.TotalVertexCount, Is.GreaterThan(0));
+        Assert.True(header.ClusterCount > 0);
+        Assert.True(header.TotalVertexCount > 0);
     }
 
-    [Test]
+    [Fact]
     public void TestSoAStreamLayout()
     {
         // Create a minimal triangle with known attribute values
@@ -98,13 +97,13 @@ public class ClusterBuilderTests
 
         var asset = ClusterBuilder.ProcessRaw(positions, rawAttributes, indices, new List<string>(), "TestSoA");
 
-        Assert.That(asset.Payload, Is.Not.Null);
+        Assert.NotNull(asset.Payload);
         var span = asset.Payload.Value.Span;
         var header = MemoryMarshal.Read<MeshPageHeader>(span.Slice(0, MeshPageHeader.Size));
 
-        Assert.That(header.ClusterCount, Is.GreaterThan(0));
+        Assert.True(header.ClusterCount > 0);
         uint totalVerts = header.TotalVertexCount;
-        Assert.That(totalVerts, Is.EqualTo(3));
+        Assert.Equal(3u, totalVerts);
 
         // --- Verify SoA layout ---
         // Stream 0: NORMAL (Int8x3, 3 bytes per vertex)
@@ -121,9 +120,9 @@ public class ClusterBuilderTests
             sbyte ny = (sbyte)span[offset + 1];
             sbyte nz = (sbyte)span[offset + 2];
 
-            Assert.That(nx, Is.EqualTo(0), $"Normal[{v}].x should be 0");
-            Assert.That(ny, Is.EqualTo(127), $"Normal[{v}].y should be 127 (SNORM for 1.0)");
-            Assert.That(nz, Is.EqualTo(0), $"Normal[{v}].z should be 0");
+            Assert.Equal(0, nx);
+            Assert.Equal(127, ny);
+            Assert.Equal(0, nz);
         }
 
         // UV stream: starts right after normal stream
@@ -137,14 +136,40 @@ public class ClusterBuilderTests
             float uExpected = uvs[v * 2 + 0];
             float vExpected = uvs[v * 2 + 1];
 
-            Assert.That(u, Is.EqualTo(uExpected).Within(0.01f), $"UV[{v}].u");
-            Assert.That((float)BitConverter.UInt16BitsToHalf(rawV),
-                Is.EqualTo(vExpected).Within(0.01f), $"UV[{v}].v");
+            Assert.InRange(u, uExpected - 0.01f, uExpected + 0.01f);
+            Assert.InRange((float)BitConverter.UInt16BitsToHalf(rawV), vExpected - 0.01f, vExpected + 0.01f);
         }
 
         // Verify indices start after UV stream (no interleaving gap)
         uint expectedIndicesOffset = uvBase + (uint)(3 * 4); // 3 verts * 4 bytes
-        Assert.That(header.IndicesOffset, Is.EqualTo(expectedIndicesOffset),
-            "Indices should start right after the last attribute stream (SoA contiguous)");
+        Assert.Equal(expectedIndicesOffset, header.IndicesOffset);
+    }
+
+    [Fact]
+    public void ProcessRaw_WritesDefaultMaterialGuids_WhenResolverProvided()
+    {
+        var positions = new Vector3[]
+        {
+            new(0, 0, 0),
+            new(1, 0, 0),
+            new(0, 1, 0),
+        };
+        var indices = new uint[] { 0, 1, 2 };
+        var materialGuid = SomeEngine.Assets.AssetGuid.New();
+
+        var asset = ClusterBuilder.ProcessRaw(
+            positions,
+            new List<RawAttribute>(),
+            indices,
+            new List<string> { "MatA" },
+            "GuidMesh",
+            name => name == "MatA" ? materialGuid : SomeEngine.Assets.AssetGuid.Empty);
+
+        Assert.NotNull(asset.DefaultMaterialGuids);
+        Assert.Single(asset.DefaultMaterialGuids);
+        Assert.Equal(materialGuid.ToFlatString(), asset.DefaultMaterialGuids[0]);
+        Assert.NotNull(asset.DefaultMaterialSlots);
+        Assert.Single(asset.DefaultMaterialSlots);
+        Assert.Equal("MatA", asset.DefaultMaterialSlots[0]);
     }
 }

@@ -1,6 +1,6 @@
+using System;
 using System.Numerics;
 using Friflo.Engine.ECS;
-using NUnit.Framework;
 using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
 using SomeEngine.Core.Math;
@@ -9,16 +9,14 @@ using SomeEngine.Render.Systems;
 
 namespace SomeEngine.Tests.Systems
 {
-    [TestFixture]
-    public class InstanceSyncSystemTests
+    public class InstanceSyncSystemTests : IDisposable
     {
         private GameWorld _world;
         private RenderContext _mockContext;
         private InstanceDataManager _dataManager;
         private InstanceSyncSystem _syncSystem;
 
-        [SetUp]
-        public void Setup()
+        public InstanceSyncSystemTests()
         {
             _world = new GameWorld();
             // In a real scenario we might need a mocked RenderContext that doesn't crash on buffer creation without D3D12/Vulkan.
@@ -30,40 +28,39 @@ namespace SomeEngine.Tests.Systems
             _world.SystemRoot.Add(_syncSystem);
         }
 
-        [TearDown]
-        public void TearDown()
+        public void Dispose()
         {
-            _mockContext?.Dispose();
+            _mockContext.Dispose();
         }
 
-        [Test]
+        [Fact]
         public void EmptyWorld_HasZeroCount()
         {
             _world.Update(0.16f);
-            Assert.That(_dataManager.Count, Is.EqualTo(0));
+            Assert.Equal(0, _dataManager.Count);
         }
 
-        [Test]
+        [Fact]
         public void EntityWithOnlyTransform_IsNotSynced()
         {
             var e = _world.EntityStore.CreateEntity();
             e.AddComponent(new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
 
             _world.Update(0.16f);
-            Assert.That(_dataManager.Count, Is.EqualTo(0));
+            Assert.Equal(0, _dataManager.Count);
         }
 
-        [Test]
+        [Fact]
         public void EntityWithOnlyMeshInstance_IsNotSynced()
         {
             var e = _world.EntityStore.CreateEntity();
             e.AddComponent(new MeshInstance { BVHRootIndex = 1 });
 
             _world.Update(0.16f);
-            Assert.That(_dataManager.Count, Is.EqualTo(0));
+            Assert.Equal(0, _dataManager.Count);
         }
 
-        [Test]
+        [Fact]
         public void EntityWithBoth_IsSynced()
         {
             var e = _world.EntityStore.CreateEntity();
@@ -71,10 +68,10 @@ namespace SomeEngine.Tests.Systems
             e.AddComponent(new MeshInstance { BVHRootIndex = 5 });
 
             _world.Update(0.16f);
-            Assert.That(_dataManager.Count, Is.EqualTo(1));
+            Assert.Equal(1, _dataManager.Count);
         }
 
-        [Test]
+        [Fact]
         public void MultipleEntities_AreHandledCorrectly()
         {
             var e1 = _world.EntityStore.CreateEntity();
@@ -89,7 +86,7 @@ namespace SomeEngine.Tests.Systems
             e3.AddComponent(new MeshInstance { BVHRootIndex = 12 });
 
             _world.Update(0.16f);
-            Assert.That(_dataManager.Count, Is.EqualTo(2));
+            Assert.Equal(2, _dataManager.Count);
         }
     }
 }

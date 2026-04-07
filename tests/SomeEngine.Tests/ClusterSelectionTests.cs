@@ -2,25 +2,23 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.InteropServices;
-using NUnit.Framework;
 using SomeEngine.Assets.Data;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Render.Systems;
 
 namespace SomeEngine.Tests;
 
-[TestFixture]
 public class ClusterSelectionTests
 {
-    [Test]
+    [Fact]
     public void TestSelection_LinearHierarchy()
     {
         // 1. Setup a simple hierarchy
         // Root (LOD 1) -> Child (LOD 0)
-        
+
         // Root: Center (0,0,100), Radius 10, Error 10.
         // Child: Center (0,0,100), Radius 5, Error 1.
-        
+
         var root = new GPUCluster
         {
             LODCenter = new Vector3(0, 0, 100),
@@ -49,34 +47,34 @@ public class ClusterSelectionTests
 
         // 2. Test Case A: Camera Far Away (Dist 1000)
         Vector3 camPosFar = new Vector3(0, 0, -900);
-        
+
         // Root Selection
         bool selectRoot = ClusterSelection.IsClusterSelected(root, camPosFar, threshold, rootParentSphere, rootParentError);
         // Child Selection
         bool selectChild = ClusterSelection.IsClusterSelected(child, camPosFar, threshold, childParentSphere, childParentError);
-        
-        Assert.That(selectRoot, Is.True, "Should select Root when far away");
-        Assert.That(selectChild, Is.False, "Should NOT select Child when Parent (Root) is good");
+
+        Assert.True(selectRoot, "Should select Root when far away");
+        Assert.False(selectChild, "Should NOT select Child when Parent (Root) is good");
 
         // 3. Test Case B: Camera Closer (Dist 200)
         Vector3 camPosNear = new Vector3(0, 0, -100);
-        
+
         selectRoot = ClusterSelection.IsClusterSelected(root, camPosNear, threshold, rootParentSphere, rootParentError);
         selectChild = ClusterSelection.IsClusterSelected(child, camPosNear, threshold, childParentSphere, childParentError);
-        
-        Assert.That(selectRoot, Is.False, "Should NOT select Root when it is bad (too coarse)");
-        Assert.That(selectChild, Is.True, "Should select Child when closer");
+
+        Assert.False(selectRoot, "Should NOT select Root when it is bad (too coarse)");
+        Assert.True(selectChild, "Should select Child when closer");
     }
 
     /*
-    [Test]
+    [Fact]
     public void TestSelection_BoundaryCondition()
     ...
     */
 
-    
+
     /*
-    [Test]
+    [Fact]
     public void TestSelection_WithClusterBuilder()
     {
         // 1. Generate IcoSphere Clusters
@@ -112,7 +110,7 @@ public class ClusterSelectionTests
         // Threshold high (relaxed) -> Should pick Coarse
         ClusterSelection.SelectClustersLinear(clustersArr, camPos, 1.0f, selected);
         // Assert we picked some clusters
-        Assert.That(selected.Count, Is.GreaterThan(0));
+                Assert.True(selected.Count > 0);
         
         // Verify we didn't pick overlapping ancestry
         // (This is hard to verify without graph, but we can check if we picked both a node and its parent if we knew the indices)
@@ -124,7 +122,7 @@ public class ClusterSelectionTests
         ClusterSelection.SelectClustersLinear(clustersArr, camPos, 0.0001f, selected);
         int fineCount = selected.Count;
         
-        Assert.That(fineCount, Is.GreaterThan(coarseCount), "Stricter threshold should select more (finer) clusters");
+                Assert.True(fineCount > coarseCount, "Stricter threshold should select more (finer) clusters");
     }
     */
 }

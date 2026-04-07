@@ -1,13 +1,11 @@
-using NUnit.Framework;
 using SomeEngine.Core.Math;
 using System.Numerics;
 
 namespace SomeEngine.Tests.ECS;
 
-[TestFixture]
 public class FreeCameraTests
 {
-    [Test]
+    [Fact]
     public void MoveLocal_Forward_UpdatesPositionAlongForward()
     {
         var camera = new FreeCamera(
@@ -21,11 +19,11 @@ public class FreeCameraTests
 
         camera.MoveLocal(new Vector3(0, 0, 2));
 
-        Assert.That(camera.Position.X, Is.EqualTo(0).Within(1e-5f));
-        Assert.That(camera.Position.Z, Is.EqualTo(2).Within(1e-5f));
+        Assert.InRange(camera.Position.X, 0 - 1e-5f, 0 + 1e-5f);
+        Assert.InRange(camera.Position.Z, 2 - 1e-5f, 2 + 1e-5f);
     }
 
-    [Test]
+    [Fact]
     public void AddYawPitch_ClampsPitch()
     {
         var camera = new FreeCamera(
@@ -39,10 +37,10 @@ public class FreeCameraTests
 
         camera.AddYawPitch(0.0f, 10.0f);
 
-        Assert.That(camera.Pitch, Is.LessThan(MathF.PI * 0.5f));
+        Assert.True(camera.Pitch < MathF.PI * 0.5f);
     }
 
-    [Test]
+    [Fact]
     public void GetLodScale_MatchesProjectionFormula()
     {
         var camera = new FreeCamera(
@@ -57,6 +55,6 @@ public class FreeCameraTests
         float lodScale = camera.GetLodScale(720.0f);
         float expected = 720.0f / (2.0f * MathF.Tan((MathF.PI / 4.0f) * 0.5f));
 
-        Assert.That(lodScale, Is.EqualTo(expected).Within(1e-5f));
+        Assert.InRange(lodScale, expected - 1e-5f, expected + 1e-5f);
     }
 }

@@ -5,7 +5,7 @@ namespace SomeEngine.Tests;
 
 public class ClusterPipelineTypesTests
 {
-    [Test]
+    [Fact]
     public void ClusterDrawConfig_CanCarryVisibleClusterMetaHandle()
     {
         var meta = new RenderGraphHandle(7);
@@ -14,15 +14,15 @@ public class ClusterPipelineTypesTests
             VisibleClusterMeta = meta,
         };
 
-        Assert.That(config.VisibleClusterMeta.IsValid, Is.True);
-        Assert.That(config.VisibleClusterMeta.Index, Is.EqualTo(meta.Index));
+        Assert.True(config.VisibleClusterMeta.IsValid);
+        Assert.Equal(meta.Index, config.VisibleClusterMeta.Index);
     }
 
-    [Test]
+    [Fact]
     public void ClusterDrawConfig_DefaultOpaque_DoesNotForceMetaHandle()
     {
         var config = ClusterDrawConfig.Opaque();
 
-        Assert.That(config.VisibleClusterMeta.IsValid, Is.False);
+        Assert.False(config.VisibleClusterMeta.IsValid);
     }
 }

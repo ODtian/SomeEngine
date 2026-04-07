@@ -1,16 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
-using NUnit.Framework;
 using SomeEngine.Assets.Data;
 using SomeEngine.Assets.Importers;
 
 namespace SomeEngine.Tests;
 
-[TestFixture]
 public class ClusterLodErrorInvariantTests
 {
-    // [Test]
+    // [Fact]
     // public void ParentError_ShouldBeGreaterOrEqual_ThanClusterError_ForNonRoot()
     // {
     //     var (vertices, indices, attributes) = PrimitiveMeshGenerator.CreateIcoSphere(5);
@@ -51,11 +49,11 @@ public class ClusterLodErrorInvariantTests
     //         offset += (int)pageSize;
     //     }
 
-    //     Assert.That(checkedCount, Is.GreaterThan(0));
-    //     Assert.That(violationCount, Is.EqualTo(0), "Found clusters where ParentLODError < LODError; this breaks cut monotonicity and causes overlap.");
+    //         //     Assert.True(checkedCount > 0);
+    //         //     Assert.Equal(0, violationCount);
     // }
 
-    // [Test]
+    // [Fact]
     // public void ParentError_ShouldMapToExistingCoarserSelfError()
     // {
     //     var (vertices, indices, attributes) = PrimitiveMeshGenerator.CreateIcoSphere(5);
@@ -113,7 +111,7 @@ public class ClusterLodErrorInvariantTests
     //             missingMappedCount++;
     //     }
 
-    //     Assert.That(checkedCount, Is.GreaterThan(0));
-    //     Assert.That(missingMappedCount, Is.EqualTo(0), "Found child clusters whose ParentLODError does not map to any coarser cluster LODError.");
+    //         //     Assert.True(checkedCount > 0);
+    //         //     Assert.Equal(0, missingMappedCount);
     // }
 }

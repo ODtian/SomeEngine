@@ -2,15 +2,14 @@ using System;
 using System.Numerics;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
-using NUnit.Framework;
 using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
 using SomeEngine.Core.ECS.Systems;
+using SomeEngine.Core.Jobs;
 using SomeEngine.Core.Math;
 
 namespace SomeEngine.Tests.ECS;
 
-[TestFixture]
 public class TransformSystemTests
 {
     private EntityStore _store;
@@ -19,21 +18,27 @@ public class TransformSystemTests
     private SystemRoot _systemRoot;
     private SystemContext _context;
 
-    [SetUp]
-    public void Setup()
+    private void RunSystems()
+    {
+        _context.GlobalDependency = default;
+        _systemRoot.Update(default);
+        _context.GlobalDependency.Complete();
+    }
+
+    public TransformSystemTests()
     {
         _store = new EntityStore();
         _context = new SystemContext();
         _hierarchySystem = new HierarchySystem(_store);
         _transformSystem = new TransformSystem(_context);
-        
+
         _systemRoot = new SystemRoot(_store) {
             _hierarchySystem,
             _transformSystem
         };
     }
 
-    [Test]
+    [Fact]
     public void TestHierarchyAndTransform()
     {
         // 1. Create Entities
@@ -52,24 +57,24 @@ public class TransformSystemTests
         child.AddChild(grandChild);
 
         // 2. Run Systems
-        _systemRoot.Update(default);
+        RunSystems();
 
         // 3. Verify Depths
-        Assert.That(root.GetComponent<TransformDepth>().Value, Is.EqualTo(0));
-        Assert.That(child.GetComponent<TransformDepth>().Value, Is.EqualTo(1));
-        Assert.That(grandChild.GetComponent<TransformDepth>().Value, Is.EqualTo(2));
+        Assert.Equal(0, root.GetComponent<TransformDepth>().Value);
+        Assert.Equal(1, child.GetComponent<TransformDepth>().Value);
+        Assert.Equal(2, grandChild.GetComponent<TransformDepth>().Value);
 
         // 4. Verify World Transforms
         var rootWorld = root.GetComponent<WorldTransform>().Qvvs;
         var childWorld = child.GetComponent<WorldTransform>().Qvvs;
         var grandChildWorld = grandChild.GetComponent<WorldTransform>().Qvvs;
 
-        Assert.That(rootWorld.Position, Is.EqualTo(new Vector3(0, 0, 0)));
-        Assert.That(childWorld.Position, Is.EqualTo(new Vector3(10, 0, 0)));
-        Assert.That(grandChildWorld.Position, Is.EqualTo(new Vector3(10, 5, 0)));
+        Assert.Equal(new Vector3(0, 0, 0), rootWorld.Position);
+        Assert.Equal(new Vector3(10, 0, 0), childWorld.Position);
+        Assert.Equal(new Vector3(10, 5, 0), grandChildWorld.Position);
     }
 
-    [Test]
+    [Fact]
     public void TestRotation()
     {
         var root = _store.CreateEntity();
@@ -82,14 +87,14 @@ public class TransformSystemTests
         child.AddComponent(new WorldTransform());
         root.AddChild(child);
 
-        _systemRoot.Update(default);
+        RunSystems();
 
         var childWorld = child.GetComponent<WorldTransform>().Qvvs;
-        
+
         var expected = Vector3.Transform(new Vector3(10, 0, 0), rotation);
-        
-        Assert.That(childWorld.Position.X, Is.EqualTo(expected.X).Within(0.001f));
-        Assert.That(childWorld.Position.Y, Is.EqualTo(expected.Y).Within(0.001f));
-        Assert.That(childWorld.Position.Z, Is.EqualTo(expected.Z).Within(0.001f));
+
+        Assert.InRange(childWorld.Position.X, expected.X - 0.001f, expected.X + 0.001f);
+        Assert.InRange(childWorld.Position.Y, expected.Y - 0.001f, expected.Y + 0.001f);
+        Assert.InRange(childWorld.Position.Z, expected.Z - 0.001f, expected.Z + 0.001f);
     }
 }

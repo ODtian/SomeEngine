@@ -2,13 +2,11 @@ using System.Collections.Generic;
 using System.Reflection;
 using Diligent;
 using NSubstitute;
-using NUnit.Framework;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Tests;
 
-[TestFixture]
 public class RenderGraphTests
 {
     private class EmptyData
@@ -16,7 +14,7 @@ public class RenderGraphTests
         public object? UserData;
     }
 
-    [Test]
+    [Fact]
     public void TestPlacedResourceAliasing()
     {
         using var graph = new RenderGraph();
@@ -86,24 +84,12 @@ public class RenderGraphTests
         ulong offset2 = GetMemoryOffset(graph, tex2);
         ulong offset3 = GetMemoryOffset(graph, tex3);
 
-        Assert.That(
-            offset1,
-            Is.EqualTo(offset3),
-            "Lifetimes don't overlap, should alias to same offset"
-        );
-        Assert.That(
-            offset1,
-            Is.Not.EqualTo(offset2),
-            "Lifetimes overlap, should have different offsets"
-        );
-        Assert.That(
-            offset2,
-            Is.Not.EqualTo(offset3),
-            "Lifetimes overlap, should have different offsets"
-        );
+        Assert.Equal(offset3, offset1);
+        Assert.NotEqual(offset2, offset1);
+        Assert.NotEqual(offset3, offset2);
     }
 
-    [Test]
+    [Fact]
     public void TestPlacedResourceAliasing_NoDevice()
     {
         using var graph = new RenderGraph();
@@ -131,14 +117,10 @@ public class RenderGraphTests
         graph.Compile(null);
 
         ulong offset1 = GetMemoryOffset(graph, tex1);
-        Assert.That(
-            offset1,
-            Is.EqualTo(ulong.MaxValue),
-            "Should not allocate placed resource without device"
-        );
+        Assert.Equal(ulong.MaxValue, offset1);
     }
 
-    [Test]
+    [Fact]
     public void TestPerMipBarriers()
     {
         using var graph = new RenderGraph();
@@ -206,15 +188,11 @@ public class RenderGraphTests
         var compiledPasses = GetCompiledPasses(graph);
         var executionOrder = GetExecutionOrder(graph);
 
-        Assert.That(executionOrder.Count, Is.GreaterThanOrEqualTo(3));
+        Assert.True(executionOrder.Count >= 3);
 
         // Check pass 1 (Downsample Mip1) barriers
         var pass1 = compiledPasses[executionOrder[1]];
-        Assert.That(
-            pass1.PreBarriers.Count,
-            Is.GreaterThan(0),
-            "Downsample Mip1 should have barriers"
-        );
+        Assert.True(pass1.PreBarriers.Count > 0, "Downsample Mip1 should have barriers");
 
         // Since both src and dst are UAV on the same resource, we expect UAV flush barriers
         // The barrier should reference mip 0 and/or mip 1 (either individually or as a merged range)
@@ -230,18 +208,14 @@ public class RenderGraphTests
                 break;
             }
         }
-        Assert.That(hasUavBarrier, Is.True, "Should have UAV flush barrier for mip chain");
+        Assert.True(hasUavBarrier, "Should have UAV flush barrier for mip chain");
 
         // Check pass 2 (Downsample Mip2) barriers
         var pass2 = compiledPasses[executionOrder[2]];
-        Assert.That(
-            pass2.PreBarriers.Count,
-            Is.GreaterThan(0),
-            "Downsample Mip2 should have barriers"
-        );
+        Assert.True(pass2.PreBarriers.Count > 0, "Downsample Mip2 should have barriers");
     }
 
-    [Test]
+    [Fact]
     public void TestWholeResourceBarriersStillWork()
     {
         using var graph = new RenderGraph();
@@ -285,11 +259,11 @@ public class RenderGraphTests
         var compiledPasses = GetCompiledPasses(graph);
         var executionOrder = GetExecutionOrder(graph);
 
-        Assert.That(executionOrder.Count, Is.EqualTo(2));
+        Assert.Equal(2, executionOrder.Count);
 
         // The ReadAndWrite pass should have a RT->SRV barrier for SrcTex
         var readPass = compiledPasses[executionOrder[1]];
-        Assert.That(readPass.PreBarriers.Count, Is.GreaterThan(0));
+        Assert.True(readPass.PreBarriers.Count > 0);
 
         bool hasRtToSrvBarrier = false;
         foreach (var b in readPass.PreBarriers)
@@ -300,7 +274,7 @@ public class RenderGraphTests
                 break;
             }
         }
-        Assert.That(hasRtToSrvBarrier, Is.True, "Should have RT -> SRV barrier");
+        Assert.True(hasRtToSrvBarrier, "Should have RT -> SRV barrier");
     }
 
     // ── RenderFeature Tests ──
@@ -340,7 +314,7 @@ public class RenderGraphTests
         public static void ResetCallCounter() => _callCounter = 0;
     }
 
-    [Test]
+    [Fact]
     public void TestFeatureAddPassesCalledDuringCompile()
     {
         using var graph = new RenderGraph();
@@ -348,15 +322,15 @@ public class RenderGraphTests
         graph.AddFeature(feature);
 
         // AddPasses should not be called before Compile
-        Assert.That(feature.AddPassesCalled, Is.False);
+        Assert.False(feature.AddPassesCalled);
 
         graph.Compile(null);
 
         // AddPasses should be called during Compile
-        Assert.That(feature.AddPassesCalled, Is.True);
+        Assert.True(feature.AddPassesCalled);
     }
 
-    [Test]
+    [Fact]
     public void TestFeaturePassesParticipateInCompile()
     {
         using var graph = new RenderGraph();
@@ -392,16 +366,12 @@ public class RenderGraphTests
         var executionOrder = GetExecutionOrder(graph);
         var compiledPasses = GetCompiledPasses(graph);
 
-        Assert.That(
-            executionOrder.Count,
-            Is.EqualTo(1),
-            "Feature pass should be in execution order"
-        );
-        Assert.That(compiledPasses[executionOrder[0]].Name, Is.EqualTo("FeaturePass"));
-        Assert.That(compiledPasses[executionOrder[0]].Active, Is.True);
+        Assert.Equal(1, executionOrder.Count);
+        Assert.Equal("FeaturePass", compiledPasses[executionOrder[0]].Name);
+        Assert.True(compiledPasses[executionOrder[0]].Active);
     }
 
-    [Test]
+    [Fact]
     public void TestMultipleFeaturesOrdering()
     {
         using var graph = new RenderGraph();
@@ -449,13 +419,13 @@ public class RenderGraphTests
         graph.Compile(null);
 
         // FeatureA should be called before FeatureB
-        Assert.That(featureA.AddPassesCallOrder, Is.LessThan(featureB.AddPassesCallOrder));
+        Assert.True(featureA.AddPassesCallOrder < featureB.AddPassesCallOrder);
 
         var executionOrder = GetExecutionOrder(graph);
-        Assert.That(executionOrder.Count, Is.EqualTo(2));
+        Assert.Equal(2, executionOrder.Count);
     }
 
-    [Test]
+    [Fact]
     public void TestFeatureDisposedOnGraphDispose()
     {
         var feature = new TestFeature("TestFeature");
@@ -463,14 +433,14 @@ public class RenderGraphTests
         {
             var graph = new RenderGraph();
             graph.AddFeature(feature);
-            Assert.That(feature.DisposeCalled, Is.False);
+            Assert.False(feature.DisposeCalled);
             graph.Dispose();
         }
 
-        Assert.That(feature.DisposeCalled, Is.True);
+        Assert.True(feature.DisposeCalled);
     }
 
-    [Test]
+    [Fact]
     public void TestRemoveFeature()
     {
         using var graph = new RenderGraph();
@@ -480,7 +450,7 @@ public class RenderGraphTests
         graph.RemoveFeature(feature);
         graph.Compile(null);
 
-        Assert.That(feature.AddPassesCalled, Is.False, "Removed feature should not be called");
+        Assert.False(feature.AddPassesCalled, "Removed feature should not be called");
     }
 
     // ── Reflection helpers ──
@@ -495,7 +465,7 @@ public class RenderGraphTests
 
         var indexProp = typeof(RenderGraphHandle).GetProperty(
             "Index",
-            BindingFlags.NonPublic | BindingFlags.Instance
+            BindingFlags.Public | BindingFlags.Instance
         );
         int index = (int)indexProp!.GetValue(handle)!;
 
@@ -575,7 +545,7 @@ public class RenderGraphTests
         return (List<int>)field!.GetValue(graph)!;
     }
 
-    [Test]
+    [Fact]
     public void TestAddPassNonGeneric()
     {
         using var graph = new RenderGraph();
@@ -604,6 +574,6 @@ public class RenderGraphTests
         graph.MarkOutput(h);
         graph.Compile();
 
-        Assert.That(setupCalled, Is.True, "Setup lambda should be called during Compile");
+        Assert.True(setupCalled, "Setup lambda should be called during Compile");
     }
 }

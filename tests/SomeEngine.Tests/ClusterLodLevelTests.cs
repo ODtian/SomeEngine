@@ -2,7 +2,6 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using NUnit.Framework;
 using SomeEngine.Assets.Data;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Assets.Schema;
@@ -10,10 +9,9 @@ using SomeEngine.Core.Math;
 
 namespace SomeEngine.Tests;
 
-[TestFixture]
 public class ClusterLodLevelTests
 {
-    [Test]
+    [Fact]
     public void VerifyClusterLodLevelSerialization()
     {
         // 1. Create a dummy high-res mesh to force LOD generation
@@ -70,9 +68,9 @@ public class ClusterLodLevelTests
         }
 
         // Assert that we have at least level 0 and level 1
-        Assert.That(levelCounts[0], Is.GreaterThan(0), "Should have Level 0 clusters");
+        Assert.True(levelCounts[0] > 0, "Should have Level 0 clusters");
         // With 20k tris, we should definitely have LODs
-        Assert.That(maxLevel, Is.GreaterThan(0), "Should have generated LODs");
-        Assert.That(levelCounts[1], Is.GreaterThan(0), "Should have Level 1 clusters");
+        Assert.True(maxLevel > 0, "Should have generated LODs");
+        Assert.True(levelCounts[1] > 0, "Should have Level 1 clusters");
     }
 }

@@ -1,6 +1,5 @@
 using System.IO;
 using FlatSharp;
-using NUnit.Framework;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Assets.Schema;
 using SharpGLTF.Geometry;
@@ -11,10 +10,9 @@ using System.Linq;
 
 namespace SomeEngine.Tests;
 
-[TestFixture]
 public class IcoSphereTest
 {
-    [Test]
+    [Fact]
     public void TestIcoSphereGeneration()
     {
         // Level 3 subdivision -> 1280 triangles, 642 vertices
@@ -23,28 +21,28 @@ public class IcoSphereTest
         var (vertices, indices, attributes) =
             PrimitiveMeshGenerator.CreateIcoSphere(5);
 
-        Assert.That(indices.Length, Is.EqualTo(20480 * 3));
-        Assert.That(vertices.Length, Is.EqualTo(10242));
+        Assert.Equal(20480 * 3, indices.Length);
+        Assert.Equal(10242, vertices.Length);
 
         // Process through ClusterBuilder
         var meshAsset = ClusterBuilder.ProcessRaw(
             vertices, attributes, indices, new System.Collections.Generic.List<string>(), "IcoSphere_LOD5"
         );
 
-        Assert.That(meshAsset.Payload, Is.Not.Null);
-        Assert.That(meshAsset.Payload.Value.Length, Is.GreaterThan(0));
+        Assert.NotNull(meshAsset.Payload);
+        Assert.True(meshAsset.Payload.Value.Length > 0);
 
         // Verify attribute streams
-        Assert.That(meshAsset.Attributes, Is.Not.Null);
-        Assert.That(meshAsset.Attributes!.Count, Is.EqualTo(3), "Expected 3 attributes: NORMAL, TANGENT, TEXCOORD_0");
+        Assert.NotNull(meshAsset.Attributes);
+        Assert.Equal(3, meshAsset.Attributes!.Count);
         for (int i = 0; i < meshAsset.Attributes.Count; i++)
         {
             var a = meshAsset.Attributes[i];
-            TestContext.Out.WriteLine($"  Attr[{i}] name={a.Name} type={a.Type} comp={a.Components} norm={a.Normalized} streamIdx={a.Offset}");
+            Console.WriteLine($"  Attr[{i}] name={a.Name} type={a.Type} comp={a.Components} norm={a.Normalized} streamIdx={a.Offset}");
         }
-        Assert.That(meshAsset.Attributes[0].Name, Is.EqualTo("NORMAL"));
-        Assert.That(meshAsset.Attributes[1].Name, Is.EqualTo("TANGENT"));
-        Assert.That(meshAsset.Attributes[2].Name, Is.EqualTo("TEXCOORD_0"));
+        Assert.Equal("NORMAL", meshAsset.Attributes[0].Name);
+        Assert.Equal("TANGENT", meshAsset.Attributes[1].Name);
+        Assert.Equal("TEXCOORD_0", meshAsset.Attributes[2].Name);
 
         // Save to disk for engine to use
         string outputPath = Path.Combine(
@@ -63,7 +61,7 @@ public class IcoSphereTest
         fs.Write(buffer, 0, bytesWritten);
     }
 
-    [Test]
+    [Fact]
     public void GenerateIcoSphereGltf()
     {
         var (vertices, indices, attributes) =
@@ -121,6 +119,6 @@ public class IcoSphereTest
 
         scene.ToGltf2().SaveGLB(outputPath);
 
-        TestContext.Out.WriteLine($"Exported GLTF to {outputPath}");
+        Console.WriteLine($"Exported GLTF to {outputPath}");
     }
 }

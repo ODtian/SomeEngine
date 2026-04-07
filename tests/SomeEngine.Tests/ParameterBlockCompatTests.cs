@@ -1,8 +1,8 @@
 using System.IO;
 using System.Linq;
 using System.Text;
-using NUnit.Framework;
 using SlangShaderSharp;
+using SomeEngine.Assets.Importers;
 
 namespace SomeEngine.Tests;
 
@@ -10,21 +10,13 @@ namespace SomeEngine.Tests;
 /// 验证 Slang ParameterBlock 反射能力。
 /// 使用 SPIR-V target（Slang 内置后端，无需 dxcompiler.dll）。
 /// </summary>
-[TestFixture]
 public class ParameterBlockCompatTests
 {
-    private IGlobalSession _gs = null!;
-
-    [OneTimeSetUp]
-    public void Setup()
-    {
-        Slang.CreateGlobalSession(Slang.ApiVersion, out _gs);
-    }
-
-    [Test]
+    [Fact]
     public void ParameterBlock_ModuleReflection_ExtractsMaterialBindings()
     {
-        var source = """
+        var globalSession = SlangShaderImporter.GlobalSession;
+            var source = """
             [__AttributeUsage(_AttributeTargets.Struct)]
             struct PipelineTagAttribute { string tag; };
 
@@ -51,26 +43,26 @@ public class ParameterBlockCompatTests
             }
             """u8;
 
-        var sessionDesc = new SessionDesc
-        {
-            Targets = [new TargetDesc { Format = SlangCompileTarget.Spirv, Profile = _gs.FindProfile("glsl_460") }],
-            DefaultMatrixLayoutMode = SlangMatrixLayoutMode.ColumnMajor,
-            CompilerOptionEntries = [
-                new CompilerOptionEntry(CompilerOptionName.NoMangle, CompilerOptionValue.FromInt(1, 0)),
-                new CompilerOptionEntry(CompilerOptionName.VulkanEmitReflection, CompilerOptionValue.FromInt(1, 0)),
-            ],
-        };
+            var sessionDesc = new SessionDesc
+            {
+                Targets = [new TargetDesc { Format = SlangCompileTarget.Spirv, Profile = globalSession.FindProfile("glsl_460") }],
+                DefaultMatrixLayoutMode = SlangMatrixLayoutMode.ColumnMajor,
+                CompilerOptionEntries = [
+                    new CompilerOptionEntry(CompilerOptionName.NoMangle, CompilerOptionValue.FromInt(1, 0)),
+                    new CompilerOptionEntry(CompilerOptionName.VulkanEmitReflection, CompilerOptionValue.FromInt(1, 0)),
+                ],
+            };
 
-        _gs.CreateSession(sessionDesc, out var session);
-        var blob = Slang.CreateBlob(source);
-        var module = session.LoadModuleFromSource("test_pb", "test_pb.slang", blob, out var diag);
-        Assert.That(module, Is.Not.Null, $"Module load failed: {diag?.AsString}");
+            globalSession.CreateSession(sessionDesc, out var session);
+            var blob = Slang.CreateBlob(source);
+            var module = session.LoadModuleFromSource("test_pb", "test_pb.slang", blob, out var diag);
+            Assert.NotNull(module);
 
         // ── Module Reflection ──
         var moduleRefl = module.GetModuleReflection();
-        Assert.That(moduleRefl, Is.Not.EqualTo(DeclReflection.Null));
+        Assert.NotEqual(DeclReflection.Null, moduleRefl);
 
-        TestContext.Out.WriteLine($"Top-level declarations: {moduleRefl.Count}");
+        Console.WriteLine($"Top-level declarations: {moduleRefl.Count}");
 
         bool foundPB = false;
         var matBindings = new System.Collections.Generic.List<string>();
@@ -80,7 +72,7 @@ public class ParameterBlockCompatTests
         for (uint i = 0; i < moduleRefl.Count; i++)
         {
             var decl = moduleRefl[(int)i];
-            TestContext.Out.WriteLine($"  [{i}] {decl.Name} ({decl.Kind})");
+            Console.WriteLine($"  [{i}] {decl.Name} ({decl.Kind})");
 
             if (decl.Kind != DeclReflectionKind.Variable) continue;
 
@@ -88,7 +80,7 @@ public class ParameterBlockCompatTests
             if (v == VariableReflection.Null) continue;
 
             var vt = v.Type;
-            TestContext.Out.WriteLine($"       Type.Kind={vt.Kind}  Name={vt.Name}");
+            Console.WriteLine($"       Type.Kind={vt.Kind}  Name={vt.Name}");
 
             if (vt.Kind == SlangTypeKind.ParameterBlock)
             {
@@ -96,63 +88,63 @@ public class ParameterBlockCompatTests
                 var elem = vt.ElementType;
                 pbStructName = elem.Name;
                 pbType = elem;
-                TestContext.Out.WriteLine($"       → ParameterBlock<{elem.Name}>");
-                TestContext.Out.WriteLine($"         FieldCount={elem.FieldCount}  AttrCount={elem.AttributeCount}");
+                Console.WriteLine($"       → ParameterBlock<{elem.Name}>");
+                Console.WriteLine($"         FieldCount={elem.FieldCount}  AttrCount={elem.AttributeCount}");
 
                 for (uint f = 0; f < elem.FieldCount; f++)
                 {
                     var field = elem.GetFieldByIndex(f);
                     matBindings.Add(field.Name);
-                    TestContext.Out.WriteLine($"         Field[{f}]: {field.Name} (Kind={field.Type.Kind})");
+                    Console.WriteLine($"         Field[{f}]: {field.Name} (Kind={field.Type.Kind})");
                 }
             }
         }
 
         // ── Assertions ──
-        Assert.That(foundPB, Is.True, "Should detect ParameterBlock<T>");
-        Assert.That(pbStructName, Is.EqualTo("PBRMaterialParams"));
-        Assert.That(matBindings, Is.EqualTo(new[] { "AlbedoMap", "NormalMap", "ARMMap", "MaterialSampler" }));
+        Assert.True(foundPB, "Should detect ParameterBlock<T>");
+        Assert.Equal("PBRMaterialParams", pbStructName);
+        Assert.Equal(new[] { "AlbedoMap", "NormalMap", "ARMMap", "MaterialSampler" }, matBindings);
 
         // Assert attribute is present
-        Assert.That(pbType, Is.Not.Null);
+        Assert.NotNull(pbType);
         var pbValue = pbType!.Value;
-        Assert.That(pbValue.AttributeCount, Is.GreaterThan(0u), "Should expose user attributes");
+        Assert.True(pbValue.AttributeCount > 0u, "Should expose user attributes");
         var attr = pbValue.GetAttribute(0);
-        Assert.That(attr.Name, Is.EqualTo("PipelineTag"));
-        Assert.That(attr.ArgumentCount, Is.EqualTo(1));
-        Assert.That(attr.GetArgumentValueString(0), Is.EqualTo("ClusterShader"));
+        Assert.Equal("PipelineTag", attr.Name);
+        Assert.Equal(1u, attr.ArgumentCount);
+        Assert.Equal("ClusterShader", attr.GetArgumentValueString(0));
 
         // Global resources must NOT leak into ParameterBlock
-        Assert.That(matBindings, Does.Not.Contain("Uniforms"));
-        Assert.That(matBindings, Does.Not.Contain("SomeBuffer"));
+        Assert.DoesNotContain("Uniforms", matBindings);
+        Assert.DoesNotContain("SomeBuffer", matBindings);
 
-        TestContext.Out.WriteLine("\n=== ParameterBlock reflection PASSED ===");
+        Console.WriteLine("\n=== ParameterBlock reflection PASSED ===");
 
         // ── Compile & verify SPIR-V bytecode ──
         module.FindEntryPointByName("CSMain", out var ep);
-        Assert.That(ep, Is.Not.Null);
+        Assert.NotNull(ep);
 
         session.CreateCompositeComponentType([module, ep], out var composed, out _);
         composed!.Link(out var linked, out _);
-        Assert.That(linked, Is.Not.Null);
+        Assert.NotNull(linked);
 
         linked!.GetEntryPointCode(0, 0, out var codeBlob, out _);
-        Assert.That(codeBlob, Is.Not.Null, "Should produce SPIR-V code");
+        Assert.NotNull(codeBlob);
         var codeSize = (int)codeBlob!.GetBufferSize();
-        Assert.That(codeSize, Is.GreaterThan(0), "SPIR-V should not be empty");
-        TestContext.Out.WriteLine($"SPIR-V size: {codeSize} bytes");
+        Assert.True(codeSize > 0, "SPIR-V should not be empty");
+        Console.WriteLine($"SPIR-V size: {codeSize} bytes");
 
         // ── Linked layout — check binding spaces ──
         var layout = linked.GetLayout(0, out _);
-        Assert.That(layout, Is.Not.EqualTo(ShaderReflection.Null));
+        Assert.NotEqual(ShaderReflection.Null, layout);
 
-        TestContext.Out.WriteLine($"\nLinked layout params: {layout.ParameterCount}");
+        Console.WriteLine($"\nLinked layout params: {layout.ParameterCount}");
         for (uint i = 0; i < layout.ParameterCount; i++)
         {
             var p = layout.GetParameterByIndex(i);
-            TestContext.Out.WriteLine($"  Param[{i}]: {p.Name}  space={p.BindingSpace}  binding={p.BindingIndex}  type.kind={p.TypeLayout.Type.Kind}");
+            Console.WriteLine($"  Param[{i}]: {p.Name}  space={p.BindingSpace}  binding={p.BindingIndex}  type.kind={p.TypeLayout.Type.Kind}");
         }
 
-        TestContext.Out.WriteLine("\n=== ParameterBlock compilation + binding layout PASSED ===");
+            Console.WriteLine("\n=== ParameterBlock compilation + binding layout PASSED ===");
     }
 }

@@ -3,16 +3,14 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
-using NUnit.Framework;
 using SomeEngine.Assets.Data;
 using SomeEngine.Assets.Importers;
 
 namespace SomeEngine.Tests;
 
-[TestFixture]
 public class ClusterLodAutoCutTests
 {
-    // [Test]
+    // [Fact]
     // public void TestIcoSphereSelectionStability()
     // {
     //     // 1. Generate IcoSphere Clusters
@@ -54,7 +52,7 @@ public class ClusterLodAutoCutTests
     //     for (float camDist = 5.0f; camDist < 500.0f; camDist *= 1.5f)
     //     {
     //         var selectedIndices = new HashSet<int>();
-            
+
     //         for (int i = 0; i < allClusters.Count; i++)
     //         {
     //             var c = allClusters[i];
@@ -83,7 +81,7 @@ public class ClusterLodAutoCutTests
     //         {
     //             var queue = new Queue<int>();
     //             var visited = new HashSet<int>();
-                
+
     //             var c = allClusters[selIdx];
     //             if (c.ParentGroupId != -1 && groupToClusters.TryGetValue(c.ParentGroupId, out var parents))
     //             {
@@ -93,9 +91,8 @@ public class ClusterLodAutoCutTests
     //             while (queue.Count > 0)
     //             {
     //                 int curr = queue.Dequeue();
-    //                 Assert.That(selectedIndices.Contains(curr), Is.False, 
-    //                     $"Overlap: Cluster {selIdx} and its ancestor {curr} are both selected at distance {camDist}.");
-                    
+    //                     //                 Assert.False(selectedIndices.Contains(curr), //                     $"Overlap: Cluster {selIdx} and its ancestor {curr} are both selected at distance {camDist}.");
+
     //                 var cluster = allClusters[curr];
     //                 if (cluster.ParentGroupId != -1 && groupToClusters.TryGetValue(cluster.ParentGroupId, out var nextParents))
     //                 {
@@ -124,7 +121,7 @@ public class ClusterLodAutoCutTests
     //                 if (cluster.ParentGroupId == -1)
     //                 {
     //                     // Reached a root without finding a selection
-    //                     Assert.Fail($"Hole: Path from leaf {leafIdx} reached root {curr} without any selection at distance {camDist}.");
+    //                     throw new Xunit.Sdk.XunitException($"Hole: Path from leaf {leafIdx} reached root {curr} without any selection at distance {camDist}.");
     //                 }
 
     //                 if (groupToClusters.TryGetValue(cluster.ParentGroupId, out var parents))
@@ -136,12 +133,12 @@ public class ClusterLodAutoCutTests
     //                 }
     //             }
     //         }
-            
-    //         TestContext.Out.WriteLine($"Distance {camDist:F2}: Selected {selectedIndices.Count} clusters. Cut is valid.");
+
+    //         Console.WriteLine($"Distance {camDist:F2}: Selected {selectedIndices.Count} clusters. Cut is valid.");
     //     }
     // }
 
-    // [Test]
+    // [Fact]
     // public void ErrorIntervals_ShouldDefineNonEmptyCutForTypicalThresholds()
     // {
     //     var (vertices, indices, attributes) = PrimitiveMeshGenerator.CreateIcoSphere(5);
@@ -185,6 +182,6 @@ public class ClusterLodAutoCutTests
     //     }
 
     //     for (int i = 0; i < thresholds.Length; i++)
-    //         Assert.That(selectedCounts[i], Is.GreaterThan(0), $"Threshold {thresholds[i]} produced empty cut.");
+    //             //         Assert.True(selectedCounts[i] > 0, $"Threshold {thresholds[i]} produced empty cut.");
     // }
 }

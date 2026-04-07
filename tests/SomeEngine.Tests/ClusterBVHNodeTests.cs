@@ -1,11 +1,10 @@
-using NUnit.Framework;
 using SomeEngine.Assets.Data;
 
 namespace SomeEngine.Tests;
 
 public class ClusterBVHNodeTests
 {
-    [Test]
+    [Fact]
     public void TestLeafDataEncodingAndDecoding()
     {
         var node = new ClusterBVHNode();
@@ -19,11 +18,11 @@ public class ClusterBVHNodeTests
         node.GetLeafData(out uint actualStart, out uint actualCount);
 
         // Assert
-        Assert.That(actualStart, Is.EqualTo(expectedClusterStart));
-        Assert.That(actualCount, Is.EqualTo(expectedClusterCount));
+        Assert.Equal(expectedClusterStart, actualStart);
+        Assert.Equal(expectedClusterCount, actualCount);
     }
 
-    [Test]
+    [Fact]
     public void TestLeafDataBitBoundaries()
     {
         var node = new ClusterBVHNode();
@@ -36,7 +35,7 @@ public class ClusterBVHNodeTests
         node.GetLeafData(out uint actualStart, out uint actualCount);
 
         // Assert
-        Assert.That(actualStart, Is.EqualTo(expectedClusterStart));
-        Assert.That(actualCount, Is.EqualTo(expectedClusterCount));
+        Assert.Equal(expectedClusterStart, actualStart);
+        Assert.Equal(expectedClusterCount, actualCount);
     }
 }
