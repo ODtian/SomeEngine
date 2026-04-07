@@ -79,3 +79,11 @@ tools/eos/
 external/dxc/
 
 **/*.asset
+
+# Local tool/runtime artifacts
+.dotnet-cli/
+.dotnet_home/
+Library/
+external/UnrealEnigne/
+src/SomeEngine.Runtime/imgui.ini
+tests/SomeEngine.Tests/dotnet_test.log
