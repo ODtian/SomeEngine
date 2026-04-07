@@ -13,7 +13,9 @@ table TagEntry {
 }
 
 table PassEntry {
+    shader_guid: string;
     shader: string;                       // ShaderAsset name or path
+    entry_point: string;                  // specific entry point name (e.g. "CSDeformStatic")
     tags: [TagEntry] (fs_vector:"IList");
 }
 
@@ -28,6 +30,7 @@ table ScalarParam {
 }
 
 table MaterialAsset (fs_serializer) {
+    asset_guid: string;
     name: string;
     passes: [PassEntry] (fs_vector:"IList");
     textures: [TextureBinding] (fs_vector:"IList");

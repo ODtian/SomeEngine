@@ -8,7 +8,8 @@ public static class ShaderAssetSerializer
 {
     public static void Save(ShaderAsset asset, string path)
     {
-        int maxSize = ShaderAsset.Serializer.GetMaxSize(asset);
+        int maxSize
+         = ShaderAsset.Serializer.GetMaxSize(asset);
         byte[] buffer = new byte[maxSize];
         int bytesWritten = ShaderAsset.Serializer.Write(buffer, asset);
         

@@ -34,6 +34,7 @@ table ShaderBytecode {
     data: [ubyte];
     entry_point: string;
     stage: ShaderStage;
+    content_hash: string; // SHA-256 of bytecode (for content-based dedup)
 }
 
 table BackendReflection {
@@ -46,14 +47,37 @@ table ShaderMaterialBinding {
     resource_type: ubyte;    // 0=Texture, 1=Sampler, 2=Buffer
 }
 
+table ShaderEntryPointAttribute {
+    variant_index: int;
+    name: string;
+    args: [string];
+}
+
 table ShaderMetadata {
-    pipeline_tags: [string];
+    tags: [string];
     material_bindings: [ShaderMaterialBinding];
 }
 
+table DependencyEntry {
+    path: string;
+    content_hash: string;
+}
+
+table ImportTrace {
+    source_guid: string;
+    source_path: string;
+    sub_asset_key: string;
+    content_fingerprint: string;
+    dependencies: [DependencyEntry];
+    importer_version: uint;
+}
+
 table ShaderAsset (fs_serializer) {
+    asset_guid: string;
     name: string;
+    import_trace: ImportTrace;
     variants: [ShaderBytecode];
+    entry_point_attributes: [ShaderEntryPointAttribute];
     reflections: [BackendReflection];
     metadata: ShaderMetadata;
 }

@@ -95,6 +95,9 @@ public static class ClusterBuilder
         public byte Mat2;
         public byte Range0End;
         public byte Range1End;
+
+        // VRB batch info (packed uint, see BuildVRBBatches)
+        public uint VRBBatchInfo;
     }
 
     private struct ClusterLodBounds
@@ -279,7 +282,7 @@ public static class ClusterBuilder
         return nodes;
     }
 
-    public static MeshAsset Process(string filePath)
+    public static MeshAsset Process(string filePath, Func<string, AssetGuid>? materialGuidResolver = null)
     {
         var model = ModelRoot.Load(filePath);
         var mesh = model.LogicalMeshes[0];
@@ -390,7 +393,7 @@ public static class ClusterBuilder
             return string.Compare(a.Name, b.Name, StringComparison.Ordinal);
         });
 
-        return ProcessRaw(allPos.ToArray(), rawAttributes, allIndices.ToArray(), materialNames, mesh.Name ?? "Unnamed");
+        return ProcessRaw(allPos.ToArray(), rawAttributes, allIndices.ToArray(), materialNames, mesh.Name ?? "Unnamed", materialGuidResolver);
     }
 
     private static void BuildClusterLod(
@@ -599,7 +602,8 @@ public static class ClusterBuilder
         List<RawAttribute> rawAttributes,
         uint[] rawIndices,
         List<string> materialNames,
-        string name
+        string name,
+        Func<string, AssetGuid>? materialGuidResolver = null
     )
     {
         string tempFile = Path.GetTempFileName();
@@ -948,6 +952,60 @@ public static class ClusterBuilder
                     localIndices.Add((byte)localIdx);
                 }
 
+                // ── VRB full simulation: mirrors shader DeduplicateVertIndexes ──
+                // ─── VRB Batch Validation ───
+                // Validate using actual batch boundaries from VRBBatchInfo (variable-size batches),
+                // NOT the old fixed 32-tri windows. Batches beyond the encoded 5 are slow residual
+                // (allowed to exceed 32 unique verts).
+                {
+                    int triCount = localIndices.Count / 3;
+                    var idxSpan = CollectionsMarshal.AsSpan(localIndices);
+                    uint vrb = m.VRBBatchInfo;
+                    int encodedBatchCount = (int)((vrb >> 25) & 0x7) + 1;
+
+                    int batchStart = 0;
+                    for (int bi = 0; bi < encodedBatchCount; bi++)
+                    {
+                        int batchTriCount = (int)((vrb >> (bi * 5)) & 0x1F) + 1;
+                        int batchEnd = batchStart + batchTriCount;
+                        if (batchEnd > triCount) batchEnd = triCount;
+
+                        // 1. baseVertIndex = min local index in batch
+                        uint baseVert = 255;
+                        for (int ti = batchStart; ti < batchEnd; ti++)
+                        {
+                            baseVert = Math.Min(baseVert, (uint)idxSpan[ti * 3 + 0]);
+                            baseVert = Math.Min(baseVert, (uint)idxSpan[ti * 3 + 1]);
+                            baseVert = Math.Min(baseVert, (uint)idxSpan[ti * 3 + 2]);
+                        }
+
+                        // 2. Build usedVertMask (64-bit bitmask)
+                        ulong usedMask = 0;
+                        for (int ti = batchStart; ti < batchEnd; ti++)
+                        {
+                            for (int c = 0; c < 3; c++)
+                            {
+                                uint rebased = (uint)idxSpan[ti * 3 + c] - baseVert;
+                                if (rebased >= 64)
+                                    throw new Exception(
+                                        $"[VRB] SPAN: rebased={rebased} (>=64) batch {bi}, " +
+                                        $"cluster tris={triCount} verts={vCount}");
+                                usedMask |= 1UL << (int)rebased;
+                            }
+                        }
+
+                        int numUnique = BitOperations.PopCount(usedMask);
+                        if (numUnique > 32)
+                            throw new Exception(
+                                $"[VRB] UNIQUE VERT OVERFLOW: batch {bi} [{batchStart}..{batchEnd}) " +
+                                $"has {numUnique} unique local verts (max 32). " +
+                                $"cluster tris={triCount} verts={vCount}.");
+
+                        batchStart = batchEnd;
+                    }
+                    // Remaining tris beyond encoded batches = slow residual, no VRB constraint
+                }
+
                 int clusterSize = Unsafe.SizeOf<GPUCluster>();
                 int vSize = localPos.Count * 2;
                 int aSize = 0;
@@ -1020,8 +1078,8 @@ public static class ClusterBuilder
                         PackedCounts = packedCounts,
                         PackedMaterials = packedMaterials,
                         PackedRanges = packedRanges,
-                        Pad0 = 0,
-                        Pad1 = 0,
+                        MaterialTableOffset = 0xFFFFFFFF, // fast path (≤3 materials)
+                        VRBBatchInfo = m.VRBBatchInfo,
                     }
                 );
 
@@ -1065,6 +1123,14 @@ public static class ClusterBuilder
                 };
             }
 
+            var defaultMaterialGuids = materialNames
+                .Select(name =>
+                {
+                    AssetGuid guid = materialGuidResolver?.Invoke(name) ?? AssetGuid.Empty;
+                    return guid.IsEmpty ? string.Empty : guid.ToFlatString();
+                })
+                .ToArray();
+
             var meshAsset = new MeshAsset
             {
                 Name = name,
@@ -1088,6 +1154,7 @@ public static class ClusterBuilder
                     Z = quantOrigin.Z,
                 },
                 QuantStep = quantStep,
+                DefaultMaterialGuids = defaultMaterialGuids,
                 DefaultMaterialSlots = materialNames.ToArray(),
             };
 
@@ -1181,6 +1248,9 @@ public static class ClusterBuilder
         List<uint> globalIndices
     )
     {
+        // Build VRB batch info (linear scan, no reorder)
+        uint vrbBatchInfo = BuildVRBBatches(tris);
+
         int startIndex = globalIndices.Count;
         var uniqueMats = new List<byte>();
         int range0End = 0, range1End = 0;
@@ -1189,7 +1259,7 @@ public static class ClusterBuilder
 
         for (int i = 0; i < tris.Length; i++)
         {
-            var t = tris[i];
+            ref readonly var t = ref tris[i];
             if (!uniqueMats.Contains(t.mat))
             {
                 uniqueMats.Add(t.mat);
@@ -1220,8 +1290,90 @@ public static class ClusterBuilder
                 Mat2 = uniqueMats.Count > 2 ? uniqueMats[2] : (byte)0,
                 Range0End = (byte)range0End,
                 Range1End = (byte)range1End,
+                VRBBatchInfo = vrbBatchInfo,
             }
         );
+    }
+
+
+    /// <summary>
+    /// Build VRB batch info by linearly scanning triangles and closing batches
+    /// when unique vertex count exceeds 32. Preserves meshopt ordering (no reorder).
+    /// Returns a packed uint encoding up to 5 batch tri-counts.
+    /// Triangles beyond the 5th batch are implicitly a "slow residual" at runtime.
+    /// </summary>
+    private static uint BuildVRBBatches(ReadOnlySpan<TempTri> tris)
+    {
+        const int MaxUniqueVerts = 32;
+        const int MaxBatchesEncoded = 5;
+
+        Span<int> batchTriCounts = stackalloc int[MaxBatchesEncoded + 16]; // generous space
+        int batchIndex = 0;
+        int currentBatchTriCount = 0;
+        var batchVerts = new HashSet<uint>();
+        byte currentMat = tris[0].mat;
+
+        for (int i = 0; i < tris.Length; i++)
+        {
+            ref readonly var tri = ref tris[i];
+
+            // Close batch at material boundary (ensures each VRB batch is material-pure)
+            if (tri.mat != currentMat && currentBatchTriCount > 0)
+            {
+                batchTriCounts[batchIndex++] = currentBatchTriCount;
+                currentBatchTriCount = 0;
+                batchVerts.Clear();
+                currentMat = tri.mat;
+            }
+
+            // Test adding this triangle
+            int newCount = batchVerts.Count;
+            if (!batchVerts.Contains(tri.v0)) newCount++;
+            if (!batchVerts.Contains(tri.v1)) newCount++;
+            if (!batchVerts.Contains(tri.v2)) newCount++;
+
+            if (newCount > MaxUniqueVerts && currentBatchTriCount > 0)
+            {
+                // Close current batch
+                batchTriCounts[batchIndex++] = currentBatchTriCount;
+                currentBatchTriCount = 0;
+                batchVerts.Clear();
+
+                // Re-add current triangle to new batch
+                batchVerts.Add(tri.v0);
+                batchVerts.Add(tri.v1);
+                batchVerts.Add(tri.v2);
+                currentBatchTriCount = 1;
+            }
+            else
+            {
+                batchVerts.Add(tri.v0);
+                batchVerts.Add(tri.v1);
+                batchVerts.Add(tri.v2);
+                currentBatchTriCount++;
+            }
+
+            // Close batch at 32 tris
+            if (currentBatchTriCount == 32)
+            {
+                batchTriCounts[batchIndex++] = currentBatchTriCount;
+                currentBatchTriCount = 0;
+                batchVerts.Clear();
+            }
+        }
+
+        // Close final batch
+        if (currentBatchTriCount > 0)
+            batchTriCounts[batchIndex++] = currentBatchTriCount;
+
+        // Encode: up to 5 batches in a uint
+        int encodedCount = Math.Min(batchIndex, MaxBatchesEncoded);
+        uint packed = 0;
+        for (int i = 0; i < encodedCount; i++)
+            packed |= (uint)(batchTriCounts[i] - 1) << (i * 5);
+        packed |= (uint)(encodedCount - 1) << 25;
+
+        return packed;
     }
 
     private static void Clusterize(
@@ -1310,7 +1462,25 @@ public static class ClusterBuilder
                     tris[t] = new TempTri { v0 = v0, v1 = v1, v2 = v2, mat = mat };
                 }
 
-                Array.Sort(tris, (a, b) => a.mat.CompareTo(b.mat));
+                // Stable bucket grouping: preserves meshopt vertex cache order within each material.
+                // Array.Sort is unstable and would destroy spatial locality even for single-material meshlets.
+                {
+                    var buckets = new List<TempTri>[256];
+                    for (int bi = 0; bi < tris.Length; bi++)
+                    {
+                        byte bmat = tris[bi].mat;
+                        buckets[bmat] ??= new List<TempTri>();
+                        buckets[bmat].Add(tris[bi]);
+                    }
+                    int pos = 0;
+                    for (int bm = 0; bm < 256; bm++)
+                    {
+                        if (buckets[bm] == null) continue;
+                        foreach (var tri in buckets[bm])
+                            tris[pos++] = tri;
+                    }
+                }
+
 
                 var uniqueMats = new List<byte>();
                 int currentChunkStart = 0;

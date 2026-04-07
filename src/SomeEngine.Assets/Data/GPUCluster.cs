@@ -49,11 +49,11 @@ public struct GPUCluster
     // 52: uint PackedRanges — [range0End:8][range1End:8][Pad:16]
     public uint PackedRanges;
 
-    // 56: uint Pad0
-    public uint Pad0;
+    // 56: uint MaterialTableOffset — slow path (>3 materials) external table byte offset within page (0xFFFFFFFF = fast path)
+    public uint MaterialTableOffset;
 
-    // 60: uint Pad1
-    public uint Pad1;
+    // 60: uint VRBBatchInfo — VRB batch encoding (fast path: ≤5 batches packed, see BuildVRBBatches)
+    public uint VRBBatchInfo;
 
     // Total: 64 bytes
 

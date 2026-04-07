@@ -24,6 +24,8 @@ table TagOverride {
 }
 
 table MaterialInstanceAsset (fs_serializer) {
+    asset_guid: string;
+    parent_guid: string;
     parent: string;                       // parent Material asset path
     overrides: [ParamOverride] (fs_vector:"IList");
     scalar_overrides: [ScalarOverride] (fs_vector:"IList");
