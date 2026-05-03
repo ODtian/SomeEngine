@@ -681,3 +681,24 @@
 - watcher 暂时降级为空实现：`AssetDatabase` 不再实现 `IDisposable`，`StartWatching()` / `StopWatching()` 为 no-op。
 - 验证结果更新为 `129 passed, 0 failed, 1 skipped`；`dotnet build SomeEngine.slnx` 通过。
 
+## [2026-04-07] BATCH-07b DI 驱动的注册模式 + Mesh Importer
+- 删除 `AssetTypeRegistry.cs` 和 `AssetTypeRegistration.cs`，消灭静态全局可变状态。
+- 4 个 handler 从 `AssetTypeRegistration` 内部 nested class 提取为 `Pipeline/` 下独立 public 类（`ShaderAssetTypeHandler`、`MaterialAssetTypeHandler`、`MaterialInstanceAssetTypeHandler`、`MeshAssetTypeHandler`）。
+- `AssetDatabase` 构造函数改为接受 `IEnumerable<IAssetTypeHandler>` + `IEnumerable<IAssetImporter>`，替代静态 registry 查找。
+- 新增 `GltfSourceImporter : IAssetImporter`，走统一 importer 路径导入 `.gltf/.glb` → `.mesh.asset` + `.material.asset`。
+- `ClusterBuilder.Process()` 的 `materialGuidResolver` 回调已删除。
+- Runtime `TryImportModelToMesh()` 简化为 `assetDb.Import(resolvedPath)`。
+- Source Generator (`AssetPipelineCatalogGenerator`) 自动发现 handler/importer 实现类，生成 `GeneratedAssetPipelineCatalog`。
+
+## [2026-04-10] BATCH-07c 泛型 AssetProvider + TextureAsset Pipeline
+- 用泛型 `AssetProvider<T>` + 非泛型 `IAssetProvider` 桥接替换 `IAssetTypeHandler`，接口彻底删除。
+- `AssetDatabase` 引入 `TypedStore<T>` 按 `typeof(T)` 分桶缓存，运行时零装箱。`Load<T>` 约束放宽为 `where T : class`（支持 `ITexture` 等非 IAsset 类型）。`AssetDatabase` 实现 `IDisposable`。
+- 5 个 `AssetProvider<T>`：Shader / Material / MaterialInstance / Mesh / TextureData（Assets 层）；1 个 GPU Provider：`TextureAssetProvider : AssetProvider<ITexture>`（Render 层，StbImageSharp 解码 + 1x1 raw RGBA 快路）。
+- 新增 `texture_asset.fbs` FlatBuffer schema + `TextureAssetSerializer`。
+- 新增 `WellKnownAssets` 常量类（3 个默认纹理稳定 GUID）。`tools/GenerateDefaultAssets` 更新，生成对应 `.texture.asset` 文件。
+- `GltfSourceImporter` 更新：提取 GLTF 图片 → `.texture.asset`，`MaterialAsset.TextureBinding.Path` 改为存 `AssetGuid` 字符串。
+- `MaterialAssetLoader` / `MaterialInstanceLoader` 纹理引用从路径改为 `AssetGuid.TryParse()`。
+- 删除 `RenderGraph.GetOrCreatePersistentTexture`、`TextureFileLoader.CreateTexture`、`ClusterMaterials.cs`（死代码）。
+- `AssetPipelineCatalogGenerator` 更新：自动发现 `IAssetProvider` 替代 `IAssetTypeHandler`。
+- `docs/assets/pipeline_overview.md` 重写：删除过期的 `IAssetTypeHandler` / `AssetTypeRegistry` 段落，替换为 `AssetProvider<T>` 模型、Providers 表、Default Textures 段落。
+- 验证结果：`140 passed, 0 failed, 1 skipped`；`dotnet build` 0 errors, 17 warnings (pre-existing)。
