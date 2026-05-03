@@ -1,7 +1,12 @@
 <Project TreatAsLocalProperty="Platform">
   <PropertyGroup>
+    <SomeEngineRepositoryRoot>$(MSBuildThisFileDirectory)</SomeEngineRepositoryRoot>
+
     <!-- Diligent 不支持 AnyCPU，自动重定向为 x64 -->
     <Platform
       Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU' Or '$(Platform)' == 'Any CPU'">x64</Platform>
   </PropertyGroup>
+
+  <Import Project="$(SomeEngineRepositoryRoot)build\Diligent.props"
+          Condition="Exists('$(SomeEngineRepositoryRoot)build\Diligent.props')" />
 </Project>

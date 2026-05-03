@@ -1,0 +1,4 @@
+<Project>
+  <Import Project="$(MSBuildThisFileDirectory)build\Diligent.LocalBuild.targets"
+          Condition="Exists('$(MSBuildThisFileDirectory)build\Diligent.LocalBuild.targets')" />
+</Project>

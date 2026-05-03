@@ -1,0 +1,53 @@
+<Project>
+  <PropertyGroup Condition="'$(DiligentUseLocalBuild)' == 'true'">
+    <DiligentLocalPlatform Condition="'$(Platform)' == 'x64'">x64</DiligentLocalPlatform>
+    <DiligentLocalPlatform Condition="'$(Platform)' == 'x86' Or '$(Platform)' == 'Win32'">x86</DiligentLocalPlatform>
+
+    <DiligentLocalNativeRid Condition="'$(DiligentLocalPlatform)' == 'x64'">win-x64</DiligentLocalNativeRid>
+    <DiligentLocalNativeRid Condition="'$(DiligentLocalPlatform)' == 'x86'">win-x86</DiligentLocalNativeRid>
+
+    <DiligentLocalManagedDir>$(DiligentLocalBuildRoot)\bin\$(DiligentLocalPlatform)\$(DiligentConfiguration)\$(DiligentLocalManagedTfm)</DiligentLocalManagedDir>
+    <DiligentLocalManagedDll>$(DiligentLocalManagedDir)\Diligent-GraphicsEngine.NET.dll</DiligentLocalManagedDll>
+    <DiligentLocalManagedPdb>$(DiligentLocalManagedDir)\Diligent-GraphicsEngine.NET.pdb</DiligentLocalManagedPdb>
+    <DiligentLocalNativeDir>$(DiligentLocalBuildRoot)\native\$(DiligentLocalNativeRid)</DiligentLocalNativeDir>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(UsesDiligentEngine)' == 'true' And '$(DiligentUseLocalBuild)' == 'true'">
+    <Reference Include="Diligent-GraphicsEngine.NET">
+      <HintPath>$(DiligentLocalManagedDll)</HintPath>
+      <Private>true</Private>
+    </Reference>
+
+    <Content Include="$(DiligentLocalManagedPdb)" Condition="Exists('$(DiligentLocalManagedPdb)')">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+
+    <Content Include="$(DiligentLocalNativeDir)\*.dll" Condition="'$(DiligentLocalNativeDir)' != ''">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </Content>
+  </ItemGroup>
+
+  <Target Name="ValidateDiligentLocalBuild"
+          BeforeTargets="ResolveReferences"
+          Condition="'$(UsesDiligentEngine)' == 'true' And '$(DiligentUseLocalBuild)' == 'true'">
+    <Error Condition="'$(DiligentLocalPlatform)' == ''"
+           Text="Diligent local build supports Platform=x64 or Platform=x86. Current Platform='$(Platform)'." />
+    <Error Condition="!Exists('$(DiligentLocalManagedDll)')"
+           Text="Diligent local managed DLL was not found: $(DiligentLocalManagedDll). From the repo root, run: uv run .\external\DiligentCore\BuildTools\.NET\dotnet-build-package.py -c $(DiligentConfiguration) -d .\external\DiligentCore. Or set DiligentConfiguration/DiligentLocalBuildRoot." />
+    <Error Condition="!Exists('$(DiligentLocalNativeDir)')"
+           Text="Diligent local native directory was not found: $(DiligentLocalNativeDir). From the repo root, run: uv run .\external\DiligentCore\BuildTools\.NET\dotnet-build-package.py -c $(DiligentConfiguration) -d .\external\DiligentCore. Or set DiligentConfiguration/DiligentLocalBuildRoot." />
+    <Message Importance="High"
+             Text="Diligent: using local $(DiligentConfiguration) build from $(DiligentLocalBuildRoot)" />
+  </Target>
+
+  <Target Name="ShowDiligentPackageReference"
+          BeforeTargets="ResolveReferences"
+          Condition="'$(UsesDiligentEngine)' == 'true' And '$(DiligentUseLocalBuild)' != 'true'">
+    <Message Importance="High"
+             Text="Diligent: using NuGet package DiligentGraphics.DiligentEngine.Core $(DiligentPackageVersion)" />
+  </Target>
+</Project>
