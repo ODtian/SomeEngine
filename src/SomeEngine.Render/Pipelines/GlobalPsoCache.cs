@@ -177,7 +177,13 @@ public class GlobalPsoCache : IDisposable
                 if (xImms[i].SamplerOrTextureName != yImms[i].SamplerOrTextureName ||
                     xImms[i].ShaderStages != yImms[i].ShaderStages ||
                     xImms[i].Desc.MinFilter != yImms[i].Desc.MinFilter ||
-                    xImms[i].Desc.AddressU != yImms[i].Desc.AddressU) // simplified check
+                    xImms[i].Desc.MagFilter != yImms[i].Desc.MagFilter ||
+                    xImms[i].Desc.MipFilter != yImms[i].Desc.MipFilter ||
+                    xImms[i].Desc.AddressU != yImms[i].Desc.AddressU ||
+                    xImms[i].Desc.AddressV != yImms[i].Desc.AddressV ||
+                    xImms[i].Desc.AddressW != yImms[i].Desc.AddressW ||
+                    xImms[i].Desc.ComparisonFunc != yImms[i].Desc.ComparisonFunc ||
+                    xImms[i].Desc.MaxAnisotropy != yImms[i].Desc.MaxAnisotropy)
                     return false;
             }
         }

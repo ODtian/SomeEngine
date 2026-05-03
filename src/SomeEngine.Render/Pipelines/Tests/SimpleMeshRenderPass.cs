@@ -107,8 +107,8 @@ public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDi
 
         var shaderAsset = SlangShaderImporter.Import(slangPath);
 
-        using var vs = shaderAsset.CreateShader(context, "VSMain");
-        using var ps = shaderAsset.CreateShader(context, "PSMain");
+        var vs = shaderAsset.CreateShader(context, "VSMain");
+        var ps = shaderAsset.CreateShader(context, "PSMain");
 
         var layoutElements = new[]
         {
@@ -175,7 +175,7 @@ public class SimpleMeshRenderPass(RenderContext context) : IRenderGraphPass, IDi
             throw new Exception("Failed to create SimpleMesh PSO");
 
         _pso!
-            .GetStaticVariableByName(ShaderType.Vertex, "g_Constants")
+            .GetStaticVariableByReflectedBinding(context, shaderAsset, ShaderType.Vertex, "g_Constants")
             ?.Set(_cb!, SetShaderResourceFlags.None);
         _srb = _pso!.CreateShaderResourceBinding(true);
     }

@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 using Diligent;
+using SharpGen.Runtime;
 using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Graph;
@@ -8,6 +10,13 @@ namespace SomeEngine.Render.Graph;
 internal class PassMetadata
 {
     public bool Active;
+    public List<(
+        RenderGraphHandle Handle,
+        ResourceState EntryState,
+        ResourceState ExitState,
+        RenderGraphAccess Access,
+        SubResourceRange Range
+    )> Usages = [];
     public List<(RenderGraphHandle Handle, ResourceState State, SubResourceRange Range)> Reads = [];
     public List<(RenderGraphHandle Handle, ResourceState State, SubResourceRange Range)> Writes =
     [];
@@ -23,6 +32,18 @@ public class RenderGraph : IDisposable
     private readonly Dictionary<int, IBuffer> _importedBuffers = [];
     private readonly List<PassMetadata> _passMetadata = [];
     private readonly HashSet<int> _markedOutputResources = [];
+    private readonly List<TextureExtraction> _textureExtractions = [];
+    private readonly List<BufferExtraction> _bufferExtractions = [];
+
+    private readonly record struct TextureExtraction(
+        RenderGraphHandle Handle,
+        Action<ITexture?> Sink
+    );
+
+    private readonly record struct BufferExtraction(
+        RenderGraphHandle Handle,
+        Action<IBuffer?> Sink
+    );
 
     // Compile state
     private readonly struct CompiledBarrier(
@@ -57,6 +78,13 @@ public class RenderGraph : IDisposable
         )> RequiredStates { get; } = [];
     }
 
+    private sealed class GpuPassTimingSample(int passIndex, string name, IQuery query)
+    {
+        public int PassIndex { get; } = passIndex;
+        public string Name { get; } = name;
+        public IQuery Query { get; } = query;
+    }
+
     private readonly List<CompiledPass> _compiledPasses = [];
     private readonly List<int> _executionOrder = [];
     private readonly HashSet<int> _activeResourceIds = [];
@@ -76,9 +104,26 @@ public class RenderGraph : IDisposable
     private IFence? _fence;
     private ulong _fenceValue;
     private readonly Queue<(ulong Fence, IDisposable Resource)> _deferredReleases = new();
-    private readonly List<(string Name, double Ms)> _lastPassTimings = [];
+    private readonly List<(int PassIndex, string Name, double Ms)> _lastPassTimings = [];
+    private readonly List<GpuPassTimingSample> _pendingGpuPassTimings = [];
+    private readonly bool _cpuPassTimingEnabled = ReadBooleanEnvironmentVariable(
+        "SOMEENGINE_CPU_PASS_TIMINGS"
+    );
+    private readonly bool _gpuPassTimingEnabled = ReadBooleanEnvironmentVariable(
+        "SOMEENGINE_GPU_PASS_TIMINGS"
+    );
+    private readonly bool _debugPassMarkersEnabled = ReadBooleanEnvironmentVariable(
+        "SOMEENGINE_RENDERDOC_PASS_MARKERS"
+    );
+    private readonly bool _debugPassOrderEnabled = ReadBooleanEnvironmentVariable(
+        "SOMEENGINE_RENDERGRAPH_PASS_ORDER"
+    );
+    private ulong _pendingGpuTimingFence;
+    private int _pendingGpuTimingFrame;
+    private bool _gpuPassTimingUnavailable;
     private int _executeFrameCount;
     private bool _debugPassOrderOnce = true;
+    private const int TimingReportInterval = 120;
 
     // Physical resource resolution (per-frame, keyed by resource index)
     private ITexture?[] _resolvedTextures = [];
@@ -123,6 +168,8 @@ public class RenderGraph : IDisposable
         _importedBuffers.Clear();
         _passMetadata.Clear();
         _markedOutputResources.Clear();
+        _textureExtractions.Clear();
+        _bufferExtractions.Clear();
         _compiledPasses.Clear();
         _executionOrder.Clear();
         _activeResourceIds.Clear();
@@ -222,6 +269,28 @@ public class RenderGraph : IDisposable
         _markedOutputResources.Add(h.Index);
     }
 
+    public void QueueTextureExtraction(RenderGraphHandle h, Action<ITexture?> sink)
+    {
+        if (!h.IsValid)
+            return;
+        if (sink == null)
+            throw new ArgumentNullException(nameof(sink));
+
+        _textureExtractions.Add(new TextureExtraction(h, sink));
+        _markedOutputResources.Add(h.Index);
+    }
+
+    public void QueueBufferExtraction(RenderGraphHandle h, Action<IBuffer?> sink)
+    {
+        if (!h.IsValid)
+            return;
+        if (sink == null)
+            throw new ArgumentNullException(nameof(sink));
+
+        _bufferExtractions.Add(new BufferExtraction(h, sink));
+        _markedOutputResources.Add(h.Index);
+    }
+
     public RenderGraphHandle GetResourceHandle(string name)
     {
         if (_resourceLookup.TryGetValue(name, out int index))
@@ -300,6 +369,12 @@ public class RenderGraph : IDisposable
             }
         }
 
+        foreach (int sinkResourceId in sinkResources)
+        {
+            if (sinkResourceId >= 0 && sinkResourceId < _resources.Count)
+                _activeResourceIds.Add(sinkResourceId);
+        }
+
         if (device != null || getMemoryReqs != null)
         {
             AllocateMemoryHeaps(device, getMemoryReqs, firstPass, lastPass);
@@ -310,7 +385,13 @@ public class RenderGraph : IDisposable
     {
         var deviceContext = context.ImmediateContext;
 
-        if (_compiledPasses.Count == 0 || _executionOrder.Count == 0)
+        bool hasExtractions = _textureExtractions.Count > 0 || _bufferExtractions.Count > 0;
+        if (_compiledPasses.Count == 0 && !hasExtractions)
+        {
+            return;
+        }
+
+        if (_executionOrder.Count == 0 && !hasExtractions)
         {
             return;
         }
@@ -430,8 +511,21 @@ public class RenderGraph : IDisposable
 
         // Execute passes
         var rgContext = new RenderGraphContext(this, context);
-        var passSw = new System.Diagnostics.Stopwatch();
-        _lastPassTimings.Clear();
+        System.Diagnostics.Stopwatch? passSw = _cpuPassTimingEnabled
+            ? new System.Diagnostics.Stopwatch()
+            : null;
+        if (_cpuPassTimingEnabled)
+            _lastPassTimings.Clear();
+        ReportCompletedGpuPassTimings();
+
+        int frameNumber = _executeFrameCount + 1;
+        bool collectGpuTimingThisFrame =
+            _gpuPassTimingEnabled
+            && !_gpuPassTimingUnavailable
+            && _pendingGpuPassTimings.Count == 0
+            && frameNumber % TimingReportInterval == 0;
+        if (collectGpuTimingThisFrame)
+            _pendingGpuTimingFrame = frameNumber;
 
         foreach (int passIndex in _executionOrder)
         {
@@ -439,12 +533,12 @@ public class RenderGraph : IDisposable
             if (!compiledPass.Active)
                 continue;
 
-            if (_debugPassOrderOnce)
+            if (_debugPassOrderEnabled && _debugPassOrderOnce)
             {
                 Console.Write($"  [{passIndex}]{compiledPass.Pass.Name}");
             }
         }
-        if (_debugPassOrderOnce)
+        if (_debugPassOrderEnabled && _debugPassOrderOnce)
         {
             Console.WriteLine();
             _debugPassOrderOnce = false;
@@ -456,149 +550,118 @@ public class RenderGraph : IDisposable
             if (!compiledPass.Active)
                 continue;
 
-            passSw.Restart();
+            passSw?.Restart();
+            IQuery? gpuTimingQuery = null;
+            bool debugGroupStarted = false;
 
-            if (deviceContext != null && compiledPass.PreBarriers.Count > 0)
+            try
             {
-                var transitions = new List<StateTransitionDesc>();
-
-                foreach (var barrier in compiledPass.PreBarriers)
+                if (deviceContext != null)
                 {
-                    if (barrier.Handle.Index < 0 || barrier.Handle.Index >= _resources.Count)
+                    gpuTimingQuery = BeginGpuPassTiming(
+                        context,
+                        deviceContext,
+                        passIndex,
+                        compiledPass.Pass.Name,
+                        collectGpuTimingThisFrame
+                    );
+
+                    if (_debugPassMarkersEnabled || collectGpuTimingThisFrame)
+                    {
+                        deviceContext.BeginDebugGroup(
+                            compiledPass.Pass.Name,
+                            new Vector4(0.2f, 0.55f, 1.0f, 1.0f)
+                        );
+                        debugGroupStarted = true;
+                    }
+                }
+
+                if (deviceContext != null && compiledPass.PreBarriers.Count > 0)
+                {
+                    var transitions = new StateTransitionDesc[compiledPass.PreBarriers.Count];
+                    int transitionCount = 0;
+
+                    foreach (var barrier in compiledPass.PreBarriers)
+                    {
+                        if (TryBuildStateTransitionDesc(barrier, out var transition))
+                            transitions[transitionCount++] = transition;
+                    }
+
+                    FlushResourceTransitions(context, transitions, transitionCount);
+                }
+
+                foreach (var (handle, requiredState, _) in compiledPass.RequiredStates)
+                {
+                    if (!handle.IsValid)
                         continue;
 
-                    IDeviceObject? deviceObj = null;
-                    var res = _resources[barrier.Handle.Index];
-                    if (res.Kind == ResourceKind.Texture)
+                    _resources[handle.Index] = _resources[handle.Index] with
                     {
-                        deviceObj = _resolvedTextures[barrier.Handle.Index];
-                    }
-                    else if (res.Kind == ResourceKind.Buffer)
-                    {
-                        deviceObj = _resolvedBuffers[barrier.Handle.Index];
-                    }
-
-                    if (deviceObj != null)
-                    {
-                        var resIdx = barrier.Handle.Index;
-                        // Resources that still use Diligent's internal state tracking:
-                        // imported resources, and dynamic/staging buffers (no D3D12 backing).
-                        bool isImported =
-                            _importedTextures.ContainsKey(resIdx)
-                            || _importedBuffers.ContainsKey(resIdx);
-                        if (
-                            !isImported
-                            && res.Kind == ResourceKind.Buffer
-                            && _bufferDescs.TryGetValue(resIdx, out var bd)
-                            && bd.Usage != Usage.Default
-                            && bd.Usage != Usage.Immutable
-                        )
-                        {
-                            isImported = true;
-                        }
-
-                        ResourceState oldState;
-                        StateTransitionFlags flags;
-
-                        if (isImported)
-                        {
-                            // Imported resources: let Diligent auto-detect from its
-                            // internal whole-resource tracker (which is correct for these).
-                            oldState = ResourceState.Unknown;
-                            flags = StateTransitionFlags.UpdateState;
-
-                            if (
-                                barrier.OldState == ResourceState.UnorderedAccess
-                                && barrier.NewState == ResourceState.UnorderedAccess
-                            )
-                            {
-                                oldState = ResourceState.UnorderedAccess;
-                                flags = StateTransitionFlags.None;
-                            }
-                        }
-                        else
-                        {
-                            // RenderGraph-managed resources: SetState(Unknown) was called,
-                            // so Diligent will use our explicit OldState directly.
-                            oldState = barrier.OldState;
-                            flags = StateTransitionFlags.None;
-
-                            if (
-                                barrier.OldState == ResourceState.UnorderedAccess
-                                && barrier.NewState == ResourceState.UnorderedAccess
-                            )
-                            {
-                                oldState = ResourceState.UnorderedAccess;
-                            }
-
-                            // Map tracker's Unknown (never used) to Undefined
-                            // (= D3D12_RESOURCE_STATE_COMMON, the initial physical state).
-                            if (oldState == ResourceState.Unknown)
-                                oldState = ResourceState.Undefined;
-                        }
-
-                        transitions.Add(
-                            new StateTransitionDesc
-                            {
-                                Resource = deviceObj,
-                                OldState = oldState,
-                                NewState = barrier.NewState,
-                                Flags = flags,
-                                FirstMipLevel = barrier.FirstMipLevel,
-                                MipLevelsCount =
-                                    barrier.MipLevelCount == uint.MaxValue
-                                        ? Diligent.Native.RemainingMipLevels
-                                        : barrier.MipLevelCount,
-                                FirstArraySlice = barrier.FirstArraySlice,
-                                ArraySliceCount =
-                                    barrier.ArraySliceCount == uint.MaxValue
-                                        ? Diligent.Native.RemainingArraySlices
-                                        : barrier.ArraySliceCount,
-                            }
-                        );
-                    }
+                        CurrentState = requiredState,
+                    };
                 }
 
-                if (transitions.Count > 0)
-                {
-                    // Unbind RTs before transitioning to avoid Diligent info spam
-                    deviceContext.SetRenderTargets([], null, ResourceStateTransitionMode.None);
-                    deviceContext.TransitionResourceStates([.. transitions]);
-                }
+                compiledPass.Pass.Execute(rgContext);
             }
-
-            foreach (var (handle, requiredState, _) in compiledPass.RequiredStates)
+            finally
             {
-                if (!handle.IsValid)
-                    continue;
-
-                _resources[handle.Index] = _resources[handle.Index] with
+                if (gpuTimingQuery != null && deviceContext != null)
                 {
-                    CurrentState = requiredState,
-                };
+                    EndGpuPassTiming(
+                        deviceContext,
+                        gpuTimingQuery,
+                        passIndex,
+                        compiledPass.Pass.Name
+                    );
+                }
+
+                if (debugGroupStarted)
+                    deviceContext!.EndDebugGroup();
             }
 
-            compiledPass.Pass.Execute(rgContext);
-            passSw.Stop();
-            _lastPassTimings.Add((compiledPass.Pass.Name, passSw.Elapsed.TotalMilliseconds));
+            if (passSw != null)
+            {
+                passSw.Stop();
+                _lastPassTimings.Add(
+                    (passIndex, compiledPass.Pass.Name, passSw.Elapsed.TotalMilliseconds)
+                );
+            }
         }
 
         _executeFrameCount++;
-        if (_executeFrameCount % 120 == 0)
+        if (_cpuPassTimingEnabled && _executeFrameCount % TimingReportInterval == 0)
         {
-            Console.WriteLine("[Pass Timings]");
-            foreach (var (name, ms) in _lastPassTimings)
+            double totalMs = 0.0;
+            foreach (var (_, _, ms) in _lastPassTimings)
+                totalMs += ms;
+
+            List<(int PassIndex, string Name, double Ms)> topPasses = [.. _lastPassTimings];
+            topPasses.Sort(static (a, b) => b.Ms.CompareTo(a.Ms));
+
+            Console.WriteLine($"[Pass Timings] total={totalMs:F3}ms active={_lastPassTimings.Count}");
+            int printed = 0;
+            foreach (var (timedPassIndex, name, ms) in topPasses)
             {
-                if (ms >= 0.1)
-                    Console.WriteLine($"  {name, -40} {ms, 6:F1}ms");
+                if (printed >= 25)
+                    break;
+
+                Console.WriteLine($"  [{timedPassIndex,3}] {name, -40} {ms, 8:F3}ms");
+                printed++;
             }
         }
+
+        FlushExtractions();
 
         // Signal fence on GPU timeline after all passes
         if (_fence != null)
         {
             _fenceValue++;
             deviceContext?.EnqueueSignal(_fence, _fenceValue);
+
+            if (collectGpuTimingThisFrame && _pendingGpuPassTimings.Count > 0)
+            {
+                _pendingGpuTimingFence = _fenceValue;
+            }
         }
     }
 
@@ -669,31 +732,40 @@ public class RenderGraph : IDisposable
 
     // ── Internal methods for Builder ──
 
-    internal void RegisterResourceRead(
+    internal void RegisterResourceUse(
         RenderGraphHandle handle,
         int passIndex,
-        ResourceState state,
+        ResourceState entryState,
+        ResourceState exitState,
+        RenderGraphAccess access,
         SubResourceRange range
     )
     {
         if (!handle.IsValid || passIndex < 0 || passIndex >= _passMetadata.Count)
             return;
 
-        _passMetadata[passIndex].Reads.Add((handle, state, range));
+        var meta = _passMetadata[passIndex];
+        meta.Usages.Add((handle, entryState, exitState, access, range));
+
+        if ((access & RenderGraphAccess.Read) != 0)
+            meta.Reads.Add((handle, entryState, range));
+        if ((access & RenderGraphAccess.Write) != 0)
+            meta.Writes.Add((handle, exitState, range));
     }
+
+    internal void RegisterResourceRead(
+        RenderGraphHandle handle,
+        int passIndex,
+        ResourceState state,
+        SubResourceRange range
+    ) => RegisterResourceUse(handle, passIndex, state, state, RenderGraphAccess.Read, range);
 
     internal void RegisterResourceWrite(
         RenderGraphHandle handle,
         int passIndex,
         ResourceState state,
         SubResourceRange range
-    )
-    {
-        if (!handle.IsValid || passIndex < 0 || passIndex >= _passMetadata.Count)
-            return;
-
-        _passMetadata[passIndex].Writes.Add((handle, state, range));
-    }
+    ) => RegisterResourceUse(handle, passIndex, state, state, RenderGraphAccess.Write, range);
 
     // ── Internal methods for Context (resource resolution) ──
 
@@ -752,6 +824,178 @@ public class RenderGraph : IDisposable
         return buffer?.GetDefaultView(type);
     }
 
+    internal bool TryBuildResourceTransition(
+        RenderGraphHandle handle,
+        ResourceState oldState,
+        ResourceState newState,
+        out StateTransitionDesc transition
+    ) => TryBuildResourceTransition(handle, oldState, newState, SubResourceRange.All, out transition);
+
+    internal bool TryBuildResourceTransition(
+        RenderGraphHandle handle,
+        ResourceState oldState,
+        ResourceState newState,
+        SubResourceRange range,
+        out StateTransitionDesc transition
+    ) => TryBuildStateTransitionDesc(
+        new CompiledBarrier(
+            handle,
+            oldState,
+            newState,
+            range.FirstMipLevel,
+            range.MipLevelCount,
+            range.FirstArraySlice,
+            range.ArraySliceCount
+        ),
+        out transition);
+
+    private bool TryBuildStateTransitionDesc(
+        CompiledBarrier barrier,
+        out StateTransitionDesc transition
+    )
+    {
+        transition = default;
+        if (!barrier.Handle.IsValid || barrier.Handle.Index < 0 || barrier.Handle.Index >= _resources.Count)
+            return false;
+
+        if (barrier.OldState == barrier.NewState && barrier.NewState != ResourceState.UnorderedAccess)
+            return false;
+
+        int resIdx = barrier.Handle.Index;
+        var res = _resources[resIdx];
+        IDeviceObject? deviceObj = res.Kind switch
+        {
+            ResourceKind.Texture => _resolvedTextures[resIdx],
+            ResourceKind.Buffer => _resolvedBuffers[resIdx],
+            _ => null,
+        };
+        if (deviceObj == null)
+            return false;
+
+        bool isImported =
+            _importedTextures.ContainsKey(resIdx) || _importedBuffers.ContainsKey(resIdx);
+        if (
+            !isImported
+            && res.Kind == ResourceKind.Buffer
+            && _bufferDescs.TryGetValue(resIdx, out var bufferDesc)
+            && bufferDesc.Usage != Usage.Default
+            && bufferDesc.Usage != Usage.Immutable
+        )
+        {
+            isImported = true;
+        }
+
+        ResourceState transitionOldState;
+        StateTransitionFlags flags;
+        if (isImported)
+        {
+            transitionOldState = ResourceState.Unknown;
+            flags = StateTransitionFlags.UpdateState;
+
+            if (
+                barrier.OldState == ResourceState.UnorderedAccess
+                && barrier.NewState == ResourceState.UnorderedAccess
+            )
+            {
+                transitionOldState = ResourceState.UnorderedAccess;
+                flags = StateTransitionFlags.None;
+            }
+        }
+        else
+        {
+            transitionOldState = barrier.OldState;
+            flags = StateTransitionFlags.None;
+
+            if (
+                barrier.OldState == ResourceState.UnorderedAccess
+                && barrier.NewState == ResourceState.UnorderedAccess
+            )
+            {
+                transitionOldState = ResourceState.UnorderedAccess;
+            }
+
+            if (transitionOldState == ResourceState.Unknown)
+                transitionOldState = ResourceState.Undefined;
+        }
+
+        transition = new StateTransitionDesc
+        {
+            Resource = deviceObj,
+            OldState = transitionOldState,
+            NewState = barrier.NewState,
+            Flags = flags,
+            FirstMipLevel = barrier.FirstMipLevel,
+            MipLevelsCount =
+                barrier.MipLevelCount == uint.MaxValue
+                    ? Diligent.Native.RemainingMipLevels
+                    : barrier.MipLevelCount,
+            FirstArraySlice = barrier.FirstArraySlice,
+            ArraySliceCount =
+                barrier.ArraySliceCount == uint.MaxValue
+                    ? Diligent.Native.RemainingArraySlices
+                    : barrier.ArraySliceCount,
+        };
+        return true;
+    }
+
+    internal void FlushResourceTransitions(
+        RenderContext context,
+        StateTransitionDesc[] transitions,
+        int transitionCount
+    )
+    {
+        if (transitionCount <= 0)
+            return;
+
+        var deviceContext = context.ImmediateContext;
+        if (deviceContext == null)
+            return;
+
+        deviceContext.SetRenderTargets([], null, ResourceStateTransitionMode.None);
+        if (transitionCount == transitions.Length)
+        {
+            deviceContext.TransitionResourceStates(transitions);
+            return;
+        }
+
+        var compactTransitions = new StateTransitionDesc[transitionCount];
+        Array.Copy(transitions, compactTransitions, transitionCount);
+        deviceContext.TransitionResourceStates(compactTransitions);
+    }
+
+    private void FlushExtractions()
+    {
+        foreach (var extraction in _textureExtractions)
+        {
+            ITexture? texture = null;
+            if (
+                extraction.Handle.IsValid
+                && extraction.Handle.Index >= 0
+                && extraction.Handle.Index < _resolvedTextures.Length
+            )
+            {
+                texture = _resolvedTextures[extraction.Handle.Index];
+            }
+
+            extraction.Sink(texture);
+        }
+
+        foreach (var extraction in _bufferExtractions)
+        {
+            IBuffer? buffer = null;
+            if (
+                extraction.Handle.IsValid
+                && extraction.Handle.Index >= 0
+                && extraction.Handle.Index < _resolvedBuffers.Length
+            )
+            {
+                buffer = _resolvedBuffers[extraction.Handle.Index];
+            }
+
+            extraction.Sink(buffer);
+        }
+    }
+
     // ── Compile helpers ──
 
     private void PrepareForCompile()
@@ -767,6 +1011,7 @@ public class RenderGraph : IDisposable
         foreach (var meta in _passMetadata)
         {
             meta.Active = true;
+            meta.Usages.Clear();
             meta.Reads.Clear();
             meta.Writes.Clear();
         }
@@ -774,7 +1019,19 @@ public class RenderGraph : IDisposable
 
     private HashSet<int> CollectSinkResources()
     {
-        return new HashSet<int>(_markedOutputResources);
+        var sinks = new HashSet<int>(_markedOutputResources);
+        foreach (var extraction in _textureExtractions)
+        {
+            if (extraction.Handle.IsValid)
+                sinks.Add(extraction.Handle.Index);
+        }
+        foreach (var extraction in _bufferExtractions)
+        {
+            if (extraction.Handle.IsValid)
+                sinks.Add(extraction.Handle.Index);
+        }
+
+        return sinks;
     }
 
     private Dictionary<int, List<int>> BuildProducerPassLookup()
@@ -1042,12 +1299,17 @@ public class RenderGraph : IDisposable
             var requiredBySubRes =
                 new Dictionary<
                     (int ResourceId, uint Mip, uint Slice),
-                    (RenderGraphHandle Handle, ResourceState State)
+                    (
+                        RenderGraphHandle Handle,
+                        ResourceState EntryState,
+                        ResourceState ExitState
+                    )
                 >();
 
             void AccumulateRange(
                 RenderGraphHandle handle,
-                ResourceState state,
+                ResourceState entryState,
+                ResourceState exitState,
                 SubResourceRange range
             )
             {
@@ -1091,27 +1353,32 @@ public class RenderGraph : IDisposable
                         var key = (resourceId, m, s);
                         if (requiredBySubRes.TryGetValue(key, out var existing))
                         {
-                            requiredBySubRes[key] = (handle, existing.State | state);
+                            requiredBySubRes[key] = (
+                                handle,
+                                existing.EntryState | entryState,
+                                existing.ExitState | exitState
+                            );
                         }
                         else
                         {
-                            requiredBySubRes[key] = (handle, state);
+                            requiredBySubRes[key] = (handle, entryState, exitState);
                         }
                     }
                 }
             }
 
-            foreach (var (handle, state, range) in meta.Writes)
-                AccumulateRange(handle, state, range);
-            foreach (var (handle, state, range) in meta.Reads)
-                AccumulateRange(handle, state, range);
+            foreach (var (handle, entryState, exitState, _, range) in meta.Usages)
+                AccumulateRange(handle, entryState, exitState, range);
 
             if (requiredBySubRes.Count == 0)
                 continue;
 
             // Group by resource, then determine barriers
             var byResource =
-                new Dictionary<int, List<(uint Mip, uint Slice, ResourceState State)>>();
+                new Dictionary<
+                    int,
+                    List<(uint Mip, uint Slice, ResourceState EntryState, ResourceState ExitState)>
+                >();
             foreach (var (key, val) in requiredBySubRes)
             {
                 if (!byResource.TryGetValue(key.ResourceId, out var list))
@@ -1119,7 +1386,7 @@ public class RenderGraph : IDisposable
                     list = [];
                     byResource[key.ResourceId] = list;
                 }
-                list.Add((key.Mip, key.Slice, val.State));
+                list.Add((key.Mip, key.Slice, val.EntryState, val.ExitState));
             }
 
             var sortedResourceIds = new List<int>(byResource.Keys);
@@ -1138,23 +1405,27 @@ public class RenderGraph : IDisposable
                 var annotated = new List<(
                     uint Mip,
                     uint Slice,
-                    ResourceState NewState,
+                    ResourceState EntryState,
+                    ResourceState ExitState,
                     ResourceState OldState
                 )>(entries.Count);
                 foreach (var entry in entries)
                 {
                     var oldSt = GetTrackedState(trackedState, resourceId, entry.Mip, entry.Slice);
-                    annotated.Add((entry.Mip, entry.Slice, entry.State, oldSt));
+                    annotated.Add((entry.Mip, entry.Slice, entry.EntryState, entry.ExitState, oldSt));
                 }
 
-                // Sort by (OldState, NewState, Slice, Mip) so mergeable runs are adjacent
+                // Sort by (OldState, EntryState, ExitState, Slice, Mip) so mergeable runs are adjacent
                 annotated.Sort(
                     (a, b) =>
                     {
                         int c = a.OldState.CompareTo(b.OldState);
                         if (c != 0)
                             return c;
-                        c = a.NewState.CompareTo(b.NewState);
+                        c = a.EntryState.CompareTo(b.EntryState);
+                        if (c != 0)
+                            return c;
+                        c = a.ExitState.CompareTo(b.ExitState);
                         if (c != 0)
                             return c;
                         c = a.Slice.CompareTo(b.Slice);
@@ -1167,13 +1438,13 @@ public class RenderGraph : IDisposable
                 {
                     var cur = annotated[ai];
                     bool needsBarrier =
-                        cur.OldState != cur.NewState
+                        cur.OldState != cur.EntryState
                         || (
                             cur.OldState == ResourceState.UnorderedAccess
-                            && cur.NewState == ResourceState.UnorderedAccess
+                            && cur.EntryState == ResourceState.UnorderedAccess
                         );
 
-                    // Extend run: same OldState, NewState, Slice, and contiguous Mip
+                    // Extend run: same OldState, EntryState, ExitState, Slice, and contiguous Mip
                     uint runMipStart = cur.Mip;
                     uint runMipEnd = cur.Mip;
                     int runEnd = ai + 1;
@@ -1182,7 +1453,8 @@ public class RenderGraph : IDisposable
                         var next = annotated[runEnd];
                         if (
                             next.OldState == cur.OldState
-                            && next.NewState == cur.NewState
+                            && next.EntryState == cur.EntryState
+                            && next.ExitState == cur.ExitState
                             && next.Slice == cur.Slice
                             && next.Mip == runMipEnd + 1
                         )
@@ -1201,7 +1473,7 @@ public class RenderGraph : IDisposable
                             new CompiledBarrier(
                                 handle,
                                 cur.OldState,
-                                cur.NewState,
+                                cur.EntryState,
                                 runMipStart,
                                 mipCount,
                                 cur.Slice,
@@ -1213,9 +1485,9 @@ public class RenderGraph : IDisposable
                     for (uint m = runMipStart; m <= runMipEnd; m++)
                     {
                         compiledPass.RequiredStates.Add(
-                            (handle, cur.NewState, new SubResourceRange(m, 1, cur.Slice, 1))
+                            (handle, cur.ExitState, new SubResourceRange(m, 1, cur.Slice, 1))
                         );
-                        trackedState[(resourceId, m, cur.Slice)] = cur.NewState;
+                        trackedState[(resourceId, m, cur.Slice)] = cur.ExitState;
                     }
 
                     ai = runEnd;
@@ -1438,6 +1710,199 @@ public class RenderGraph : IDisposable
             && a.Mode == b.Mode;
     }
 
+    // ── Timing helpers ──
+
+    private IQuery? BeginGpuPassTiming(
+        RenderContext context,
+        IDeviceContext deviceContext,
+        int passIndex,
+        string passName,
+        bool collect
+    )
+    {
+        if (!collect || context.Device == null || _gpuPassTimingUnavailable)
+            return null;
+
+        IQuery? query = null;
+        try
+        {
+            query = context.Device.CreateQuery(
+                new QueryDesc
+                {
+                    Name = $"RG GPU [{passIndex}] {passName}",
+                    Type = QueryType.Duration,
+                }
+            );
+
+            if (query == null)
+                return null;
+
+            deviceContext.BeginQuery(query);
+            return query;
+        }
+        catch (Exception ex)
+        {
+            query?.Dispose();
+            DisableGpuPassTiming($"begin failed for [{passIndex}] {passName}: {ex.Message}");
+            return null;
+        }
+    }
+
+    private void EndGpuPassTiming(
+        IDeviceContext deviceContext,
+        IQuery query,
+        int passIndex,
+        string passName
+    )
+    {
+        try
+        {
+            deviceContext.EndQuery(query);
+            _pendingGpuPassTimings.Add(new GpuPassTimingSample(passIndex, passName, query));
+        }
+        catch (Exception ex)
+        {
+            query.Dispose();
+            DisableGpuPassTiming($"end failed for [{passIndex}] {passName}: {ex.Message}");
+        }
+    }
+
+    private void ReportCompletedGpuPassTimings()
+    {
+        if (!_gpuPassTimingEnabled || _pendingGpuPassTimings.Count == 0)
+            return;
+
+        if (
+            _fence != null
+            && _pendingGpuTimingFence != 0
+            && _fence.GetCompletedValue() < _pendingGpuTimingFence
+        )
+        {
+            return;
+        }
+
+        var topPasses = new List<(int PassIndex, string Name, double Ms)>(
+            _pendingGpuPassTimings.Count
+        );
+        double totalMs = 0.0;
+        bool readFailed = false;
+
+        foreach (var sample in _pendingGpuPassTimings)
+        {
+            try
+            {
+                if (!TryGetDurationQueryData(sample.Query, autoInvalidate: true, out var data))
+                    continue;
+
+                if (data.Frequency == 0)
+                    continue;
+
+                double ms = data.Duration * 1000.0 / data.Frequency;
+                totalMs += ms;
+                topPasses.Add((sample.PassIndex, sample.Name, ms));
+            }
+            catch (Exception ex)
+            {
+                if (!_gpuPassTimingUnavailable)
+                    Console.WriteLine($"[GPU Pass Timings] disabled: read failed: {ex.Message}");
+                _gpuPassTimingUnavailable = true;
+                readFailed = true;
+            }
+            finally
+            {
+                sample.Query.Dispose();
+            }
+        }
+
+        int timingFrame = _pendingGpuTimingFrame;
+        _pendingGpuPassTimings.Clear();
+        _pendingGpuTimingFence = 0;
+        _pendingGpuTimingFrame = 0;
+
+        if (readFailed || topPasses.Count == 0)
+            return;
+
+        topPasses.Sort(static (a, b) => b.Ms.CompareTo(a.Ms));
+
+        Console.WriteLine(
+            $"[GPU Pass Timings] frame={timingFrame} total={totalMs:F3}ms active={topPasses.Count}"
+        );
+        int printed = 0;
+        foreach (var (passIndex, name, ms) in topPasses)
+        {
+            if (printed >= 25)
+                break;
+
+            Console.WriteLine($"  [{passIndex,3}] {name, -40} {ms, 8:F3}ms");
+            printed++;
+        }
+    }
+
+    private static unsafe bool TryGetDurationQueryData(
+        IQuery query,
+        bool autoInvalidate,
+        out QueryDataDuration data
+    )
+    {
+        QueryDataDuration localData = new();
+        byte autoInvalidateByte = (byte)(autoInvalidate ? 1u : 0u);
+
+        IntPtr nativePointer = ((CppObject)query).NativePointer;
+        if (nativePointer == IntPtr.Zero)
+        {
+            data = localData;
+            return false;
+        }
+
+        void*** nativeObject = (void***)nativePointer;
+        var getData =
+            (delegate* unmanaged[Cdecl]<IntPtr, void*, uint, byte, byte>)(*nativeObject)[8];
+        byte result = getData(
+            nativePointer,
+            &localData,
+            (uint)sizeof(QueryDataDuration),
+            autoInvalidateByte
+        );
+
+        data = localData;
+        return result != 0;
+    }
+
+    private void DisableGpuPassTiming(string reason)
+    {
+        if (!_gpuPassTimingUnavailable)
+        {
+            Console.WriteLine($"[GPU Pass Timings] disabled: {reason}");
+        }
+
+        _gpuPassTimingUnavailable = true;
+        DisposePendingGpuPassTimings();
+    }
+
+    private void DisposePendingGpuPassTimings()
+    {
+        foreach (var sample in _pendingGpuPassTimings)
+        {
+            sample.Query.Dispose();
+        }
+
+        _pendingGpuPassTimings.Clear();
+        _pendingGpuTimingFence = 0;
+        _pendingGpuTimingFrame = 0;
+    }
+
+    private static bool ReadBooleanEnvironmentVariable(string name)
+    {
+        string? value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        return value.Equals("1", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("on", StringComparison.OrdinalIgnoreCase);
+    }
+
     // ── Dispose ──
 
     public void Dispose()
@@ -1447,6 +1912,8 @@ public class RenderGraph : IDisposable
         {
             _fence.Wait(_fenceValue);
         }
+
+        DisposePendingGpuPassTimings();
 
         // Flush all deferred releases
         while (_deferredReleases.Count > 0)

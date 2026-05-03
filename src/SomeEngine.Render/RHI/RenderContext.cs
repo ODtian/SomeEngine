@@ -13,6 +13,11 @@ public unsafe class RenderContext : IDisposable
     public ISwapChain? SwapChain { get; private set; }
     public TextureDesc DepthBufferDesc { get; private set; }
 
+    private readonly bool _waitForIdleBeforePresent = ReadBooleanEnvironmentVariable(
+        "SOMEENGINE_PRESENT_WAIT_FOR_IDLE"
+    );
+    private readonly uint _presentSyncInterval = ResolvePresentSyncInterval();
+
     public void Initialize(IWindow window)
     {
         if (window?.Native?.Win32 == null)
@@ -47,7 +52,7 @@ public unsafe class RenderContext : IDisposable
         Factory = factory;
         var engineCI = new EngineD3D12CreateInfo
         {
-            EnableValidation = true,
+            EnableValidation = false,
         };
         factory.CreateDeviceAndContextsD3D12(engineCI, out var device, out var contexts);
         Device = device;
@@ -89,9 +94,10 @@ public unsafe class RenderContext : IDisposable
 
     public void Present()
     {
-        // Wait for idle to test SRB mutable overwrite issue
-        ImmediateContext?.WaitForIdle();
-        SwapChain?.Present(1);
+        if (_waitForIdleBeforePresent)
+            ImmediateContext?.WaitForIdle();
+
+        SwapChain?.Present(_presentSyncInterval);
     }
 
     public void Dispose()
@@ -102,5 +108,46 @@ public unsafe class RenderContext : IDisposable
         ImmediateContext?.Dispose();
         Device?.Dispose();
         Factory?.Dispose();
+    }
+
+    private static uint ResolvePresentSyncInterval()
+    {
+        string? intervalValue = Environment.GetEnvironmentVariable("SOMEENGINE_PRESENT_INTERVAL");
+        if (
+            int.TryParse(intervalValue, out int interval)
+            && interval >= 0
+            && interval <= 4
+        )
+        {
+            return (uint)interval;
+        }
+
+        string? vsyncValue = Environment.GetEnvironmentVariable("SOMEENGINE_VSYNC");
+        if (
+            !string.IsNullOrWhiteSpace(vsyncValue)
+            && (
+                vsyncValue.Equals("0", StringComparison.OrdinalIgnoreCase)
+                || vsyncValue.Equals("false", StringComparison.OrdinalIgnoreCase)
+                || vsyncValue.Equals("off", StringComparison.OrdinalIgnoreCase)
+                || vsyncValue.Equals("no", StringComparison.OrdinalIgnoreCase)
+            )
+        )
+        {
+            return 0;
+        }
+
+        return 1;
+    }
+
+    private static bool ReadBooleanEnvironmentVariable(string name)
+    {
+        string? value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        return value.Equals("1", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("on", StringComparison.OrdinalIgnoreCase);
     }
 }

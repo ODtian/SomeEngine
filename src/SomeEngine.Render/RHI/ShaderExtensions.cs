@@ -11,13 +11,22 @@ namespace SomeEngine.Render.RHI;
 public static class ShaderExtensions
 {
     // Attach cached shader instances to the ShaderAsset lifetime
-    private static readonly ConditionalWeakTable<ShaderAsset, Dictionary<string, IShader>> _shaderCache = new();
+    private static readonly ConditionalWeakTable<ShaderAsset, Dictionary<ShaderCacheKey, IShader>> _shaderCache = new();
+    private static readonly ConditionalWeakTable<ShaderAsset, Dictionary<ShaderBindingLookupKey, ShaderBindingInfo>> _bindingCache = new();
+
+    private readonly record struct ShaderCacheKey(string Backend, string EntryPoint);
+    private readonly record struct ShaderBindingLookupKey(string Backend, ShaderType Stage, string Name);
+
+    private readonly record struct ShaderBindingInfo(
+        ShaderResourceType ResourceType,
+        uint Binding,
+        uint Space);
+
     public static ShaderReflectionData? GetReflection(this ShaderAsset asset, RenderContext context)
     {
         if (context.Device == null)
             return null;
-        var deviceType = context.Device.GetDeviceInfo().Type;
-        string backend = deviceType == RenderDeviceType.D3D12 ? "dxil" : "spirv";
+        string backend = GetBackendName(context);
         return asset.Reflections?.FirstOrDefault(r => r.Backend == backend)?.Reflection;
     }
 
@@ -77,7 +86,79 @@ public static class ShaderExtensions
         return [.. mergedVariables.Values];
     }
 
-    public static IShaderResourceVariable? GetStaticVariable(
+    private static string GetBackendName(RenderContext context)
+    {
+        var deviceType = context.Device?.GetDeviceInfo().Type;
+        return deviceType == RenderDeviceType.D3D12 ? "dxil" : "spirv";
+    }
+
+    private static Dictionary<ShaderBindingLookupKey, ShaderBindingInfo> GetBindingCache(ShaderAsset asset)
+    {
+        return _bindingCache.GetValue(asset, static asset =>
+        {
+            var cache = new Dictionary<ShaderBindingLookupKey, ShaderBindingInfo>();
+            if (asset.Reflections == null)
+                return cache;
+
+            foreach (var backendReflection in asset.Reflections)
+            {
+                string backend = backendReflection.Backend ?? string.Empty;
+                var resources = backendReflection.Reflection?.Resources;
+                if (string.IsNullOrEmpty(backend) || resources == null)
+                    continue;
+
+                foreach (var resource in resources)
+                {
+                    string name = resource.Name ?? string.Empty;
+                    if (string.IsNullOrEmpty(name) || resource.ResourceType == 0)
+                        continue;
+
+                    var stages = (ShaderType)resource.Stages;
+                    var info = new ShaderBindingInfo(
+                        (ShaderResourceType)resource.ResourceType,
+                        resource.Binding,
+                        resource.Space);
+
+                    for (uint stageBit = (uint)ShaderType.Vertex; stageBit <= (uint)ShaderType.Callable; stageBit <<= 1)
+                    {
+                        var stage = (ShaderType)stageBit;
+                        if ((stages & stage) == 0)
+                            continue;
+
+                        cache[new ShaderBindingLookupKey(backend, stage, name)] = info;
+                    }
+                }
+            }
+
+            return cache;
+        });
+    }
+
+    public static bool TryGetReflectedBinding(
+        this ShaderAsset asset,
+        RenderContext context,
+        ShaderType stage,
+        string name,
+        out ShaderResourceType resourceType,
+        out uint binding,
+        out uint space)
+    {
+        resourceType = ShaderResourceType.Unknown;
+        binding = 0;
+        space = 0;
+
+        string backend = GetBackendName(context);
+        var cache = GetBindingCache(asset);
+        if (!cache.TryGetValue(new ShaderBindingLookupKey(backend, stage, name), out var info))
+            return false;
+
+        resourceType = info.ResourceType;
+        binding = info.Binding;
+        space = info.Space;
+        return true;
+    }
+
+    public static IShaderResourceVariable? GetStaticVariableByReflectedBinding(
         this IPipelineState pso,
         RenderContext context,
         ShaderAsset? asset,
@@ -87,10 +168,13 @@ public static class ShaderExtensions
     {
         if (asset == null)
             return null;
-        return pso.GetStaticVariableByName(stage, name);
+        if (!asset.TryGetReflectedBinding(context, stage, name, out var resourceType, out var binding, out var space))
+            return null;
+
+        return pso.GetStaticVariableByBinding(stage, resourceType, binding, space);
     }
 
-    public static IShaderResourceVariable? GetVariable(
+    public static IShaderResourceVariable? GetVariableByReflectedBinding(
         this IShaderResourceBinding srb,
         RenderContext context,
         ShaderAsset? asset,
@@ -100,7 +184,10 @@ public static class ShaderExtensions
     {
         if (asset == null)
             return null;
-        return srb.GetVariableByName(stage, name);
+        if (!asset.TryGetReflectedBinding(context, stage, name, out var resourceType, out var binding, out var space))
+            return null;
+
+        return srb.GetVariableByBinding(stage, resourceType, binding, space);
     }
 
     public static IShader CreateShader(
@@ -112,17 +199,15 @@ public static class ShaderExtensions
         if (context.Device == null)
             throw new ArgumentNullException(nameof(context));
 
+        string backend = GetBackendName(context);
+        var cacheKey = new ShaderCacheKey(backend, entryPointName);
         var cacheDict = _shaderCache.GetOrCreateValue(asset);
         lock (cacheDict)
         {
-            if (cacheDict.TryGetValue(entryPointName, out var cachedShader))
+            if (cacheDict.TryGetValue(cacheKey, out var cachedShader))
             {
                 return cachedShader;
             }
-
-            // Determine backend
-            var deviceType = context.Device.GetDeviceInfo().Type;
-            string backend = deviceType == RenderDeviceType.D3D12 ? "dxil" : "spirv";
 
             // Find variant
             if (asset.Variants == null)
@@ -161,7 +246,7 @@ public static class ShaderExtensions
                 throw new Exception($"Failed to create shader {shaderCI.Desc.Name}: {ex.Message}", ex);
             }
 
-            cacheDict[entryPointName] = shader;
+            cacheDict[cacheKey] = shader;
             return shader;
         }
     }

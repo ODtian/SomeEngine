@@ -453,6 +453,101 @@ public class RenderGraphTests
         Assert.False(feature.AddPassesCalled, "Removed feature should not be called");
     }
 
+    [Fact]
+    public void QueueTextureExtraction_KeepsProducerPassAlive()
+    {
+        using var graph = new RenderGraph();
+        var desc = new TextureDesc
+        {
+            Width = 64,
+            Height = 64,
+            Format = TextureFormat.RGBA8_UNorm,
+            Type = ResourceDimension.Tex2d,
+            BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+        };
+
+        var extracted = graph.CreateTexture("Extracted", desc);
+        graph.AddPass(
+            "ProduceExtracted",
+            builder => builder.Write(extracted, ResourceState.RenderTarget),
+            _ => { }
+        );
+        graph.QueueTextureExtraction(extracted, _ => { });
+
+        graph.Compile();
+
+        var executionOrder = GetExecutionOrder(graph);
+        var compiledPasses = GetCompiledPasses(graph);
+        Assert.Single(executionOrder);
+        Assert.Equal("ProduceExtracted", compiledPasses[executionOrder[0]].Name);
+    }
+
+    [Fact]
+    public void DeadPassStillCulledWhenDifferentResourceIsExtracted()
+    {
+        using var graph = new RenderGraph();
+        var desc = new TextureDesc
+        {
+            Width = 64,
+            Height = 64,
+            Format = TextureFormat.RGBA8_UNorm,
+            Type = ResourceDimension.Tex2d,
+            BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+        };
+
+        var live = graph.CreateTexture("Live", desc);
+        var dead = graph.CreateTexture("Dead", desc);
+        graph.AddPass(
+            "DeadPass",
+            builder => builder.Write(dead, ResourceState.RenderTarget),
+            _ => { }
+        );
+        graph.AddPass(
+            "LivePass",
+            builder => builder.Write(live, ResourceState.RenderTarget),
+            _ => { }
+        );
+        graph.QueueTextureExtraction(live, _ => { });
+
+        graph.Compile();
+
+        var executionOrder = GetExecutionOrder(graph);
+        var compiledPasses = GetCompiledPasses(graph);
+        Assert.Single(executionOrder);
+        Assert.Equal("LivePass", compiledPasses[executionOrder[0]].Name);
+    }
+
+    [Fact]
+    public void QueueTextureExtraction_InvokesSinkAfterExecuteWithoutDevice()
+    {
+        using var graph = new RenderGraph();
+        var desc = new TextureDesc
+        {
+            Width = 32,
+            Height = 32,
+            Format = TextureFormat.RGBA8_UNorm,
+            Type = ResourceDimension.Tex2d,
+            BindFlags = BindFlags.ShaderResource,
+        };
+        bool sinkCalled = false;
+        ITexture? extracted = null;
+
+        var handle = graph.CreateTexture("ExtractedNoDevice", desc);
+        graph.QueueTextureExtraction(
+            handle,
+            value =>
+            {
+                sinkCalled = true;
+                extracted = value;
+            }
+        );
+        graph.Compile();
+        graph.Execute(new RenderContext());
+
+        Assert.True(sinkCalled);
+        Assert.Null(extracted);
+    }
+
     // ── Reflection helpers ──
 
     private ulong GetMemoryOffset(RenderGraph graph, RenderGraphHandle handle)
