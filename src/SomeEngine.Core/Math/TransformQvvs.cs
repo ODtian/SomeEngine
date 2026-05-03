@@ -1,5 +1,4 @@
 using System.Numerics;
-using Friflo.Engine.ECS;
 
 namespace SomeEngine.Core.Math;
 
@@ -7,7 +6,7 @@ namespace SomeEngine.Core.Math;
 /// QVVS Transform: Quaternion, Vector (Position), Vector (Stretch), Scale
 /// Based on Latios Framework concepts.
 /// </summary>
-public struct TransformQvvs(Vector3 position, Quaternion rotation, float scale = 1.0f) : IComponent
+public struct TransformQvvs(Vector3 position, Quaternion rotation, float scale = 1.0f)
 {
     public Quaternion Rotation = rotation;
     public Vector3 Position = position;

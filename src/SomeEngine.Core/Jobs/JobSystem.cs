@@ -34,12 +34,7 @@ public static class JobSystem
     public static JobHandle CombineDependencies(JobHandle h1, JobHandle h2)
     {
         // Allocate Counter
-        int counterId = JobPools.AllocCounter();
-        ref var counter = ref JobPools.Counters[counterId];
-
-        counter.Version++;
-        counter.Value = 2;
-        counter.FirstDependent = 0;
+        int counterId = JobPools.AllocCounter(2, out int version);
 
         // Use the dummy combine job type with index 0
         var jobId = new JobId(_combineJobTypeId, 0, counterId);
@@ -47,7 +42,7 @@ public static class JobSystem
         ScheduleInternal(jobId, h1);
         ScheduleInternal(jobId, h2);
 
-        return new JobHandle(counterId, counter.Version);
+        return new JobHandle(counterId, version);
     }
 
     public static JobHandle CombineDependencies(ReadOnlySpan<JobHandle> handles)
@@ -55,12 +50,7 @@ public static class JobSystem
         if (handles.Length == 0)
             return default;
 
-        int counterId = JobPools.AllocCounter();
-        ref var counter = ref JobPools.Counters[counterId];
-
-        counter.Version++;
-        counter.Value = handles.Length;
-        counter.FirstDependent = 0;
+        int counterId = JobPools.AllocCounter(handles.Length, out int version);
 
         var jobId = new JobId(_combineJobTypeId, 0, counterId);
 
@@ -69,19 +59,14 @@ public static class JobSystem
             ScheduleInternal(jobId, h);
         }
 
-        return new JobHandle(counterId, counter.Version);
+        return new JobHandle(counterId, version);
     }
 
     public static JobHandle Schedule<T>(T job, JobHandle dependency = default)
         where T : struct, IJob
     {
         // 1. Allocate and Init Counter
-        int counterId = JobPools.AllocCounter();
-        ref var counter = ref JobPools.Counters[counterId];
-
-        counter.Version++;
-        counter.Value = 1;
-        counter.FirstDependent = 0; // null
+        int counterId = JobPools.AllocCounter(1, out int version);
 
         // 2. Store Job Data
         int jobIndex = JobDataStore<T>.Add(job);
@@ -92,7 +77,7 @@ public static class JobSystem
         // 4. Handle Dependency
         ScheduleInternal(myJobId, dependency);
 
-        return new JobHandle(counterId, counter.Version);
+        return new JobHandle(counterId, version);
     }
 
     struct ParallelJobWrapper<T> : IJob
@@ -127,12 +112,7 @@ public static class JobSystem
         int batchCount = (length + batchSize - 1) / batchSize;
 
         // 1. Allocate Counter
-        int counterId = JobPools.AllocCounter();
-        ref var counter = ref JobPools.Counters[counterId];
-
-        counter.Version++;
-        counter.Value = batchCount; // Wait for ALL batches
-        counter.FirstDependent = 0;
+        int counterId = JobPools.AllocCounter(batchCount, out int version); // Wait for ALL batches
 
         // 2. Schedule Batches
         for (int i = 0; i < batchCount; i++)
@@ -153,7 +133,7 @@ public static class JobSystem
             ScheduleInternal(jobId, dependency);
         }
 
-        return new JobHandle(counterId, counter.Version);
+        return new JobHandle(counterId, version);
     }
 
     private static void ScheduleInternal(JobId jobId, JobHandle dependency)
@@ -184,48 +164,18 @@ public static class JobSystem
             return true;
 
         ref var counter = ref JobPools.Counters[handle.CounterId];
-        if (counter.Version != handle.Version)
+        if (Volatile.Read(ref counter.Version) != handle.Version)
             return true;
 
-        return counter.Value == 0;
+        if (Volatile.Read(ref counter.Allocated) == 0)
+            return true;
+
+        return Volatile.Read(ref counter.FirstDependent) == -1;
     }
 
     private static bool TryAddDependency(int counterId, int expectedVersion, JobId dependentJob)
     {
-        ref var counter = ref JobPools.Counters[counterId];
-
-        SpinWait spin = new SpinWait();
-        while (true)
-        {
-            if (counter.Version != expectedVersion)
-                return false;
-            if (counter.Value == 0)
-                return false;
-
-            int nodeId = JobPools.AllocNode();
-            ref var node = ref JobPools.Nodes[nodeId];
-            node.Job = dependentJob;
-
-            int currentHead = counter.FirstDependent;
-            if (currentHead == -1)
-            {
-                JobPools.FreeNode(nodeId);
-                return false;
-            }
-
-            node.Next = currentHead;
-
-            if (
-                Interlocked.CompareExchange(ref counter.FirstDependent, nodeId, currentHead)
-                == currentHead
-            )
-            {
-                return true;
-            }
-
-            JobPools.FreeNode(nodeId);
-            spin.SpinOnce();
-        }
+        return JobPools.TryAddDependent(counterId, expectedVersion, dependentJob);
     }
 
     private static void WorkerLoop()
@@ -262,10 +212,11 @@ public static class JobSystem
     private static void CompleteJob(int counterId)
     {
         ref var counter = ref JobPools.Counters[counterId];
+        int version = Volatile.Read(ref counter.Version);
 
         if (Interlocked.Decrement(ref counter.Value) == 0)
         {
-            int head = Interlocked.Exchange(ref counter.FirstDependent, -1);
+            int head = JobPools.CompleteCounter(counterId, version);
 
             while (head > 0)
             {
@@ -306,9 +257,7 @@ public static class JobSystem
         Wait(handle);
         // Only free if version matches (still valid handle)
         ref var counter = ref JobPools.Counters[handle.CounterId];
-        if (counter.Version == handle.Version)
-        {
-            JobPools.FreeCounter(handle.CounterId);
-        }
+        if (Volatile.Read(ref counter.Version) == handle.Version)
+            JobPools.TryFreeCounter(handle.CounterId, handle.Version);
     }
 }

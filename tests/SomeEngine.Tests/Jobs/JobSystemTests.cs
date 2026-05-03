@@ -15,6 +15,8 @@ public class JobSystemTests
         }
     }
 
+    private const int CounterPoolPressureCount = 17000;
+
     [Fact]
     public void TestSimpleSchedule()
     {
@@ -120,5 +122,34 @@ public class JobSystemTests
 
         // Depth 10 -> 10, 9, 8... 0 = 11 jobs
         Assert.Equal(depth + 1, RecursiveJob.TotalExecuted);
+    }
+
+    [Fact]
+    public void CompleteDoesNotExhaustCounterPool()
+    {
+        SimpleJob.ExecutedCount = 0;
+
+        for (int i = 0; i < CounterPoolPressureCount; i++)
+        {
+            JobSystem.Schedule(new SimpleJob()).Complete();
+        }
+
+        Assert.Equal(CounterPoolPressureCount, SimpleJob.ExecutedCount);
+    }
+
+    [Fact]
+    public void CompletingFinalDependencyReleasesParentCounters()
+    {
+        SimpleJob.ExecutedCount = 0;
+
+        for (int i = 0; i < CounterPoolPressureCount; i++)
+        {
+            var first = JobSystem.Schedule(new SimpleJob());
+            var second = JobSystem.Schedule(new SimpleJob(), first);
+
+            second.Complete();
+        }
+
+        Assert.Equal(CounterPoolPressureCount * 2, SimpleJob.ExecutedCount);
     }
 }

@@ -97,4 +97,20 @@ public class TransformSystemTests
         Assert.InRange(childWorld.Position.Y, expected.Y - 0.001f, expected.Y + 0.001f);
         Assert.InRange(childWorld.Position.Z, expected.Z - 0.001f, expected.Z + 0.001f);
     }
+
+    [Fact]
+    public void TestRepeatedUpdatesDoNotExhaustJobCounters()
+    {
+        var root = _store.CreateEntity();
+        root.AddComponent(new LocalTransform { Value = new TransformQvvs(Vector3.Zero, Quaternion.Identity) });
+        root.AddComponent(new WorldTransform());
+
+        for (int i = 0; i < 200; i++)
+        {
+            RunSystems();
+        }
+
+        var world = root.GetComponent<WorldTransform>().Qvvs;
+        Assert.Equal(Vector3.Zero, world.Position);
+    }
 }

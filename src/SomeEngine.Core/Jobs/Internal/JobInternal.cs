@@ -8,6 +8,7 @@ internal struct JobCounter
     public int Value;
     public int Version;
     public int FirstDependent; // 0 = null, -1 = Sentinel (Finished), >0 = Index
+    public int Allocated;
 }
 
 [StructLayout(LayoutKind.Sequential)]

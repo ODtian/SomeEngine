@@ -34,7 +34,7 @@ internal static class JobPools
         _nodeLock = new SpinLock();
     }
 
-    public static int AllocCounter()
+    public static int AllocCounter(int initialValue, out int version)
     {
         bool lockTaken = false;
         try
@@ -42,7 +42,19 @@ internal static class JobPools
             _counterLock.Enter(ref lockTaken);
             if (_counterTop > 0)
             {
-                return _counterFreeStack[--_counterTop];
+                int index = _counterFreeStack[--_counterTop];
+                ref var counter = ref Counters[index];
+
+                version = unchecked(counter.Version + 1);
+                if (version == 0)
+                    version = 1;
+
+                counter.Version = version;
+                counter.Value = initialValue;
+                counter.FirstDependent = 0;
+                counter.Allocated = 1;
+
+                return index;
             }
         }
         finally
@@ -52,16 +64,82 @@ internal static class JobPools
         throw new InvalidOperationException("JobCounter pool exhausted!");
     }
 
-    public static void FreeCounter(int index)
+    public static bool TryFreeCounter(int index, int expectedVersion)
     {
         bool lockTaken = false;
         try
         {
             _counterLock.Enter(ref lockTaken);
+            ref var counter = ref Counters[index];
+
+            if (counter.Version != expectedVersion || counter.Allocated == 0)
+                return false;
+
+            if (counter.Value != 0 || counter.FirstDependent != -1)
+                return false;
+
+            if (_counterTop >= MaxCounters)
+                return false;
+
+            counter.Value = 0;
+            counter.FirstDependent = -1;
+            counter.Allocated = 0;
+            _counterFreeStack[_counterTop++] = index;
+            return true;
+        }
+        finally
+        {
+            if (lockTaken) _counterLock.Exit();
+        }
+    }
+
+    public static bool TryAddDependent(int counterId, int expectedVersion, JobId dependentJob)
+    {
+        bool lockTaken = false;
+        try
+        {
+            _counterLock.Enter(ref lockTaken);
+            ref var counter = ref Counters[counterId];
+
+            if (counter.Version != expectedVersion || counter.Allocated == 0)
+                return false;
+
+            if (counter.Value == 0 || counter.FirstDependent == -1)
+                return false;
+
+            int nodeId = AllocNode();
+            ref var node = ref Nodes[nodeId];
+            node.Job = dependentJob;
+            node.Next = counter.FirstDependent;
+            counter.FirstDependent = nodeId;
+            return true;
+        }
+        finally
+        {
+            if (lockTaken) _counterLock.Exit();
+        }
+    }
+
+    public static int CompleteCounter(int index, int expectedVersion)
+    {
+        bool lockTaken = false;
+        try
+        {
+            _counterLock.Enter(ref lockTaken);
+            ref var counter = ref Counters[index];
+
+            if (counter.Version != expectedVersion || counter.Allocated == 0)
+                return 0;
+
+            int head = counter.FirstDependent;
+            counter.Value = 0;
+            counter.FirstDependent = -1;
+            counter.Allocated = 0;
+
             if (_counterTop < MaxCounters)
-            {
                 _counterFreeStack[_counterTop++] = index;
-            }
+
+            return head;
         }
         finally
         {
