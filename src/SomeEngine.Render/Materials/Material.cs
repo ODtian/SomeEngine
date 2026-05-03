@@ -16,39 +16,70 @@ public class Material : IDisposable
     /// <summary>名称（调试/序列化用）。</summary>
     public string Name { get; set; } = "";
 
-    /// <summary>所有贴图/采样器参数。</summary>
+    /// <summary>所有贴图与 Buffer 参数。</summary>
     public ShaderParamBag Params { get; private set; } = new();
 
-    /// <summary>唯一的渲染身份。1 Material = 1 Entity。</summary>
-    public Entity Entity { get; internal set; }
+    public MaterialScalarRegionLayout ScalarRegionLayout { get; private set; } = MaterialScalarRegionLayout.Empty;
 
-    internal MaterialSystem? System { get; set; }
+    public int ScalarRegionByteSize => ScalarRegionLayout.ByteSize;
+
+    /// <summary>该材质拥有的所有 pass 实体。</summary>
+    public Entity[] PassEntities { get; internal set; } = [];
+
+    internal EntityStore? PassStore { get; set; }
+
+    /// <summary>Revision used by extract/prepare caches to detect material-side changes.</summary>
+    public uint Version { get; private set; } = 1;
+
+    public void Touch()
+    {
+        unchecked
+        {
+            Version++;
+        }
+    }
 
     /// <summary>
     /// 克隆此材质。新实例 Params 独立副本，共享底层 GPU 资源引用。
     /// </summary>
     public Material Instantiate()
     {
-        var materialSystem = System ?? throw new InvalidOperationException("Material is not attached to a MaterialSystem.");
+        var passStore = PassStore ?? throw new InvalidOperationException("Material is not attached to a pass entity store.");
         var inst = new Material
         {
             AssetGuid = AssetGuid,
             Name = Name + " (Instance)",
             Params = Params.Clone(),
+            ScalarRegionLayout = ScalarRegionLayout,
         };
 
-        var entity = materialSystem.Store.CreateEntity();
-        if (!Entity.IsNull && Entity.StoreOwnership == StoreOwnership.attached)
+        if (PassEntities.Length > 0)
         {
-            MaterialEntityUtility.CloneMaterialIdentity(inst, Entity, entity);
+            Entity[] clonedPasses = new Entity[PassEntities.Length];
+            for (int i = 0; i < PassEntities.Length; i++)
+            {
+                Entity target = passStore.CreateEntity();
+                Entity source = PassEntities[i];
+                if (!source.IsNull)
+                {
+                    EntityStore.CopyEntity(source, target);
+                }
+
+                target.AddComponent(new Pipelines.MaterialRef { Owner = inst });
+                clonedPasses[i] = target;
+            }
+
+            inst.PassEntities = clonedPasses;
         }
         else
         {
+            var entity = passStore.CreateEntity();
             entity.AddComponent(new Pipelines.MaterialRef { Owner = inst });
-        }
 
-        inst.Entity = entity;
-        inst.System = materialSystem;
+            inst.PassEntities = [entity];
+        }
+        inst.PassStore = passStore;
+        inst.Touch();
 
         return inst;
     }
@@ -56,27 +87,38 @@ public class Material : IDisposable
     public void SetTexture(string name, ITextureView? view)
     {
         Params.Set(name, view);
+        Touch();
     }
 
-    /// <summary>设置采样器参数。</summary>
-    public void SetSampler(string name, ISampler? sampler)
+    public void SetScalarRegionLayout(MaterialScalarRegionLayout layout)
     {
-        Params.Set(name, sampler);
+        ScalarRegionLayout = layout ?? MaterialScalarRegionLayout.Empty;
+        Touch();
     }
+
+    public void WriteScalarRegion(Span<byte> destination)
+        => ScalarRegionLayout.Write(Params, destination);
 
     /// <summary>设置 Buffer 参数。</summary>
     public void SetBuffer(string name, IBufferView? view)
     {
         Params.Set(name, view);
+        Touch();
     }
 
     public void Dispose()
     {
-        System = null;
+        PassStore = null;
 
-        if (!Entity.IsNull && Entity.StoreOwnership == StoreOwnership.attached)
+        if (PassEntities.Length > 0)
         {
-            Entity.DeleteEntity();
+            foreach (Entity passEntity in PassEntities)
+            {
+                if (!passEntity.IsNull && passEntity.StoreOwnership == StoreOwnership.attached)
+                {
+                    passEntity.DeleteEntity();
+                }
+            }
         }
 
         Params.Dispose();

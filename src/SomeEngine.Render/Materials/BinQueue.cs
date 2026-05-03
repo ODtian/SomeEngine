@@ -9,6 +9,8 @@ namespace SomeEngine.Render.Materials;
 /// </summary>
 public sealed class BinQueue
 {
+    public delegate ReadOnlySpan<Entity> QueryEntities();
+
     public readonly struct BinRange
     {
         public readonly ushort Start;
@@ -25,18 +27,27 @@ public sealed class BinQueue
 
     public readonly struct BinGroup
     {
-        public required Func<Entity[]> Query { get; init; }
+        public required QueryEntities Query { get; init; }
         public required Func<Entity, int> OrderKey { get; init; }
         public required Func<Entity, ulong> SignatureFunc { get; init; }
     }
 
     private readonly List<BinGroup> _groups = new();
     private Entity[] _entities = [];
+    private int _entityCount;
     private BinRange[] _ranges = [];
+    private int _rangeCount;
     private ushort[] _argsBinMap = [];
-    private readonly List<EntityBinEntry> _entityBins = [];
+    private int _argsBinCount;
+    private readonly Dictionary<int, ushort> _entityBins = [];
+    private readonly List<EntitySignatureEntry> _pendingEntries = [];
+    private readonly List<Entity> _allEntitiesScratch = [];
+    private readonly List<BinRange> _rangesScratch = [];
+    private readonly List<ushort> _argsMapScratch = [];
+    private readonly Dictionary<ulong, ushort> _primaryBinsBySignature = [];
+    private readonly Dictionary<ulong, ushort> _signatureBins = [];
 
-    public int TotalBinCount => _entities.Length;
+    public int TotalBinCount => _entityCount;
 
     public void RegisterGroup(BinGroup group)
     {
@@ -46,18 +57,19 @@ public sealed class BinQueue
     public void Rebuild()
     {
         _entityBins.Clear();
-        var pendingEntries = new List<EntitySignatureEntry>();
+        _pendingEntries.Clear();
 
         foreach (var group in _groups)
         {
-            var entities = group.Query() ?? [];
-            foreach (var entity in entities)
+            ReadOnlySpan<Entity> entities = group.Query();
+            for (int i = 0; i < entities.Length; i++)
             {
-                pendingEntries.Add(new EntitySignatureEntry(entity, group.OrderKey(entity), group.SignatureFunc(entity)));
+                Entity entity = entities[i];
+                _pendingEntries.Add(new EntitySignatureEntry(entity, group.OrderKey(entity), group.SignatureFunc(entity)));
             }
         }
 
-        pendingEntries.Sort(static (a, b) =>
+        _pendingEntries.Sort(static (a, b) =>
         {
             int orderCompare = a.OrderKey.CompareTo(b.OrderKey);
             if (orderCompare != 0)
@@ -69,95 +81,99 @@ public sealed class BinQueue
             return signatureCompare != 0 ? signatureCompare : a.Entity.Id.CompareTo(b.Entity.Id);
         });
 
-        var allEntities = new List<Entity>();
-        var ranges = new List<BinRange>();
-        var primaryBinsBySignature = new List<SignatureBinEntry>();
-        var argsMap = new List<ushort>();
+        _allEntitiesScratch.Clear();
+        _rangesScratch.Clear();
+        _primaryBinsBySignature.Clear();
+        _argsMapScratch.Clear();
         ushort currentBin = 0;
 
         int entryIndex = 0;
-        while (entryIndex < pendingEntries.Count)
+        while (entryIndex < _pendingEntries.Count)
         {
-            int orderKey = pendingEntries[entryIndex].OrderKey;
-            var signatureBins = new List<SignatureBinEntry>();
+            int orderKey = _pendingEntries[entryIndex].OrderKey;
+            _signatureBins.Clear();
             ushort regionStartBin = currentBin;
 
-            while (entryIndex < pendingEntries.Count && pendingEntries[entryIndex].OrderKey == orderKey)
+            while (entryIndex < _pendingEntries.Count && _pendingEntries[entryIndex].OrderKey == orderKey)
             {
-                var entry = pendingEntries[entryIndex++];
-                int signatureIndex = FindSignature(signatureBins, entry.Signature);
-                ushort binIndex;
-
-                if (signatureIndex >= 0)
+                var entry = _pendingEntries[entryIndex++];
+                if (_signatureBins.TryGetValue(entry.Signature, out ushort binIndex))
                 {
-                    binIndex = signatureBins[signatureIndex].Bin;
-                }
-                else
-                {
-                    binIndex = currentBin++;
-                    signatureBins.Add(new SignatureBinEntry(entry.Signature, binIndex));
-                    allEntities.Add(entry.Entity);
-
-                    ushort argsBin = binIndex;
-                    if (orderKey == 0)
-                    {
-                        primaryBinsBySignature.Add(new SignatureBinEntry(entry.Signature, binIndex));
-                    }
-                    else
-                    {
-                        int primaryIndex = FindSignature(primaryBinsBySignature, entry.Signature);
-                        if (primaryIndex >= 0)
-                        {
-                            argsBin = primaryBinsBySignature[primaryIndex].Bin;
-                        }
-                    }
-
-                    argsMap.Add(argsBin);
+                    AddOrReplaceEntityBin(entry.Entity.Id, binIndex);
+                    continue;
                 }
 
+                binIndex = currentBin++;
+                _signatureBins[entry.Signature] = binIndex;
+                _allEntitiesScratch.Add(entry.Entity);
+
+                ushort argsBin = binIndex;
+                if (orderKey == 0)
+                {
+                    _primaryBinsBySignature[entry.Signature] = binIndex;
+                }
+                else if (_primaryBinsBySignature.TryGetValue(entry.Signature, out ushort primaryBin))
+                {
+                    argsBin = primaryBin;
+                }
+
+                _argsMapScratch.Add(argsBin);
                 AddOrReplaceEntityBin(entry.Entity.Id, binIndex);
             }
 
             ushort regionCount = (ushort)(currentBin - regionStartBin);
             if (regionCount > 0)
             {
-                ranges.Add(new BinRange(regionStartBin, regionCount, orderKey));
+                _rangesScratch.Add(new BinRange(regionStartBin, regionCount, orderKey));
             }
         }
 
-        _entities = allEntities.ToArray();
-        _ranges = ranges.ToArray();
-        _argsBinMap = argsMap.ToArray();
+        EnsureCapacity(ref _entities, _allEntitiesScratch.Count);
+        _allEntitiesScratch.CopyTo(_entities);
+        _entityCount = _allEntitiesScratch.Count;
+
+        EnsureCapacity(ref _ranges, _rangesScratch.Count);
+        _rangesScratch.CopyTo(_ranges);
+        _rangeCount = _rangesScratch.Count;
+
+        EnsureCapacity(ref _argsBinMap, _argsMapScratch.Count);
+        for (int i = 0; i < _argsMapScratch.Count; i++)
+        {
+            _argsBinMap[i] = _argsMapScratch[i];
+        }
+        _argsBinCount = _argsMapScratch.Count;
     }
 
-    public BinRange[] GetRanges()
+    public ReadOnlySpan<BinRange> GetRanges()
     {
-        return _ranges;
+        return _ranges.AsSpan(0, _rangeCount);
     }
 
     public Entity GetEntity(int binIndex)
     {
-        if (binIndex < 0 || binIndex >= _entities.Length)
+        if (binIndex < 0 || binIndex >= _entityCount)
             throw new ArgumentOutOfRangeException(nameof(binIndex));
         return _entities[binIndex];
     }
 
     public ushort GetBinForEntity(Entity entity)
     {
-        for (int i = 0; i < _entityBins.Count; i++)
+        if (TryGetBinForEntity(entity, out ushort bin))
         {
-            if (_entityBins[i].EntityId == entity.Id)
-            {
-                return _entityBins[i].Bin;
-            }
+            return bin;
         }
 
         throw new KeyNotFoundException("Entity not found in BinQueue.");
     }
 
+    public bool TryGetBinForEntity(Entity entity, out ushort bin)
+    {
+        return _entityBins.TryGetValue(entity.Id, out bin);
+    }
+
     public int GetArgsBin(int binIndex)
     {
-        if (binIndex < 0 || binIndex >= _argsBinMap.Length)
+        if (binIndex < 0 || binIndex >= _argsBinCount)
         {
             throw new ArgumentOutOfRangeException(nameof(binIndex));
         }
@@ -167,32 +183,16 @@ public sealed class BinQueue
 
     private void AddOrReplaceEntityBin(int entityId, ushort bin)
     {
-        for (int i = 0; i < _entityBins.Count; i++)
-        {
-            if (_entityBins[i].EntityId == entityId)
-            {
-                _entityBins[i] = new EntityBinEntry(entityId, bin);
-                return;
-            }
-        }
-
-        _entityBins.Add(new EntityBinEntry(entityId, bin));
+        _entityBins[entityId] = bin;
     }
 
-    private static int FindSignature(List<SignatureBinEntry> entries, ulong signature)
+    private static void EnsureCapacity<T>(ref T[] array, int count)
     {
-        for (int i = 0; i < entries.Count; i++)
+        if (array.Length < count)
         {
-            if (entries[i].Signature == signature)
-            {
-                return i;
-            }
+            Array.Resize(ref array, Math.Max(count, array.Length == 0 ? 16 : array.Length * 2));
         }
-
-        return -1;
     }
 
     private readonly record struct EntitySignatureEntry(Entity Entity, int OrderKey, ulong Signature);
-    private readonly record struct SignatureBinEntry(ulong Signature, ushort Bin);
-    private readonly record struct EntityBinEntry(int EntityId, ushort Bin);
 }

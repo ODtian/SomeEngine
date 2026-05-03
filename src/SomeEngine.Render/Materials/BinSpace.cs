@@ -17,8 +17,8 @@ public sealed class BinSpace : IDisposable
     private bool _frozen;
     private MaterialSlotBuffer? _buffer;
     private MaterialSlotCache? _cache;
-    private readonly List<EntitySlotEntry> _slotOffsets = [];
     private uint _version;
+    private bool _dirty;
 
     public uint Version => _version;
 
@@ -57,6 +57,7 @@ public sealed class BinSpace : IDisposable
         _frozen = true;
         _buffer = new MaterialSlotBuffer(_fields.Count);
         _cache = new MaterialSlotCache(_buffer);
+        _dirty = true;
     }
 
     /// <summary>按名称查找 fieldIndex。</summary>
@@ -73,6 +74,7 @@ public sealed class BinSpace : IDisposable
     {
         ValidateFieldIndex(fieldIndex);
         _fields[fieldIndex].BinQueue.RegisterGroup(group);
+        MarkDirty();
     }
 
     // ── Slot 管理 ──
@@ -80,33 +82,35 @@ public sealed class BinSpace : IDisposable
     public int AllocateSlots(ReadOnlySpan<Entity> entities)
     {
         EnsureFrozen();
-        int offset = _cache!.GetOrAllocate(entities);
 
+        MaterialSlotBinding[] bindings = new MaterialSlotBinding[entities.Length];
         for (int i = 0; i < entities.Length; i++)
         {
-            AddOrReplaceSlotOffset(entities[i].Id, offset + i);
+            Entity[] fieldEntities = new Entity[_fields.Count];
+            for (int fieldIndex = 0; fieldIndex < _fields.Count; fieldIndex++)
+            {
+                fieldEntities[fieldIndex] = entities[i];
+            }
+
+            bindings[i] = new MaterialSlotBinding(entities[i], fieldEntities);
         }
 
-        return offset;
+        return AllocateSlots(bindings);
     }
 
-    public int GetSlotOffset(Entity entity)
+    public int AllocateSlots(ReadOnlySpan<MaterialSlotBinding> bindings)
     {
-        for (int i = 0; i < _slotOffsets.Count; i++)
-        {
-            if (_slotOffsets[i].EntityId == entity.Id)
-            {
-                return _slotOffsets[i].Offset;
-            }
-        }
-
-        throw new KeyNotFoundException($"Entity {entity.Id} not allocated in this BinSpace.");
+        EnsureFrozen();
+        int offset = _cache!.GetOrAllocate(bindings);
+        MarkDirty();
+        return offset;
     }
 
     /// <summary>释放 slot 区间。</summary>
     public void ReleaseSlots(int offset)
     {
         _cache?.Release(offset);
+        MarkDirty();
     }
 
     // ── Rebuild ──
@@ -114,7 +118,15 @@ public sealed class BinSpace : IDisposable
     public void RebuildIfDirty()
     {
         EnsureFrozen();
-        ForceRebuild();
+        if (_dirty)
+        {
+            ForceRebuild();
+        }
+    }
+
+    public void MarkDirty()
+    {
+        _dirty = true;
     }
 
     /// <summary>强制重建所有 field（不检查版本）。</summary>
@@ -127,11 +139,12 @@ public sealed class BinSpace : IDisposable
             _cache!.RebuildField(i, _fields[i].BinQueue);
         }
         _version++;
+        _dirty = false;
     }
 
     // ── 查询 ──
 
-    public BinQueue.BinRange[] GetRanges(int fieldIndex)
+    public ReadOnlySpan<BinQueue.BinRange> GetRanges(int fieldIndex)
     {
         ValidateFieldIndex(fieldIndex);
         return _fields[fieldIndex].BinQueue.GetRanges();
@@ -154,6 +167,12 @@ public sealed class BinSpace : IDisposable
     {
         ValidateFieldIndex(fieldIndex);
         return _fields[fieldIndex].BinQueue.GetBinForEntity(entity);
+    }
+
+    public bool TryGetBinForEntity(int fieldIndex, Entity entity, out ushort bin)
+    {
+        ValidateFieldIndex(fieldIndex);
+        return _fields[fieldIndex].BinQueue.TryGetBinForEntity(entity, out bin);
     }
 
     public int GetArgsBin(int fieldIndex, int binIndex)
@@ -188,21 +207,6 @@ public sealed class BinSpace : IDisposable
     {
         _cache?.Dispose();
         _buffer?.Dispose();
-        _slotOffsets.Clear();
-    }
-
-    private void AddOrReplaceSlotOffset(int entityId, int offset)
-    {
-        for (int i = 0; i < _slotOffsets.Count; i++)
-        {
-            if (_slotOffsets[i].EntityId == entityId)
-            {
-                _slotOffsets[i] = new EntitySlotEntry(entityId, offset);
-                return;
-            }
-        }
-
-        _slotOffsets.Add(new EntitySlotEntry(entityId, offset));
     }
 
     private class FieldInfo
@@ -216,6 +220,4 @@ public sealed class BinSpace : IDisposable
             BinQueue = binQueue;
         }
     }
-
-    private readonly record struct EntitySlotEntry(int EntityId, int Offset);
 }

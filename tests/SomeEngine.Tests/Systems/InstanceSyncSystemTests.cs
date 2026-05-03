@@ -4,6 +4,7 @@ using Friflo.Engine.ECS;
 using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
 using SomeEngine.Core.Math;
+using SomeEngine.Render.Data;
 using SomeEngine.Render.RHI;
 using SomeEngine.Render.Systems;
 
@@ -24,7 +25,7 @@ namespace SomeEngine.Tests.Systems
             // and rely on the null checks inside InstanceSyncSystem to not crash when trying to create/upload buffers.
             _mockContext = new RenderContext();
             _dataManager = new InstanceDataManager();
-            _syncSystem = new InstanceSyncSystem(_dataManager);
+            _syncSystem = new InstanceSyncSystem(_dataManager, _world.SystemContext);
             _world.SystemRoot.Add(_syncSystem);
         }
 
@@ -44,7 +45,7 @@ namespace SomeEngine.Tests.Systems
         public void EntityWithOnlyTransform_IsNotSynced()
         {
             var e = _world.EntityStore.CreateEntity();
-            e.AddComponent(new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
+            AddTransform(e, new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
 
             _world.Update(0.16f);
             Assert.Equal(0, _dataManager.Count);
@@ -64,7 +65,7 @@ namespace SomeEngine.Tests.Systems
         public void EntityWithBoth_IsSynced()
         {
             var e = _world.EntityStore.CreateEntity();
-            e.AddComponent(new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
+            AddTransform(e, new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
             e.AddComponent(new MeshInstance { BVHRootIndex = 5 });
 
             _world.Update(0.16f);
@@ -72,21 +73,64 @@ namespace SomeEngine.Tests.Systems
         }
 
         [Fact]
+        public void MeshInstanceAuthoredBoundsExpansion_IsUploadedToInstanceHeader()
+        {
+            var e = _world.EntityStore.CreateEntity();
+            AddTransform(e, new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
+            e.AddComponent(new MeshInstance
+            {
+                BVHRootIndex = 5,
+                BoundsExpansion = 0.25f,
+            });
+
+            _world.Update(0.16f);
+
+            Assert.Equal(1, _dataManager.Count);
+            Assert.Equal(
+                0.25f,
+                InstanceHeaderLayout.ReadFloat32(_dataManager.GetHeader(0), InstanceHeaderLayout.BoundsExpansionWorld));
+        }
+
+        [Fact]
+        public void MaterialOverride_IsUploadedThroughInstanceDataFlagsAndHeapOffset()
+        {
+            var e = _world.EntityStore.CreateEntity();
+            AddTransform(e, new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
+            e.AddComponent(new MeshInstance { BVHRootIndex = 5 });
+            e.AddComponent(new MaterialOverride { BaseColorTint = new Vector4(0.2f, 0.3f, 0.4f, 1.0f) });
+
+            _world.Update(0.16f);
+
+            ReadOnlySpan<byte> header = _dataManager.GetHeader(0);
+            Assert.Equal(
+                (uint)GpuInstanceDataFlags.MaterialOverride,
+                InstanceHeaderLayout.ReadUInt32(header, InstanceHeaderLayout.InstanceDataFlags));
+            Assert.Equal(0u, InstanceHeaderLayout.ReadUInt32(header, InstanceHeaderLayout.InstanceDataOffset));
+            Assert.True(_dataManager.MetadataByteCount >= sizeof(float) * 4);
+        }
+
+        [Fact]
         public void MultipleEntities_AreHandledCorrectly()
         {
             var e1 = _world.EntityStore.CreateEntity();
-            e1.AddComponent(new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
+            AddTransform(e1, new TransformQvvs(Vector3.Zero, Quaternion.Identity, 1.0f));
             e1.AddComponent(new MeshInstance { BVHRootIndex = 5 });
 
             var e2 = _world.EntityStore.CreateEntity(); // only transform
-            e2.AddComponent(new TransformQvvs(Vector3.One, Quaternion.Identity, 1.0f));
+            AddTransform(e2, new TransformQvvs(Vector3.One, Quaternion.Identity, 1.0f));
 
             var e3 = _world.EntityStore.CreateEntity();
-            e3.AddComponent(new TransformQvvs(new Vector3(2, 2, 2), Quaternion.Identity, 2.0f));
+            AddTransform(e3, new TransformQvvs(new Vector3(2, 2, 2), Quaternion.Identity, 2.0f));
             e3.AddComponent(new MeshInstance { BVHRootIndex = 12 });
 
             _world.Update(0.16f);
             Assert.Equal(2, _dataManager.Count);
+        }
+
+        private static void AddTransform(Entity entity, TransformQvvs value)
+        {
+            entity.AddComponent(new LocalTransform { Value = value });
+            entity.AddComponent(new WorldTransform());
         }
     }
 }

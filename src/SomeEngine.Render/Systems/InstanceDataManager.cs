@@ -6,7 +6,7 @@ namespace SomeEngine.Render.Systems;
 public class InstanceDataManager
 {
     private GpuTransform[] _cpuTransforms;
-    private GpuInstanceHeader[] _cpuHeaders;
+    private byte[] _cpuHeaders;
     private byte[] _cpuMetadata;
     private int _capacity = 1024;
 
@@ -14,13 +14,13 @@ public class InstanceDataManager
     public int MetadataByteCount { get; private set; }
 
     public Span<GpuTransform> CpuTransforms => _cpuTransforms.AsSpan(0, Count);
-    public Span<GpuInstanceHeader> CpuHeaders => _cpuHeaders.AsSpan(0, Count);
+    public Span<byte> CpuHeaders => _cpuHeaders.AsSpan(0, Count * InstanceHeaderLayout.StrideBytes);
     public Span<byte> CpuMetadata => _cpuMetadata.AsSpan(0, MetadataByteCount);
 
     public InstanceDataManager()
     {
         _cpuTransforms = new GpuTransform[_capacity];
-        _cpuHeaders = new GpuInstanceHeader[_capacity];
+        _cpuHeaders = new byte[_capacity * InstanceHeaderLayout.StrideBytes];
         _cpuMetadata = new byte[_capacity * 32]; // Initial guess: 32 bytes per instance max on average
     }
 
@@ -31,7 +31,7 @@ public class InstanceDataManager
             while (_capacity < needed)
                 _capacity *= 2;
             Array.Resize(ref _cpuTransforms, _capacity);
-            Array.Resize(ref _cpuHeaders, _capacity);
+            Array.Resize(ref _cpuHeaders, _capacity * InstanceHeaderLayout.StrideBytes);
         }
     }
 
@@ -45,10 +45,15 @@ public class InstanceDataManager
         _cpuTransforms[index] = transform;
     }
 
-    public void SetHeader(int index, GpuInstanceHeader header)
-    {
-        _cpuHeaders[index] = header;
-    }
+    public InstanceHeaderWriter GetHeaderWriter(int index)
+        => new(_cpuHeaders.AsSpan(
+            index * InstanceHeaderLayout.StrideBytes,
+            InstanceHeaderLayout.StrideBytes));
+
+    public ReadOnlySpan<byte> GetHeader(int index)
+        => _cpuHeaders.AsSpan(
+            index * InstanceHeaderLayout.StrideBytes,
+            InstanceHeaderLayout.StrideBytes);
 
     public void ClearMetadata()
     {

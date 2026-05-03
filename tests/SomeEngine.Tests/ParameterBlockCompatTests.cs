@@ -13,6 +13,42 @@ namespace SomeEngine.Tests;
 public class ParameterBlockCompatTests
 {
     [Fact]
+    public void EntryPointUniformStruct_ImporterReflectsResourceFields()
+    {
+        var source = """
+            struct PBRMaterialParams
+            {
+                Texture2D AlbedoMap;
+                SamplerState MaterialSampler;
+            };
+
+            [shader("compute")]
+            [numthreads(64, 1, 1)]
+            void CSMain(uint3 tid : SV_DispatchThreadID, uniform PBRMaterialParams materialParams)
+            {
+                float4 albedo = materialParams.AlbedoMap.SampleLevel(materialParams.MaterialSampler, float2(0.0), 0.0);
+            }
+            """;
+
+        string dir = Path.Combine(Path.GetTempPath(), "SomeEngineTests", "Shaders");
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, "entry_struct_material.slang");
+        var asset = SlangShaderImporter.Import(path, source);
+
+        Assert.NotEmpty(asset.Reflections!);
+        foreach (var backend in asset.Reflections!)
+        {
+            var resources = backend.Reflection!.Resources!;
+            var albedo = Assert.Single(resources, static r => r.Name == "AlbedoMap");
+            var sampler = Assert.Single(resources, static r => r.Name == "MaterialSampler");
+
+            Assert.NotEqual(0, albedo.ResourceType);
+            Assert.NotEqual(0, sampler.ResourceType);
+            Assert.DoesNotContain(resources, static r => r.Name == "materialParams");
+        }
+    }
+
+    [Fact]
     public void ParameterBlock_ModuleReflection_ExtractsMaterialBindings()
     {
         var globalSession = SlangShaderImporter.GlobalSession;

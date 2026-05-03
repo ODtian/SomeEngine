@@ -1,3 +1,4 @@
+using Friflo.Engine.ECS;
 using SomeEngine.Assets;
 using SomeEngine.Assets.Pipeline;
 using SomeEngine.Assets.Schema;
@@ -12,35 +13,33 @@ namespace SomeEngine.Render.Assets;
 /// </summary>
 public static class MaterialAssetLoader
 {
-    /// <summary>贴图加载回调。path → ITextureView?</summary>
-    public delegate Diligent.ITextureView? TextureLoadFunc(string path);
-
-    /// <summary>Shader 加载回调。guid → ShaderAsset?</summary>
+    /// <summary>贴图加载回调。guid → ITextureView?</summary>
+    public delegate Diligent.ITextureView? TextureLoadFunc(AssetGuid textureGuid);
     public delegate ShaderAsset? ShaderLoadFunc(AssetGuid guid);
 
     public static Material Load(
         byte[] data,
-        MaterialSystem materialSystem,
+        EntityStore materialStore,
         TextureLoadFunc? textureLoader = null,
         ShaderLoadFunc? shaderLoader = null)
     {
         MaterialAsset asset = MaterialAssetSerializer.Parse(data);
-        return LoadFromAsset(asset, materialSystem, textureLoader, shaderLoader);
+        return LoadFromAsset(asset, materialStore, textureLoader, shaderLoader);
     }
 
     public static Material LoadFromFile(
         string path,
-        MaterialSystem materialSystem,
+        EntityStore materialStore,
         TextureLoadFunc? textureLoader = null,
         ShaderLoadFunc? shaderLoader = null)
     {
         MaterialAsset asset = MaterialAssetSerializer.Load(path);
-        return LoadFromAsset(asset, materialSystem, textureLoader, shaderLoader);
+        return LoadFromAsset(asset, materialStore, textureLoader, shaderLoader);
     }
 
     public static Material LoadFromAsset(
         MaterialAsset asset,
-        MaterialSystem materialSystem,
+        EntityStore materialStore,
         TextureLoadFunc? textureLoader = null,
         ShaderLoadFunc? shaderLoader = null)
     {
@@ -52,52 +51,104 @@ public static class MaterialAssetLoader
             AssetGuid = materialAssetGuid,
             Name = asset.Name ?? string.Empty,
         };
-        Friflo.Engine.ECS.Entity entity = materialSystem.Store.CreateEntity();
-        entity.AddComponent(new MaterialRef { Owner = material });
-        material.Entity = entity;
-        material.System = materialSystem;
+        material.PassStore = materialStore;
 
-        if (asset.Passes is { Count: > 0 } && shaderLoader != null)
+        var passEntities = new List<Friflo.Engine.ECS.Entity>();
+        ShaderMaterialScalarLayout? scalarLayout = null;
+
+        if (asset.Passes is { Count: > 0 })
         {
             for (int i = 0; i < asset.Passes.Count; i++)
             {
                 PassEntry passEntry = asset.Passes[i];
-                if (!AssetGuid.TryParse(passEntry.ShaderGuid, out AssetGuid shaderGuid) || shaderGuid.IsEmpty)
+                Friflo.Engine.ECS.Entity entity = materialStore.CreateEntity();
+                entity.AddComponent(new MaterialRef { Owner = material });
+
+                if (passEntry.Tags != null)
                 {
+                    foreach (TagEntry tagEntry in passEntry.Tags)
+                    {
+                        Baker.Apply(in tagEntry, entity);
+                    }
+                }
+
+                if (passEntry.Components != null)
+                {
+                    foreach (ComponentEntry componentEntry in passEntry.Components)
+                    {
+                        Baker.Apply(in componentEntry, entity);
+                    }
+                }
+
+                if (shaderLoader == null
+                    || !AssetGuid.TryParse(passEntry.ShaderGuid, out AssetGuid shaderGuid)
+                    || shaderGuid.IsEmpty)
+                {
+                    passEntities.Add(entity);
                     continue;
                 }
 
-                ShaderAsset? loadedShader = shaderLoader(shaderGuid);
-                if (loadedShader == null)
+                ShaderAsset? shader = shaderLoader(shaderGuid);
+                scalarLayout ??= SelectMaterialScalarLayout(shader);
+                if (shader?.EntryPointAttributes == null)
                 {
+                    passEntities.Add(entity);
                     continue;
                 }
 
-                if (string.IsNullOrWhiteSpace(loadedShader.AssetGuid))
+                for (int attrIndex = 0; attrIndex < shader.EntryPointAttributes.Count; attrIndex++)
                 {
-                    loadedShader.AssetGuid = shaderGuid.ToFlatString();
+                    ShaderEntryPointAttribute attribute = shader.EntryPointAttributes[attrIndex];
+                    ShaderAttributeBakeSource bakeSource = new(attribute, shader, passEntry.EntryPoint);
+                    Baker.Apply(in bakeSource, entity);
                 }
 
-                ApplyShaderAuthoring(material.Entity, passEntry, loadedShader);
+                if (TryMergeClusterRasterPass(passEntities, entity))
+                {
+                    entity.DeleteEntity();
+                    continue;
+                }
+
+                passEntities.Add(entity);
             }
         }
+
+        if (passEntities.Count == 0)
+        {
+            Friflo.Engine.ECS.Entity entity = materialStore.CreateEntity();
+            entity.AddComponent(new MaterialRef { Owner = material });
+            passEntities.Add(entity);
+        }
+
+        material.PassEntities = [.. passEntities];
 
         if (asset.Textures != null)
         {
             foreach (TextureBinding binding in asset.Textures)
             {
-                if (binding.Name == null || binding.Path == null)
+                if (binding.Name == null || binding.TextureGuid == null)
                 {
                     continue;
                 }
 
-                Diligent.ITextureView? view = textureLoader?.Invoke(binding.Path);
-                if (view != null)
+                if (!AssetGuid.TryParse(binding.TextureGuid, out AssetGuid textureGuid) || textureGuid.IsEmpty)
                 {
-                    material.SetTexture(binding.Name, view);
+                    continue;
                 }
+
+                Diligent.ITextureView? view = textureLoader?.Invoke(textureGuid);
+                material.SetTexture(binding.Name, view);
             }
         }
+
+        MaterialScalarRegionLayout scalarRegionLayout = MaterialScalarRegionLayout.FromShaderLayout(scalarLayout);
+        if (asset.Scalars is { Count: > 0 } && scalarRegionLayout.PayloadByteSize == 0)
+        {
+            throw new InvalidOperationException(
+                $"Material '{material.Name}' declares scalar parameters, but no shader material scalar layout was found.");
+        }
+
+        material.SetScalarRegionLayout(scalarRegionLayout);
 
         if (asset.Scalars != null)
         {
@@ -112,29 +163,75 @@ public static class MaterialAssetLoader
             }
         }
 
-        if (asset.Passes != null)
-        {
-            foreach (PassEntry passEntry in asset.Passes)
-            {
-                if (passEntry.Tags == null)
-                {
-                    continue;
-                }
-
-                foreach (TagEntry tagEntry in passEntry.Tags)
-                {
-                    if (!string.IsNullOrEmpty(tagEntry.Name))
-                    {
-                        MaterialEntityTags.Apply(material.Entity, tagEntry.Name);
-                    }
-                }
-            }
-        }
-
         return material;
     }
 
     /// <summary>将 ParamValue union 值写入 ShaderParamBag。</summary>
+    private static ShaderMaterialScalarLayout? SelectMaterialScalarLayout(ShaderAsset? shader)
+    {
+        if (shader?.Metadata?.MaterialScalarLayouts == null)
+        {
+            return null;
+        }
+
+        foreach (ShaderMaterialScalarLayout layout in shader.Metadata.MaterialScalarLayouts)
+        {
+            if (!string.IsNullOrWhiteSpace(layout.Name))
+            {
+                return layout;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryMergeClusterRasterPass(
+        List<Friflo.Engine.ECS.Entity> passEntities,
+        Friflo.Engine.ECS.Entity source)
+    {
+        if (!source.TryGetComponent<ClusterRaster>(out ClusterRaster sourceRaster))
+        {
+            return false;
+        }
+
+        foreach (Friflo.Engine.ECS.Entity target in passEntities)
+        {
+            if (!target.TryGetComponent<ClusterRaster>(out _)
+                || !HaveSameMaterialTags(target, source))
+            {
+                continue;
+            }
+
+            ref ClusterRaster targetRaster = ref target.GetComponent<ClusterRaster>();
+            MergeVariant(ref targetRaster.SWInline, sourceRaster.SWInline);
+            MergeVariant(ref targetRaster.SWCached, sourceRaster.SWCached);
+            MergeVariant(ref targetRaster.HWVSInline, sourceRaster.HWVSInline);
+            MergeVariant(ref targetRaster.HWVSCached, sourceRaster.HWVSCached);
+            MergeVariant(ref targetRaster.HWPS, sourceRaster.HWPS);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static void MergeVariant(ref ShaderVariantRef target, ShaderVariantRef source)
+    {
+        if (target.IsEmpty && !source.IsEmpty)
+        {
+            target = source;
+        }
+    }
+
+    private static bool HaveSameMaterialTags(
+        Friflo.Engine.ECS.Entity left,
+        Friflo.Engine.ECS.Entity right)
+    {
+        return left.Tags.Has<Opaque>() == right.Tags.Has<Opaque>()
+            && left.Tags.Has<Masked>() == right.Tags.Has<Masked>()
+            && left.Tags.Has<Translucent>() == right.Tags.Has<Translucent>()
+            && left.Tags.Has<TwoSided>() == right.Tags.Has<TwoSided>();
+    }
+
     public static void ApplyScalarParam(ShaderParamBag bag, string name, ParamValue value)
     {
         switch (value.Kind)
@@ -161,143 +258,5 @@ public static class MaterialAssetLoader
                 bag.SetScalar(name, new System.Numerics.Vector4(v4.X, v4.Y, v4.Z, v4.W));
                 break;
         }
-    }
-
-    private static void ApplyShaderAuthoring(Friflo.Engine.ECS.Entity entity, PassEntry passEntry, ShaderAsset shader)
-    {
-        bool usedSerializedAttributes = false;
-        if (shader.EntryPointAttributes != null)
-        {
-            for (int i = 0; i < shader.EntryPointAttributes.Count; i++)
-            {
-                ShaderEntryPointAttribute attribute = shader.EntryPointAttributes[i];
-                if (attribute.Name == null)
-                {
-                    continue;
-                }
-
-                usedSerializedAttributes = ClusterRenderAuthoring.TryApply(
-                    entity,
-                    attribute.Name,
-                    attribute.Args,
-                    attribute.VariantIndex,
-                    shader) || usedSerializedAttributes;
-            }
-        }
-
-        if (!usedSerializedAttributes)
-        {
-            ApplyLegacyPassRole(entity, passEntry, shader);
-        }
-    }
-
-    private static void ApplyLegacyPassRole(Friflo.Engine.ECS.Entity entity, PassEntry passEntry, ShaderAsset shader)
-    {
-        if (passEntry.Tags == null)
-        {
-            return;
-        }
-
-        for (int i = 0; i < passEntry.Tags.Count; i++)
-        {
-            string? name = passEntry.Tags[i].Name;
-            if (string.IsNullOrEmpty(name))
-            {
-                continue;
-            }
-
-            switch (name)
-            {
-                case "ClusterShader":
-                    int shadeVariant = FindVariantIndex(shader, passEntry.EntryPoint);
-                    if (shadeVariant >= 0)
-                    {
-                        ClusterShadeAuthoring.Apply(entity, [], shadeVariant, shader);
-                    }
-                    break;
-                case "ClusterRaster":
-                    ApplyLegacyRasterAuthoring(entity, shader);
-                    break;
-                case "VertexDeform":
-                    int deformVariant = FindVariantIndex(shader, passEntry.EntryPoint);
-                    if (deformVariant >= 0)
-                    {
-                        SetClusterDeform(entity, shader, deformVariant);
-                    }
-                    break;
-            }
-        }
-    }
-
-    private static void ApplyLegacyRasterAuthoring(Friflo.Engine.ECS.Entity entity, ShaderAsset shader)
-    {
-        if (shader.Variants == null)
-        {
-            return;
-        }
-
-        for (int i = 0; i < shader.Variants.Count; i++)
-        {
-            ShaderBytecode variant = shader.Variants[i];
-            if (variant.Stage != ShaderStage.Compute)
-            {
-                continue;
-            }
-
-            if (string.Equals(variant.EntryPoint, "CSSWRaster", StringComparison.Ordinal))
-            {
-                ClusterRasterAuthoring.Apply(entity, ["sw_inline"], i, shader);
-            }
-            else if (string.Equals(variant.EntryPoint, "CSSWRasterCached", StringComparison.Ordinal))
-            {
-                ClusterRasterAuthoring.Apply(entity, ["sw_cached"], i, shader);
-            }
-        }
-    }
-
-    private static void SetClusterDeform(Friflo.Engine.ECS.Entity entity, ShaderAsset shader, int variantIndex)
-    {
-        string? entryPoint = shader.Variants != null && variantIndex >= 0 && variantIndex < shader.Variants.Count
-            ? shader.Variants[variantIndex].EntryPoint
-            : null;
-
-        if (entity.TryGetComponent<ClusterDeform>(out _))
-        {
-            ref ClusterDeform deform = ref entity.GetComponent<ClusterDeform>();
-            deform.Default = new ShaderVariantRef(shader, entryPoint);
-        }
-        else
-        {
-            entity.AddComponent(new ClusterDeform { Default = new ShaderVariantRef(shader, entryPoint) });
-        }
-    }
-
-    private static int FindVariantIndex(ShaderAsset shader, string? preferredEntryPoint)
-    {
-        if (shader.Variants == null)
-        {
-            return -1;
-        }
-
-        if (!string.IsNullOrEmpty(preferredEntryPoint))
-        {
-            for (int i = 0; i < shader.Variants.Count; i++)
-            {
-                if (string.Equals(shader.Variants[i].EntryPoint, preferredEntryPoint, StringComparison.Ordinal))
-                {
-                    return i;
-                }
-            }
-        }
-
-        for (int i = 0; i < shader.Variants.Count; i++)
-        {
-            if (shader.Variants[i].Stage == ShaderStage.Compute)
-            {
-                return i;
-            }
-        }
-
-        return shader.Variants.Count > 0 ? 0 : -1;
     }
 }

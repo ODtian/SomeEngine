@@ -1,3 +1,4 @@
+using Friflo.Engine.ECS;
 using SomeEngine.Assets.Schema;
 using SomeEngine.Assets.Pipeline;
 using SomeEngine.Assets;
@@ -18,22 +19,12 @@ public static class MaterialInstanceLoader
     /// </summary>
     public static Material Load(
         byte[] data,
-        Material parent,
-        MaterialSystem materialSystem,
-        MaterialAssetLoader.TextureLoadFunc? textureLoader = null)
-    {
-        var asset = MaterialInstanceAssetSerializer.Parse(data);
-        return LoadFromAsset(asset, parent, materialSystem, textureLoader);
-    }
-
-    public static Material Load(
-        byte[] data,
-        MaterialSystem materialSystem,
+        EntityStore materialStore,
         ParentMaterialLoadFunc parentLoader,
         MaterialAssetLoader.TextureLoadFunc? textureLoader = null)
     {
         var asset = MaterialInstanceAssetSerializer.Parse(data);
-        return LoadFromAsset(asset, materialSystem, parentLoader, textureLoader);
+        return LoadFromAsset(asset, materialStore, parentLoader, textureLoader);
     }
 
     /// <summary>
@@ -41,88 +32,17 @@ public static class MaterialInstanceLoader
     /// </summary>
     public static Material LoadFromFile(
         string path,
-        Material parent,
-        MaterialSystem materialSystem,
-        MaterialAssetLoader.TextureLoadFunc? textureLoader = null)
-    {
-        var asset = MaterialInstanceAssetSerializer.Load(path);
-        return LoadFromAsset(asset, parent, materialSystem, textureLoader);
-    }
-
-    public static Material LoadFromFile(
-        string path,
-        MaterialSystem materialSystem,
+        EntityStore materialStore,
         ParentMaterialLoadFunc parentLoader,
         MaterialAssetLoader.TextureLoadFunc? textureLoader = null)
     {
         var asset = MaterialInstanceAssetSerializer.Load(path);
-        return LoadFromAsset(asset, materialSystem, parentLoader, textureLoader);
-    }
-
-    /// <summary>
-    /// 从已解析的 FlatBuffer 对象加载 MaterialInstance。
-    /// </summary>
-    public static Material LoadFromAsset(
-        MaterialInstanceAsset asset,
-        Material parent,
-        MaterialSystem materialSystem,
-        MaterialAssetLoader.TextureLoadFunc? textureLoader = null)
-    {
-        if (!ReferenceEquals(parent.System, materialSystem))
-        {
-            throw new InvalidOperationException("Parent material is attached to a different MaterialSystem.");
-        }
-
-        var instance = parent.Instantiate();
-        instance.AssetGuid = AssetGuid.TryParse(asset.AssetGuid, out var instanceGuid)
-            ? instanceGuid
-            : AssetGuid.Empty;
-
-        // 2. Apply texture overrides
-        if (asset.Overrides != null)
-        {
-            foreach (var ovr in asset.Overrides)
-            {
-                if (ovr.Name == null || ovr.Path == null) continue;
-                var view = textureLoader?.Invoke(ovr.Path);
-                if (view != null)
-                    instance.SetTexture(ovr.Name, view);
-            }
-        }
-
-        // 3. Apply scalar overrides
-        if (asset.ScalarOverrides != null)
-        {
-            foreach (var ovr in asset.ScalarOverrides)
-            {
-                if (ovr.Name == null || ovr.Value == null) continue;
-                MaterialAssetLoader.ApplyScalarParam(instance.Params, ovr.Name, ovr.Value.Value);
-            }
-        }
-
-        if (asset.TagOverrides != null)
-        {
-            foreach (var ovr in asset.TagOverrides)
-            {
-                if (ovr.Name == null) continue;
-
-                if (ovr.Remove)
-                {
-                    MaterialEntityTags.Remove(instance.Entity, ovr.Name);
-                }
-                else
-                {
-                    MaterialEntityTags.Apply(instance.Entity, ovr.Name);
-                }
-            }
-        }
-
-        return instance;
+        return LoadFromAsset(asset, materialStore, parentLoader, textureLoader);
     }
 
     public static Material LoadFromAsset(
         MaterialInstanceAsset asset,
-        MaterialSystem materialSystem,
+        EntityStore materialStore,
         ParentMaterialLoadFunc parentLoader,
         MaterialAssetLoader.TextureLoadFunc? textureLoader = null)
     {
@@ -138,6 +58,39 @@ public static class MaterialInstanceLoader
         var parent = parentLoader(parentGuid)
             ?? throw new InvalidOperationException($"Parent material not found for guid '{parentGuid}'.");
 
-        return LoadFromAsset(asset, parent, materialSystem, textureLoader);
+        if (!ReferenceEquals(parent.PassStore, materialStore))
+        {
+            throw new InvalidOperationException("Parent material is attached to a different pass entity store.");
+        }
+
+        var instance = parent.Instantiate();
+        instance.AssetGuid = AssetGuid.TryParse(asset.AssetGuid, out var instanceGuid)
+            ? instanceGuid
+            : AssetGuid.Empty;
+
+        if (asset.Overrides != null)
+        {
+            foreach (var ovr in asset.Overrides)
+            {
+                if (ovr.Name == null || ovr.TextureGuid == null) continue;
+                if (!AssetGuid.TryParse(ovr.TextureGuid, out var texGuid) || texGuid.IsEmpty) continue;
+                var view = textureLoader?.Invoke(texGuid);
+                if (view != null)
+                    instance.SetTexture(ovr.Name, view);
+            }
+        }
+
+        if (asset.ScalarOverrides != null)
+        {
+            foreach (var ovr in asset.ScalarOverrides)
+            {
+                if (ovr.Name == null || ovr.Value == null) continue;
+                MaterialAssetLoader.ApplyScalarParam(instance.Params, ovr.Name, ovr.Value.Value);
+            }
+
+            instance.Touch();
+        }
+
+        return instance;
     }
 }

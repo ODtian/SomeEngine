@@ -2,12 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using Diligent;
+using SomeEngine.Assets.Schema;
+using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Materials;
 
 /// <summary>
-/// 动态 shader 参数容器。存储贴图/Buffer/Sampler 绑定，按 string name 索引。
-/// 替代旧的 IShaderParams + 源生成器 ApplyToSRB() 模式（用于材质参数）。
+/// 动态 shader 参数容器。存储贴图/Buffer 绑定与标量参数，按 string name 索引。
+/// 材质参数运行时容器。
 /// </summary>
 public sealed class ShaderParamBag : IDisposable
 {
@@ -34,7 +36,7 @@ public sealed class ShaderParamBag : IDisposable
         _entries[name] = new Entry(EntryKind.Buffer, buffer);
     }
 
-    /// <summary>设置采样器绑定。</summary>
+    /// <summary>设置 Sampler 绑定。</summary>
     public void Set(string name, ISampler? sampler)
     {
         _entries[name] = new Entry(EntryKind.Sampler, sampler);
@@ -64,6 +66,25 @@ public sealed class ShaderParamBag : IDisposable
         if (_entries.TryGetValue(name, out var entry) && entry.Kind == EntryKind.Scalar)
             return entry.Value;
         return null;
+    }
+
+    public IEnumerable<(string Name, object Value)> EnumerateScalars()
+    {
+        if (_entries.Count == 0)
+            yield break;
+
+        var sortedKeys = new string[_entries.Count];
+        int idx = 0;
+        foreach (string key in _entries.Keys)
+            sortedKeys[idx++] = key;
+        Array.Sort(sortedKeys, StringComparer.Ordinal);
+
+        foreach (string name in sortedKeys)
+        {
+            var entry = _entries[name];
+            if (entry.Kind == EntryKind.Scalar && entry.Value != null)
+                yield return (name, entry.Value);
+        }
     }
 
     /// <summary>移除绑定。</summary>
@@ -196,14 +217,28 @@ public sealed class ShaderParamBag : IDisposable
     /// <summary>
     /// 将所有参数绑定到 SRB（Compute stage）。
     /// </summary>
-    public void ApplyTo(IShaderResourceBinding srb, ShaderType stage = ShaderType.Compute)
+    public void ApplyTo(IShaderResourceBinding srb, RenderContext context, ShaderAsset shaderAsset, ShaderType stage = ShaderType.Compute)
     {
+        ApplyTo(srb, context, shaderAsset, stage, fallbacks: null, onFallback: null);
+    }
+
+    public void ApplyTo(
+        IShaderResourceBinding srb,
+        RenderContext context,
+        ShaderAsset shaderAsset,
+        ShaderType stage,
+        MaterialResourceFallbacks? fallbacks,
+        Action<string, ShaderResourceType>? onFallback = null)
+    {
+        if (fallbacks != null)
+            ApplyFallbacks(shaderAsset, fallbacks, onFallback);
+
         foreach (var (name, entry) in _entries)
         {
             if (entry.Value == null) continue;
 
-            var variable = srb.GetVariableByName(stage, name);
-                        
+            var variable = srb.GetVariableByReflectedBinding(context, shaderAsset, stage, name);
+
             if (variable == null) continue;
 
             switch (entry.Kind)
@@ -222,6 +257,64 @@ public sealed class ShaderParamBag : IDisposable
                     break;
             }
         }
+    }
+
+    public int ApplyFallbacks(
+        ShaderAsset? shaderAsset,
+        MaterialResourceFallbacks fallbacks,
+        Action<string, ShaderResourceType>? onFallback = null)
+    {
+        if (fallbacks == null)
+            throw new ArgumentNullException(nameof(fallbacks));
+
+        int applied = 0;
+        if (shaderAsset?.Metadata?.MaterialBindings == null)
+            return applied;
+
+        foreach (var binding in shaderAsset.Metadata.MaterialBindings)
+        {
+            string? name = binding.Name;
+            if (string.IsNullOrWhiteSpace(name) || Contains(name))
+                continue;
+
+            switch (binding.ResourceType)
+            {
+                case MaterialBindingTexture:
+                    ITextureView? texture = fallbacks.ResolveTexture(name);
+                    if (texture == null)
+                        continue;
+
+                    Set(name, texture);
+                    onFallback?.Invoke(name, ShaderResourceType.TextureSrv);
+                    applied++;
+                    break;
+                case MaterialBindingSampler:
+                    if (fallbacks.DefaultSampler == null)
+                        continue;
+
+                    Set(name, fallbacks.DefaultSampler);
+                    onFallback?.Invoke(name, ShaderResourceType.Sampler);
+                    applied++;
+                    break;
+                case MaterialBindingBuffer:
+                    if (fallbacks.DefaultBufferView != null)
+                    {
+                        Set(name, fallbacks.DefaultBufferView);
+                        onFallback?.Invoke(name, ShaderResourceType.BufferSrv);
+                        applied++;
+                    }
+                    else if (fallbacks.DefaultConstantBuffer != null)
+                    {
+                        SetBuffer(name, fallbacks.DefaultConstantBuffer);
+                        onFallback?.Invoke(name, ShaderResourceType.ConstantBuffer);
+                        applied++;
+                    }
+
+                    break;
+            }
+        }
+
+        return applied;
     }
 
     /// <summary>
@@ -298,4 +391,8 @@ public sealed class ShaderParamBag : IDisposable
     }
 
     private readonly record struct Entry(EntryKind Kind, object? Value);
+
+    private const byte MaterialBindingTexture = 0;
+    private const byte MaterialBindingSampler = 1;
+    private const byte MaterialBindingBuffer = 2;
 }

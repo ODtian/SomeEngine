@@ -1,21 +1,28 @@
 using System;
-using Diligent;
 using Friflo.Engine.ECS;
 using Friflo.Engine.ECS.Systems;
+using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
-using SomeEngine.Core.Math;
+using SomeEngine.Core.Jobs;
 using SomeEngine.Render.Data;
 using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Systems;
 
-public class InstanceSyncSystem(InstanceDataManager dataManager)
-    : QuerySystem<TransformQvvs, MeshInstance>
+public class InstanceSyncSystem(InstanceDataManager dataManager, SystemContext? systemContext = null)
+    : QuerySystem<WorldTransform, MeshInstance>
 {
     private readonly InstanceDataManager _dataManager = dataManager;
+    private readonly SystemContext? _systemContext = systemContext;
 
     protected override void OnUpdate()
     {
+        if (_systemContext != null)
+        {
+            _systemContext.GlobalDependency.Complete();
+            _systemContext.GlobalDependency = default;
+        }
+
         int count = Query.Count;
         _dataManager.EnsureCapacity(count);
         _dataManager.ClearMetadata();
@@ -23,35 +30,28 @@ public class InstanceSyncSystem(InstanceDataManager dataManager)
         int index = 0;
         foreach (var entity in Query.Entities)
         {
-            var t = entity.GetComponent<TransformQvvs>();
+            var t = entity.GetComponent<WorldTransform>();
             var m = entity.GetComponent<MeshInstance>();
 
-            uint metaOffset = 0;
-            uint metaCount = 0;
+            uint instanceDataOffset = 0;
+            var instanceDataFlags = GpuInstanceDataFlags.None;
 
             if (entity.TryGetComponent<MaterialOverride>(out var overrideData))
             {
-                metaOffset = _dataManager.AppendMetadata(ref overrideData);
-                metaCount = (uint)(
-                    System.Runtime.CompilerServices.Unsafe.SizeOf<MaterialOverride>() / 4
-                );
+                instanceDataOffset = _dataManager.AppendMetadata(ref overrideData);
+                instanceDataFlags |= GpuInstanceDataFlags.MaterialOverride;
             }
 
-            _dataManager.SetTransform(index, GpuTransform.FromQvvs(t));
-            _dataManager.SetHeader(
-                index,
-                new GpuInstanceHeader
-                {
-                    BVHRootIndex = m.BVHRootIndex,
-                    MaterialSlotOffset = m.MaterialSlotOffset,
-                    MetadataOffset = metaOffset,
-                    MetadataCount = metaCount,
-                    BoundsExpansion = 0f,
-                    Pad1 = 0,
-                    Pad2 = 0,
-                    Pad3 = 0,
-                }
-            );
+            _dataManager.SetTransform(index, GpuTransform.FromQvvs(t.Qvvs));
+            float boundsExpansion = MathF.Max(0f, m.BoundsExpansion);
+
+            var writer = _dataManager.GetHeaderWriter(index);
+            writer.Clear();
+            writer.SetBvhRootIndex(m.BVHRootIndex);
+            writer.SetMaterialSlotOffset(0);
+            writer.SetInstanceDataOffset(instanceDataOffset);
+            writer.SetInstanceDataFlags(instanceDataFlags);
+            writer.SetBoundsExpansionWorld(boundsExpansion);
             index++;
         }
 
