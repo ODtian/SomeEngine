@@ -1,0 +1,16 @@
+// FlatBuffers schema for TextureAsset
+namespace SomeEngine.Assets.Schema;
+
+attribute "fs_serializer";
+attribute "fs_vector";
+
+table TextureAsset (fs_serializer) {
+    asset_guid: string;
+    name: string;
+    width: uint;
+    height: uint;
+    format: string;                         // e.g. "RGBA8_UNorm"
+    payload: [ubyte] (fs_vector:"Memory");  // compressed image bytes (PNG/JPG)
+}
+
+root_type TextureAsset;

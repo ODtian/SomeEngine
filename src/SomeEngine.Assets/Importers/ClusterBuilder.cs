@@ -72,6 +72,7 @@ public static class ClusterBuilder
     private const float SimplifyRatio = 0.5f;
     private const int PageSize = 128 * 1024; // 128KB
     private const int PageHeaderSize = 44; // New header with quant params
+    private const int MaxEncodedTriangleStart = ushort.MaxValue;
 
     private struct BuilderMeshlet
     {
@@ -286,7 +287,14 @@ public static class ClusterBuilder
     {
         var model = ModelRoot.Load(filePath);
         var mesh = model.LogicalMeshes[0];
+        IReadOnlyList<MeshMaterialSlot> materialSlots = mesh.Primitives
+            .Select(primitive => new MeshMaterialSlot(materialGuidResolver?.Invoke(primitive.Material?.Name ?? string.Empty) ?? AssetGuid.Empty))
+            .ToArray();
+        return ProcessMesh(mesh, materialSlots, mesh.Name ?? "Unnamed");
+    }
 
+    public static MeshAsset ProcessMesh(Mesh mesh, IReadOnlyList<MeshMaterialSlot> materialSlots, string name)
+    {
         static float[] ReadAccessorAsFloatArray(Accessor accessor)
         {
             return accessor.Dimensions switch
@@ -326,7 +334,7 @@ public static class ClusterBuilder
         }
 
         var combinedMaterialIndices = new List<float>();
-        var materialNames = new List<string>();
+        var normalizedMaterialSlots = new List<MeshMaterialSlot>();
         uint vertexOffset = 0;
 
         for (int primIdx = 0; primIdx < mesh.Primitives.Count; primIdx++)
@@ -354,8 +362,10 @@ public static class ClusterBuilder
                 }
             }
 
-            string matName = primitive.Material?.Name ?? $"Material_{primIdx}";
-            materialNames.Add(matName);
+            normalizedMaterialSlots.Add(
+                primIdx < materialSlots.Count
+                    ? materialSlots[primIdx]
+                    : new MeshMaterialSlot(AssetGuid.Empty));
 
             for (int i = 0; i < positions.Length; i++)
             {
@@ -393,7 +403,25 @@ public static class ClusterBuilder
             return string.Compare(a.Name, b.Name, StringComparison.Ordinal);
         });
 
-        return ProcessRaw(allPos.ToArray(), rawAttributes, allIndices.ToArray(), materialNames, mesh.Name ?? "Unnamed", materialGuidResolver);
+        return ProcessRaw(allPos.ToArray(), rawAttributes, allIndices.ToArray(), normalizedMaterialSlots, name);
+    }
+
+    public static MeshAsset ProcessRaw(
+        Vector3[] rawPos,
+        List<RawAttribute> rawAttributes,
+        uint[] rawIndices,
+        IReadOnlyList<MeshMaterialSlot> materialSlots,
+        string name)
+    {
+        List<string> regionNames = materialSlots
+            .Select(static (slot, index) => $"region_{index}")
+            .ToList();
+        return ProcessRaw(
+            rawPos,
+            rawAttributes,
+            rawIndices,
+            regionNames,
+            name);
     }
 
     private static void BuildClusterLod(
@@ -601,9 +629,8 @@ public static class ClusterBuilder
         Vector3[] rawPos,
         List<RawAttribute> rawAttributes,
         uint[] rawIndices,
-        List<string> materialNames,
-        string name,
-        Func<string, AssetGuid>? materialGuidResolver = null
+        List<string> regionNames,
+        string name
     )
     {
         string tempFile = Path.GetTempFileName();
@@ -1014,13 +1041,23 @@ public static class ClusterBuilder
                 int iSize = localIndices.Count;
                 int totalAdded = clusterSize + vSize + aSize + iSize;
 
-                if (currentBytes + totalAdded > PageSize)
+                if (currentBytes + totalAdded > PageSize
+                    || currentIndices.Count > MaxEncodedTriangleStart)
                 {
                     FlushPage();
                 }
 
                 uint vStart = (uint)(currentPositions.Count / 3);
                 uint tStart = (uint)currentIndices.Count;
+                if (vStart > ushort.MaxValue)
+                    throw new InvalidOperationException(
+                        $"Cluster page vertex start exceeds encoded range: {vStart} > {ushort.MaxValue}");
+                if (tStart > ushort.MaxValue)
+                    throw new InvalidOperationException(
+                        $"Cluster page triangle start exceeds encoded range: {tStart} > {ushort.MaxValue}");
+                if (currentClusters.Count > 0xFFF)
+                    throw new InvalidOperationException(
+                        $"Cluster page cluster start exceeds BVH leaf encoding range: {currentClusters.Count} > 4095");
 
                 currentPositions.AddRange(localPos);
                 for (int s = 0; s < finalAttributes.Count; s++)
@@ -1080,6 +1117,8 @@ public static class ClusterBuilder
                         PackedRanges = packedRanges,
                         MaterialTableOffset = 0xFFFFFFFF, // fast path (≤3 materials)
                         VRBBatchInfo = m.VRBBatchInfo,
+                        BoundMin = cMin,
+                        BoundMax = cMax,
                     }
                 );
 
@@ -1123,12 +1162,8 @@ public static class ClusterBuilder
                 };
             }
 
-            var defaultMaterialGuids = materialNames
-                .Select(name =>
-                {
-                    AssetGuid guid = materialGuidResolver?.Invoke(name) ?? AssetGuid.Empty;
-                    return guid.IsEmpty ? string.Empty : guid.ToFlatString();
-                })
+            MeshRegion[] meshRegions = regionNames
+                .Select(regionName => new MeshRegion { Name = regionName })
                 .ToArray();
 
             var meshAsset = new MeshAsset
@@ -1154,8 +1189,7 @@ public static class ClusterBuilder
                     Z = quantOrigin.Z,
                 },
                 QuantStep = quantStep,
-                DefaultMaterialGuids = defaultMaterialGuids,
-                DefaultMaterialSlots = materialNames.ToArray(),
+                Regions = meshRegions,
             };
 
             fs.Seek(0, SeekOrigin.Begin);

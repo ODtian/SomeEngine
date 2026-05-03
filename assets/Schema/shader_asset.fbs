@@ -23,6 +23,9 @@ enum ShaderStage : ubyte {
 table ShaderResourceReflection {
     name: string;
     stages: uint; // Diligent SHADER_TYPE bitmask
+    binding: uint; // Diligent Register / Vulkan binding / WebGPU binding index
+    space: uint; // Diligent Space / Vulkan descriptor set / WebGPU bind group
+    resource_type: ubyte; // Diligent ShaderResourceType numeric value; 0=Unknown
 }
 
 table ShaderReflectionData {
@@ -47,6 +50,21 @@ table ShaderMaterialBinding {
     resource_type: ubyte;    // 0=Texture, 1=Sampler, 2=Buffer
 }
 
+table ShaderMaterialScalarField {
+    name: string;
+    offset: uint;            // byte offset from the start of the scalar payload
+    size: uint;              // field byte size under Slang layout rules
+    row_count: uint;
+    column_count: uint;
+    scalar_type: ubyte;      // SlangScalarType numeric value: Bool=2, Int32=3, UInt32=4, Float32=8
+}
+
+table ShaderMaterialScalarLayout {
+    name: string;            // Slang struct name, e.g. StandardPBRScalars
+    size: uint;              // payload byte size under Slang layout rules
+    fields: [ShaderMaterialScalarField];
+}
+
 table ShaderEntryPointAttribute {
     variant_index: int;
     name: string;
@@ -56,6 +74,7 @@ table ShaderEntryPointAttribute {
 table ShaderMetadata {
     tags: [string];
     material_bindings: [ShaderMaterialBinding];
+    material_scalar_layouts: [ShaderMaterialScalarLayout];
 }
 
 table DependencyEntry {

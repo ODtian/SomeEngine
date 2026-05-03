@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Threading;
 using SomeEngine.Assets;
 using SomeEngine.Assets.Pipeline;
 using SomeEngine.Assets.Schema;
@@ -11,11 +10,6 @@ namespace SomeEngine.Tests.Assets;
 
 public class AssetDatabaseTests
 {
-    public AssetDatabaseTests()
-    {
-        AssetTypeRegistration.RegisterBuiltIns();
-    }
-
     [Fact]
     public void Load_BySourcePath_ImportsShader_AndReusesGuid()
     {
@@ -24,7 +18,7 @@ public class AssetDatabaseTests
 
         try
         {
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
 
             ShaderAsset? first = db.Load<ShaderAsset>("assets/Shaders/simple.slang", "shader:main");
             ShaderAsset? second = db.Load<ShaderAsset>("assets/Shaders/simple.slang", "shader:main");
@@ -49,14 +43,15 @@ public class AssetDatabaseTests
 
         try
         {
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
 
             ShaderAsset? first = db.Load<ShaderAsset>("assets/Shaders/up_to_date.slang", "shader:main");
             Assert.NotNull(first);
 
             string manifestPath = Path.Combine(dir, "Library", "AssetManifest", AssetManifest.AssetIndexFileName);
-            DateTime before = File.GetLastWriteTimeUtc(manifestPath);
-            Thread.Sleep(1100);
+            DateTime before = DateTime.UtcNow.AddMinutes(-5);
+            File.SetLastWriteTimeUtc(manifestPath, before);
+            before = File.GetLastWriteTimeUtc(manifestPath);
 
             ShaderAsset? second = db.Load<ShaderAsset>("assets/Shaders/up_to_date.slang", "shader:main");
             DateTime after = File.GetLastWriteTimeUtc(manifestPath);
@@ -79,16 +74,17 @@ public class AssetDatabaseTests
 
         try
         {
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
 
             ShaderAsset? first = db.Load<ShaderAsset>("assets/Shaders/reimport.slang", "shader:main");
             Assert.NotNull(first);
 
             string sourcePath = Path.Combine(dir, "assets", "Shaders", "reimport.slang");
             string manifestPath = Path.Combine(dir, "Library", "AssetManifest", AssetManifest.AssetIndexFileName);
-            DateTime before = File.GetLastWriteTimeUtc(manifestPath);
+            DateTime before = DateTime.UtcNow.AddMinutes(-5);
+            File.SetLastWriteTimeUtc(manifestPath, before);
+            before = File.GetLastWriteTimeUtc(manifestPath);
 
-            Thread.Sleep(1100);
             File.AppendAllText(sourcePath, "\n// force reimport");
 
             ShaderAsset? second = db.Load<ShaderAsset>("assets/Shaders/reimport.slang", "shader:main");
@@ -97,6 +93,33 @@ public class AssetDatabaseTests
             Assert.NotNull(second);
             Assert.Equal(first!.AssetGuid, second!.AssetGuid);
             Assert.True(after > before);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void Load_BySourcePath_ReimportPreservesDeterministicShaderGuid_WhenImportedMetaIsMissing()
+    {
+        string dir = CreateTempDir();
+        WriteSimpleShader(dir, "assets/Shaders/deterministic.slang");
+
+        try
+        {
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
+            ShaderAsset? first = db.Load<ShaderAsset>("assets/Shaders/deterministic.slang", "shader:main");
+            Assert.NotNull(first);
+
+            string importedPath = Path.Combine(dir, "assets", "Shaders", "deterministic.shader.asset");
+            File.Delete(importedPath);
+            File.Delete(AssetMetaManager.GetMetaPath(importedPath));
+
+            ShaderAsset? second = db.Load<ShaderAsset>("assets/Shaders/deterministic.slang", "shader:main");
+
+            Assert.NotNull(second);
+            Assert.Equal(first!.AssetGuid, second!.AssetGuid);
         }
         finally
         {
@@ -123,13 +146,137 @@ public class AssetDatabaseTests
                 Scalars = [],
             }, materialPath);
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             db.Import("assets/Materials/test.material.asset");
             MaterialAsset? asset = db.Load<MaterialAsset>(materialGuid);
 
             Assert.NotNull(asset);
             Assert.Equal("TestMaterial", asset!.Name);
             Assert.Equal(materialGuid.ToFlatString(), asset.AssetGuid);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void Load_ByGuid_RejectsPayloadGuidMismatch()
+    {
+        string dir = CreateTempDir();
+
+        try
+        {
+            AssetGuid manifestGuid = AssetGuid.New();
+            AssetGuid payloadGuid = AssetGuid.New();
+            const string path = "assets/Materials/mismatch.material.asset";
+            string fullPath = Path.Combine(dir, path.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            MaterialAssetSerializer.Save(new MaterialAsset
+            {
+                AssetGuid = payloadGuid.ToFlatString(),
+                Name = "MismatchMaterial",
+                Passes = [],
+                Textures = [],
+                Scalars = [],
+            }, fullPath);
+
+            AssetManifest manifest = new();
+            manifest.AddAsset(manifestGuid, "MismatchMaterial", path, nameof(MaterialAsset));
+            manifest.Save(Path.Combine(dir, "Library", "AssetManifest"));
+
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
+
+            Assert.Throws<InvalidOperationException>(() => db.Load<MaterialAsset>(manifestGuid));
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void CreateAsset_AssignsGuid_RegistersManifest_AndReusesExistingGuid()
+    {
+        string dir = CreateTempDir();
+
+        try
+        {
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
+            const string path = "assets/Materials/created.material.asset";
+
+            AssetGuid firstGuid = db.CreateAsset(path, new MaterialAsset
+            {
+                Name = "CreatedMaterial",
+                Passes = [],
+                Textures = [],
+                Scalars = [],
+            });
+
+            Assert.False(firstGuid.IsEmpty);
+            Assert.Equal(firstGuid, db.Resolve(path));
+            MaterialAsset? firstLoad = db.Load<MaterialAsset>(firstGuid);
+            Assert.NotNull(firstLoad);
+            Assert.Equal(firstGuid.ToFlatString(), firstLoad!.AssetGuid);
+            Assert.Equal("CreatedMaterial", firstLoad.Name);
+
+            AssetGuid secondGuid = db.CreateAsset(path, new MaterialAsset
+            {
+                Name = "UpdatedMaterial",
+                Passes = [],
+                Textures = [],
+                Scalars = [],
+            });
+
+            Assert.Equal(firstGuid, secondGuid);
+            MaterialAsset? secondLoad = db.Load<MaterialAsset>(firstGuid);
+            Assert.NotNull(secondLoad);
+            Assert.Equal("UpdatedMaterial", secondLoad!.Name);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void CreateAsset_UsesRegisteredGuid_WhenExistingFileGuidDiffers()
+    {
+        string dir = CreateTempDir();
+
+        try
+        {
+            const string path = "assets/Materials/reconcile.material.asset";
+            string fullPath = Path.Combine(dir, path.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+
+            AssetGuid staleGuid = AssetGuid.New();
+            AssetGuid fileGuid = AssetGuid.New();
+            MaterialAssetSerializer.Save(new MaterialAsset
+            {
+                AssetGuid = fileGuid.ToFlatString(),
+                Name = "ExistingFile",
+                Passes = [],
+                Textures = [],
+                Scalars = [],
+            }, fullPath);
+
+            AssetManifest manifest = new();
+            manifest.AddAsset(staleGuid, "Stale", path, nameof(MaterialAsset));
+            manifest.Save(Path.Combine(dir, "Library", "AssetManifest"));
+
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
+            AssetGuid createdGuid = db.CreateAsset(path, new MaterialAsset
+            {
+                Name = "Reconciled",
+                Passes = [],
+                Textures = [],
+                Scalars = [],
+            });
+
+            Assert.Equal(staleGuid, createdGuid);
+            Assert.Equal(staleGuid, db.Resolve(path));
+            Assert.DoesNotContain(db.List(nameof(MaterialAsset)), record => record.Guid == fileGuid);
         }
         finally
         {
@@ -154,7 +301,7 @@ public class AssetDatabaseTests
             manifest.AddAsset(meshGuid, "MeshA", "assets/Meshes/a.mesh.asset", nameof(MeshAsset), dependencies: [materialGuid]);
             manifest.Save(Path.Combine(dir, "Library", "AssetManifest"));
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             IReadOnlyList<AssetManifestRecord> materials = db.List(nameof(MaterialAsset));
 
             Assert.Single(materials);
@@ -225,7 +372,7 @@ public class AssetDatabaseTests
             manifest.AddAsset(materialGuid, "DanglingMaterial", "assets/Materials/dangling.material.asset", nameof(MaterialAsset), dependencies: [missingShaderGuid]);
             manifest.Save(Path.Combine(dir, "Library", "AssetManifest"));
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             IReadOnlyList<AssetDiagnostic> diagnostics = db.Validate();
 
             Assert.Contains(diagnostics, static diagnostic => diagnostic.Kind == AssetDiagnosticKind.OrphanSourceMeta);
@@ -248,7 +395,7 @@ public class AssetDatabaseTests
 
         try
         {
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
 
             AssetGuid materialGuid = AssetGuid.New();
             string materialPath = Path.Combine(dir, "assets", "Materials", "imported.material.asset");
@@ -274,13 +421,13 @@ public class AssetDatabaseTests
     }
 
     [Fact]
-    public void AssetDatabase_IsNotDisposable()
+    public void AssetDatabase_IsDisposable()
     {
-        Assert.False(typeof(IDisposable).IsAssignableFrom(typeof(AssetDatabase)));
+        Assert.True(typeof(IDisposable).IsAssignableFrom(typeof(AssetDatabase)));
     }
 
     [Fact]
-    public void AssetDatabase_LazyRegisters_AssetFiles_OnLoad()
+    public void AssetDatabase_DoesNotLazyRegister_AssetFiles_OnLoad()
     {
         string dir = CreateTempDir();
 
@@ -298,13 +445,11 @@ public class AssetDatabaseTests
                 Scalars = [],
             }, materialPath);
 
-            AssetDatabase db = new(dir);
-            // manifest 是空的，但 Load 会按需注册
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             MaterialAsset? loaded = db.Load<MaterialAsset>("assets/Materials/lazy.material.asset");
 
-            Assert.NotNull(loaded);
-            Assert.Equal("LazyMaterial", loaded!.Name);
-            Assert.Equal(materialGuid, db.Resolve("assets/Materials/lazy.material.asset"));
+            Assert.Null(loaded);
+            Assert.Null(db.Resolve("assets/Materials/lazy.material.asset"));
         }
         finally
         {
@@ -317,7 +462,7 @@ public class AssetDatabaseTests
         string dir = CreateTempDir();
         try
         {
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             Assert.Empty(db.List(nameof(MaterialAsset)));
             Assert.Empty(db.List(nameof(ShaderAsset)));
         }
@@ -330,7 +475,7 @@ public class AssetDatabaseTests
         string dir = CreateTempDir();
         try
         {
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             MaterialAsset? result = db.Load<MaterialAsset>(AssetGuid.New());
             Assert.Null(result);
         }
@@ -343,7 +488,7 @@ public class AssetDatabaseTests
         string dir = CreateTempDir();
         try
         {
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             Assert.Null(db.Resolve("assets/Materials/nonexistent.material.asset"));
         }
         finally { Directory.Delete(dir, true); }
@@ -355,7 +500,7 @@ public class AssetDatabaseTests
         string dir = CreateTempDir();
         try
         {
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             Assert.Empty(db.GetDependencies(AssetGuid.New()));
         }
         finally { Directory.Delete(dir, true); }
@@ -367,7 +512,7 @@ public class AssetDatabaseTests
         string dir = CreateTempDir();
         try
         {
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             Assert.Empty(db.GetReferencers(AssetGuid.New()));
         }
         finally { Directory.Delete(dir, true); }
@@ -389,7 +534,7 @@ public class AssetDatabaseTests
                 Passes = [], Textures = [], Scalars = [],
             }, path);
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             db.Import("assets/Materials/dup.material.asset");
             db.Import("assets/Materials/dup.material.asset");
 
@@ -412,7 +557,7 @@ public class AssetDatabaseTests
             MaterialAssetSerializer.Save(new MaterialAsset { AssetGuid = g1.ToFlatString(), Name = "A", Passes = [], Textures = [], Scalars = [] }, p1);
             MaterialAssetSerializer.Save(new MaterialAsset { AssetGuid = g2.ToFlatString(), Name = "B", Passes = [], Textures = [], Scalars = [] }, p2);
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             db.Import("assets/Materials/a.material.asset");
             db.Import("assets/Materials/b.material.asset");
 
@@ -434,7 +579,7 @@ public class AssetDatabaseTests
             manifest.AddAsset(guid, "Ghost", "assets/Materials/ghost.material.asset", nameof(MaterialAsset));
             manifest.Save(Path.Combine(dir, "Library", "AssetManifest"));
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             IReadOnlyList<AssetDiagnostic> diagnostics = db.Validate();
 
             Assert.Contains(diagnostics, d => d.Kind == AssetDiagnosticKind.MissingAssetFile && d.AssetGuid == guid);
@@ -453,7 +598,7 @@ public class AssetDatabaseTests
             manifest.AddAsset(guid, "Pre", "assets/Materials/pre.material.asset", nameof(MaterialAsset));
             manifest.Save(Path.Combine(dir, "Library", "AssetManifest"));
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             Assert.Single(db.List(nameof(MaterialAsset)));
             Assert.Equal(guid, db.Resolve("assets/Materials/pre.material.asset"));
         }
@@ -461,7 +606,7 @@ public class AssetDatabaseTests
     }
 
     [Fact]
-    public void Load_ByPath_LazyRegisters_ThenResolvable()
+    public void Load_ByPath_RequiresManifestRegistration()
     {
         string dir = CreateTempDir();
         try
@@ -476,10 +621,16 @@ public class AssetDatabaseTests
                 Passes = [], Textures = [], Scalars = [],
             }, path);
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             Assert.Null(db.Resolve("assets/Materials/lazy2.material.asset"));
 
             MaterialAsset? loaded = db.Load<MaterialAsset>("assets/Materials/lazy2.material.asset");
+            Assert.Null(loaded);
+            Assert.Null(db.Resolve("assets/Materials/lazy2.material.asset"));
+
+            db.Import("assets/Materials/lazy2.material.asset");
+
+            loaded = db.Load<MaterialAsset>("assets/Materials/lazy2.material.asset");
             Assert.NotNull(loaded);
             Assert.Equal(guid, db.Resolve("assets/Materials/lazy2.material.asset"));
         }

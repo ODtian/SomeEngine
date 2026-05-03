@@ -8,6 +8,14 @@ public interface IAsset
     string Name { get; }
 }
 
+public interface IMutableAsset : IAsset
+{
+    void SetAssetGuid(AssetGuid guid);
+}
+
+public delegate void AssetSaveHandler<in TAsset>(TAsset asset, string path)
+    where TAsset : class, IMutableAsset;
+
 public readonly record struct ImportedAsset(IAsset Asset, string SubAssetKey, string OutputPath);
 
 public enum AssetDiagnosticKind

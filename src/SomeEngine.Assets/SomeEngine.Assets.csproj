@@ -18,9 +18,13 @@
     <PackageReference Include="FlatSharp.Runtime" Version="7.9.0" />
     <PackageReference Include="SharpGLTF.Core" Version="1.0.6" />
     <ProjectReference Include="..\..\external\SlangShaderSharp\src\SlangShaderSharp.csproj" />
+    <ProjectReference Include="..\SomeEngine.Generators\SomeEngine.Generators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <ItemGroup>
+    <FlatSharpSchema Include="..\..\assets\Schema\texture_asset.fbs" />
     <FlatSharpSchema Include="..\..\assets\Schema\mesh_asset.fbs" />
     <FlatSharpSchema Include="..\..\assets\Schema\shader_asset.fbs" />
     <FlatSharpSchema Include="..\..\assets\Schema\material_asset.fbs">

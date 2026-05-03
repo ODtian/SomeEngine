@@ -4,9 +4,9 @@ using System.Runtime.InteropServices;
 namespace SomeEngine.Assets.Data;
 
 /// <summary>
-/// Compressed GPU cluster (48 bytes).
+/// Compressed GPU cluster.
 /// Positions are decoded using global quantization: float(IntBase + localOffset) * QuantStep + QuantOrigin.
-/// Center/Radius for culling are packed as u16 offsets from IntBase.
+/// Center/Radius are packed for LOD; bounds are object-space per-cluster AABB for culling.
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public struct GPUCluster
@@ -55,7 +55,13 @@ public struct GPUCluster
     // 60: uint VRBBatchInfo — VRB batch encoding (fast path: ≤5 batches packed, see BuildVRBBatches)
     public uint VRBBatchInfo;
 
-    // Total: 64 bytes
+    // 64: object-space cluster AABB min
+    public Vector3 BoundMin;
+
+    // 76: object-space cluster AABB max
+    public Vector3 BoundMax;
+
+    public const int SizeInBytes = 88;
 
     // Helper to pack CenterOffset and RadiusQuant
     public static uint PackU16Pair(ushort a, ushort b) => (uint)a | ((uint)b << 16);

@@ -4,8 +4,9 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
-using System.Text;
 using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
 using SlangShaderSharp;
 using SomeEngine.Assets.Pipeline;
 using SomeEngine.Assets.Schema;
@@ -13,12 +14,35 @@ using Schema = global::SomeEngine.Assets.Schema;
 
 namespace SomeEngine.Assets.Importers;
 
-public static class SlangShaderImporter
+public static partial class SlangShaderImporter
 {
-    public const uint ImporterVersion = 2;
+    public const uint ImporterVersion = 6;
+    private const byte DiligentShaderResourceTypeUnknown = 0;
+    private const byte DiligentShaderResourceTypeConstantBuffer = 1;
+    private const byte DiligentShaderResourceTypeTextureSrv = 2;
+    private const byte DiligentShaderResourceTypeBufferSrv = 3;
+    private const byte DiligentShaderResourceTypeTextureUav = 4;
+    private const byte DiligentShaderResourceTypeBufferUav = 5;
+    private const byte DiligentShaderResourceTypeSampler = 6;
+    private const byte DiligentShaderResourceTypeInputAttachment = 7;
+    private const byte DiligentShaderResourceTypeAccelStruct = 8;
+
+    private readonly record struct ShaderResourceReflectionKey(
+        string Name,
+        uint Binding,
+        uint Space,
+        byte ResourceType
+    );
+
+    private static readonly bool LogReflection =
+        Environment.GetEnvironmentVariable("SOMEENGINE_SLANG_REFLECTION_LOG") == "1";
+
     [ThreadStatic]
     private static IGlobalSession? t_globalSession;
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (Schema.ShaderAsset Asset, DateTime LastModified)> _cache = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        string,
+        (Schema.ShaderAsset Asset, DateTime LastModified)
+    > _cache = new();
 
     public static IGlobalSession GlobalSession
     {
@@ -36,7 +60,9 @@ public static class SlangShaderImporter
     public static Schema.ShaderAsset Import(string filePath, string? source = null)
     {
         var sourceMeta = SourceMetaManager.GetOrCreate(filePath);
-        var existingAsset = AssetMetaManager.TryLoad(Path.ChangeExtension(Path.GetFullPath(filePath), ".shader.asset"));
+        var existingAsset = AssetMetaManager.TryLoad(
+            Path.ChangeExtension(Path.GetFullPath(filePath), ".shader.asset")
+        );
         return Import(filePath, sourceMeta, existingAsset, source);
     }
 
@@ -44,19 +70,32 @@ public static class SlangShaderImporter
         string filePath,
         SourceMeta sourceMeta,
         AssetMeta? existingAsset,
-        string? source = null)
+        string? source = null
+    )
     {
         filePath = Path.GetFullPath(filePath);
         string cachePath = Path.ChangeExtension(filePath, ".shader.asset");
         string projectRoot = ResolveProjectRoot(filePath);
         string subAssetKey = "shader:main";
+        AssetGuid assetGuid = ResolveImportedAssetGuid(sourceMeta.SourceGuid, subAssetKey);
+        if (existingAsset != null && existingAsset.AssetGuid != assetGuid)
+        {
+            existingAsset = null;
+        }
 
         if (existingAsset != null && File.Exists(cachePath))
         {
-            string? historicalFingerprint = TryComputeCurrentFingerprint(existingAsset.Dependencies, projectRoot, ImporterVersion);
-            if (historicalFingerprint == existingAsset.ContentFingerprint)
+            AssetImportFingerprint? historicalFingerprint = TryComputeCurrentFingerprint(
+                existingAsset.Dependencies,
+                projectRoot,
+                ImporterVersion
+            );
+            if (historicalFingerprint?.ContentFingerprint == existingAsset.ContentFingerprint)
             {
-                if (_cache.TryGetValue(filePath, out var memoryCached) && IsAssetMetaMatching(memoryCached.Asset, existingAsset))
+                if (
+                    _cache.TryGetValue(filePath, out var memoryCached)
+                    && IsAssetMetaMatching(memoryCached.Asset, existingAsset)
+                )
                 {
                     return memoryCached.Asset;
                 }
@@ -132,12 +171,13 @@ public static class SlangShaderImporter
         var metadata = new ShaderMetadata
         {
             Tags = [],
-            MaterialBindings = []
+            MaterialBindings = [],
+            MaterialScalarLayouts = [],
         };
 
         var asset = new Schema.ShaderAsset
         {
-            AssetGuid = existingAsset?.AssetGuid.ToFlatString() ?? AssetGuid.New().ToFlatString(),
+            AssetGuid = assetGuid.ToFlatString(),
             Name = name,
             ImportTrace = new Schema.ImportTrace
             {
@@ -160,184 +200,207 @@ public static class SlangShaderImporter
             Metadata = metadata,
         };
 
-            var moduleRefl = module.GetModuleReflection();
-            for (uint i = 0; i < moduleRefl.Count; i++)
+        var moduleRefl = module.GetModuleReflection();
+        var materialScalarTypes = CollectMaterialScalarTypeNames(
+            moduleRefl,
+            source,
+            dependencies,
+            projectRoot
+        );
+        for (uint i = 0; i < moduleRefl.Count; i++)
+        {
+            var decl = moduleRefl[(int)i];
+            if (decl.Kind != DeclReflectionKind.Variable)
+                continue;
+
+            var v = decl.AsVariable();
+            if (v == VariableReflection.Null)
+                continue;
+
+            if (v.Type.Kind == SlangTypeKind.ParameterBlock)
             {
-                var decl = moduleRefl[(int)i];
-                if (decl.Kind != DeclReflectionKind.Variable) continue;
+                var elementType = v.Type.ElementType;
 
-                var v = decl.AsVariable();
-                if (v == VariableReflection.Null) continue;
-
-                if (v.Type.Kind == SlangTypeKind.ParameterBlock)
+                for (uint a = 0; a < elementType.AttributeCount; a++)
                 {
-                    var elementType = v.Type.ElementType;
-
-                    for (uint a = 0; a < elementType.AttributeCount; a++)
+                    var attr = elementType.GetAttribute(a);
+                    if (attr.Name == "PipelineTag" && attr.ArgumentCount > 0)
                     {
-                        var attr = elementType.GetAttribute(a);
-                        if (attr.Name == "PipelineTag" && attr.ArgumentCount > 0)
-                        {
-                            metadata.Tags.Add(attr.GetArgumentValueString(0));
-                        }
+                        metadata.Tags.Add(attr.GetArgumentValueString(0));
                     }
+                }
 
-                    for (uint f = 0; f < elementType.FieldCount; f++)
-                    {
-                        var field = elementType.GetFieldByIndex(f);
-                        metadata.MaterialBindings.Add(new Schema.ShaderMaterialBinding
+                for (uint f = 0; f < elementType.FieldCount; f++)
+                {
+                    var field = elementType.GetFieldByIndex(f);
+                    metadata.MaterialBindings.Add(
+                        new Schema.ShaderMaterialBinding
                         {
                             Name = field.Name,
                             ResourceType = InferResourceType(field.Type.Kind),
-                        });
+                        }
+                    );
+                }
+            }
+        }
+
+        var backendResourceMaps =
+            new Dictionary<string, Dictionary<ShaderResourceReflectionKey, uint>>();
+        for (int t = 0; t < targets.Length; t++)
+        {
+            string backendName = targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv";
+            backendResourceMaps[backendName] = new Dictionary<ShaderResourceReflectionKey, uint>();
+        }
+
+        for (int i = 0; i < entryPointCount; i++)
+        {
+            IEntryPoint? entryPoint = null;
+            IComponentType? composedProgram = null;
+            ISlangBlob? diagnostics2 = null;
+            IComponentType? linkedProgram = null;
+            ISlangBlob? linkDiagnostics = null;
+
+            module.GetDefinedEntryPoint(i, out entryPoint);
+            var reflectedAttributes = CollectEntryPointAttributes(
+                entryPoint.GetFunctionReflection()
+            );
+
+            // Compose (Module + EntryPoint)
+            session.CreateCompositeComponentType(
+                [module, entryPoint],
+                out composedProgram,
+                out diagnostics2
+            );
+
+            if (composedProgram == null)
+            {
+                Console.WriteLine(
+                    $"Warning: Failed to compose entry point {i}: {GetString(diagnostics2)}"
+                );
+                continue;
+            }
+
+            // Link
+            composedProgram.Link(out linkedProgram, out linkDiagnostics);
+
+            if (linkedProgram == null)
+            {
+                Console.WriteLine(
+                    $"Warning: Failed to link entry point {i}: {GetString(linkDiagnostics)}"
+                );
+                continue;
+            }
+
+            // Get Layout from linked program for each target
+            for (int t = 0; t < targets.Length; t++)
+            {
+                string backendName =
+                    targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv";
+                var reflection = linkedProgram.GetLayout((nint)t, out _);
+                if (reflection != ShaderReflection.Null)
+                {
+                    var epReflection = reflection.GetEntryPointByIndex(0);
+                    ShaderStage epStage =
+                        epReflection.Stage != SlangStage.None
+                            ? MapStage(epReflection.Stage)
+                            : ShaderStage.Vertex;
+
+                    // Global parameters (cbuffer, StructuredBuffer, etc.)
+                    uint globalParamCount = reflection.ParameterCount;
+                    if (LogReflection)
+                    {
+                        Console.WriteLine(
+                            $"[Slang Reflection] Backend={backendName} EP={epReflection.Name} Stage={epStage} GlobalParams={globalParamCount}"
+                        );
+                    }
+                    for (uint pi = 0; pi < globalParamCount; pi++)
+                    {
+                        var param = reflection.GetParameterByIndex(pi);
+                        CollectResourceFromVar(param, epStage, backendResourceMaps[backendName]);
+                    }
+
+                    uint entryParamCount = epReflection.ParameterCount;
+                    for (uint pi = 0; pi < entryParamCount; pi++)
+                    {
+                        var param = epReflection.GetParameterByIndex(pi);
+                        CollectResourceFromVar(param, epStage, backendResourceMaps[backendName]);
                     }
                 }
             }
 
-            var backendResourceMaps =
-                new Dictionary<
-                    string,
-                    Dictionary<string, HashSet<ShaderStage>>
-                >();
+            var baseReflection = linkedProgram.GetLayout(0, out _);
+            if (baseReflection == ShaderReflection.Null)
+                baseReflection = linkedProgram.GetLayout(1, out _);
+            CollectMaterialScalarLayouts(baseReflection, materialScalarTypes, metadata);
+
+            var entryPointReflection = baseReflection.GetEntryPointByIndex(0);
+            string epName = entryPointReflection.Name;
+            var finalStage = MapStage(entryPointReflection.Stage);
+
+            // Get compiled code for each target
             for (int t = 0; t < targets.Length; t++)
             {
-                string backendName = targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv";
-                backendResourceMaps[backendName] = new Dictionary<string, HashSet<ShaderStage>>();
-            }
+                linkedProgram.GetEntryPointCode(0, t, out var codeBlob, out var diag);
 
-            for (int i = 0; i < entryPointCount; i++)
-            {
-                IEntryPoint? entryPoint = null;
-                IComponentType? composedProgram = null;
-                ISlangBlob? diagnostics2 = null;
-                IComponentType? linkedProgram = null;
-                ISlangBlob? linkDiagnostics = null;
+                if (codeBlob != null)
+                {
+                    int variantIndex = asset.Variants.Count;
+                    var rawBytes = GetBytes(codeBlob);
+                    bool isSpirvBackend = targets[t].Format == SlangCompileTarget.Spirv;
+                    // Normalize bytecode before hashing:
+                    // SPIR-V: strip OpName/OpMemberName (debug names that vary with variable names)
+                    var bytesToHash = isSpirvBackend ? StripSpirvNames(rawBytes) : rawBytes;
+                    var hashBytes = SHA256.HashData(bytesToHash);
+                    var contentHash = Convert.ToHexString(hashBytes);
 
-                module.GetDefinedEntryPoint(i, out entryPoint);
-                var reflectedAttributes = CollectEntryPointAttributes(entryPoint.GetFunctionReflection());
-
-                    // Compose (Module + EntryPoint)
-                    session.CreateCompositeComponentType(
-                        [module, entryPoint],
-                        out composedProgram,
-                        out diagnostics2
+                    asset.Variants.Add(
+                        new ShaderBytecode
+                        {
+                            Backend =
+                                targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv",
+                            Stage = finalStage,
+                            EntryPoint = epName,
+                            Data = rawBytes,
+                            ContentHash = contentHash,
+                        }
                     );
 
-                    if (composedProgram == null)
+                    for (int attrIndex = 0; attrIndex < reflectedAttributes.Count; attrIndex++)
                     {
-                        Console.WriteLine(
-                            $"Warning: Failed to compose entry point {i}: {GetString(diagnostics2)}"
-                        );
-                        continue;
-                    }
-
-                    // Link
-                    composedProgram.Link(out linkedProgram, out linkDiagnostics);
-
-                    if (linkedProgram == null)
-                    {
-                        Console.WriteLine(
-                            $"Warning: Failed to link entry point {i}: {GetString(linkDiagnostics)}"
-                        );
-                        continue;
-                    }
-
-                    // Get Layout from linked program for each target
-                    for (int t = 0; t < targets.Length; t++)
-                    {
-                        string backendName =
-                            targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv";
-                        var reflection = linkedProgram.GetLayout((nint)t, out _);
-                        if (reflection != ShaderReflection.Null)
-                        {
-                            var epReflection = reflection.GetEntryPointByIndex(0);
-                            ShaderStage epStage =
-                                epReflection.Stage != SlangStage.None
-                                    ? MapStage(epReflection.Stage)
-                                    : ShaderStage.Vertex;
-
-                            // Global parameters (cbuffer, StructuredBuffer, etc.)
-                            uint globalParamCount = reflection.ParameterCount;
-                            Console.WriteLine(
-                                $"[Slang Reflection] Backend={backendName} EP={epReflection.Name} Stage={epStage} GlobalParams={globalParamCount}"
-                            );
-                            for (uint pi = 0; pi < globalParamCount; pi++)
+                        asset.EntryPointAttributes.Add(
+                            new Schema.ShaderEntryPointAttribute
                             {
-                                var param = reflection.GetParameterByIndex(pi);
-                                CollectResourceFromVar(param, epStage, backendResourceMaps[backendName]);
-                            }
-                        }
-                    }
-
-                    var baseReflection = linkedProgram.GetLayout(0, out _);
-                    if (baseReflection == ShaderReflection.Null)
-                        baseReflection = linkedProgram.GetLayout(1, out _);
-
-                    var entryPointReflection = baseReflection.GetEntryPointByIndex(0);
-                    string epName = entryPointReflection.Name;
-                    var finalStage = MapStage(entryPointReflection.Stage);
-
-                    // Get compiled code for each target
-                    for (int t = 0; t < targets.Length; t++)
-                    {
-                        linkedProgram.GetEntryPointCode(0, t, out var codeBlob, out var diag);
-
-                        if (codeBlob != null)
-                        {
-                            int variantIndex = asset.Variants.Count;
-                            var rawBytes = GetBytes(codeBlob);
-                            bool isSpirvBackend = targets[t].Format == SlangCompileTarget.Spirv;
-                            // Normalize bytecode before hashing:
-                            // SPIR-V: strip OpName/OpMemberName (debug names that vary with variable names)
-                            var bytesToHash = isSpirvBackend ? StripSpirvNames(rawBytes) : rawBytes;
-                            var hashBytes = SHA256.HashData(bytesToHash);
-                            var contentHash = Convert.ToHexString(hashBytes);
-
-                            asset.Variants.Add(
-                                new ShaderBytecode
-                                {
-                                    Backend =
-                                        targets[t].Format == SlangCompileTarget.Dxil ? "dxil" : "spirv",
-                                    Stage = finalStage,
-                                    EntryPoint = epName,
-                                    Data = rawBytes,
-                                    ContentHash = contentHash,
-                                }
-                            );
-
-                            for (int attrIndex = 0; attrIndex < reflectedAttributes.Count; attrIndex++)
-                            {
-                                asset.EntryPointAttributes.Add(new Schema.ShaderEntryPointAttribute
-                                {
-                                    VariantIndex = variantIndex,
-                                    Name = reflectedAttributes[attrIndex].Name,
-                                    Args = reflectedAttributes[attrIndex].Args.Count == 0
+                                VariantIndex = variantIndex,
+                                Name = reflectedAttributes[attrIndex].Name,
+                                Args =
+                                    reflectedAttributes[attrIndex].Args.Count == 0
                                         ? []
                                         : [.. reflectedAttributes[attrIndex].Args],
-                                });
                             }
-                        }
-                        else
-                        {
-                            Console.WriteLine(
-                                $"Warning: Failed to get code for target {t}: {GetString(diag)}"
-                            );
-                        }
+                        );
                     }
-            }
-
-            // Finalize Reflection Data
-            foreach (var kvp in backendResourceMaps)
-            {
-                var reflectionData = new Schema.ShaderReflectionData { Resources = [] };
-                var backendRef = new Schema.BackendReflection
+                }
+                else
                 {
-                    Backend = kvp.Key,
-                    Reflection = reflectionData,
-                };
-                FinalizeReflection(kvp.Value, reflectionData);
-                asset.Reflections!.Add(backendRef);
+                    Console.WriteLine(
+                        $"Warning: Failed to get code for target {t}: {GetString(diag)}"
+                    );
+                }
             }
+        }
+
+        // Finalize Reflection Data
+        foreach (var kvp in backendResourceMaps)
+        {
+            var reflectionData = new Schema.ShaderReflectionData { Resources = [] };
+            var backendRef = new Schema.BackendReflection
+            {
+                Backend = kvp.Key,
+                Reflection = reflectionData,
+            };
+            FinalizeReflection(kvp.Value, reflectionData);
+            asset.Reflections!.Add(backendRef);
+        }
 
         if (!string.IsNullOrEmpty(filePath) && File.Exists(filePath))
         {
@@ -346,27 +409,36 @@ public static class SlangShaderImporter
             try
             {
                 ShaderAssetSerializer.Save(asset, cachePath);
-                AssetMetaManager.Save(cachePath, new AssetMeta
-                {
-                    AssetGuid = AssetGuid.Parse(asset.AssetGuid ?? AssetGuid.Empty.ToFlatString()),
-                    SourceGuid = sourceMeta.SourceGuid,
-                    SubAssetKey = subAssetKey,
-                    ContentFingerprint = fingerprint,
-                    Dependencies = dependencies,
-                    ImporterVersion = ImporterVersion,
-                    AssetPath = cachePath,
-                });
+                AssetMetaManager.Save(
+                    cachePath,
+                    new AssetMeta
+                    {
+                        AssetGuid = AssetGuid.Parse(
+                            asset.AssetGuid ?? AssetGuid.Empty.ToFlatString()
+                        ),
+                        SourceGuid = sourceMeta.SourceGuid,
+                        SubAssetKey = subAssetKey,
+                        ContentFingerprint = fingerprint,
+                        Dependencies = dependencies,
+                        ImporterVersion = ImporterVersion,
+                        AssetPath = cachePath,
+                    }
+                );
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Warning: Failed to save shader asset cache to {cachePath}: {ex.Message}");
+                Console.WriteLine(
+                    $"Warning: Failed to save shader asset cache to {cachePath}: {ex.Message}"
+                );
             }
         }
 
         return asset;
     }
 
-    private static List<EntryPointAttributeData> CollectEntryPointAttributes(FunctionReflection functionReflection)
+    private static List<EntryPointAttributeData> CollectEntryPointAttributes(
+        FunctionReflection functionReflection
+    )
     {
         var attributes = new List<EntryPointAttributeData>();
         if (functionReflection == FunctionReflection.Null)
@@ -374,7 +446,11 @@ public static class SlangShaderImporter
             return attributes;
         }
 
-        for (uint attributeIndex = 0; attributeIndex < functionReflection.AttributeCount; attributeIndex++)
+        for (
+            uint attributeIndex = 0;
+            attributeIndex < functionReflection.AttributeCount;
+            attributeIndex++
+        )
         {
             var attribute = functionReflection.GetAttribute(attributeIndex);
             if (attribute == AttributeReflection.Null || string.IsNullOrEmpty(attribute.Name))
@@ -394,6 +470,220 @@ public static class SlangShaderImporter
         return attributes;
     }
 
+    private static List<string> CollectMaterialScalarTypeNames(
+        DeclReflection root,
+        string source,
+        IReadOnlyList<DependencyEntryData> dependencies,
+        string projectRoot
+    )
+    {
+        var result = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        void AddTypeName(string? name)
+        {
+            if (!string.IsNullOrWhiteSpace(name) && seen.Add(name))
+            {
+                result.Add(name);
+            }
+        }
+
+        void Visit(DeclReflection decl)
+        {
+            if (decl == DeclReflection.Null)
+            {
+                return;
+            }
+
+            if (decl.Kind == DeclReflectionKind.Struct)
+            {
+                TypeReflection type = decl.Type;
+                if (type != TypeReflection.Null && HasAttribute(type, "MaterialScalars"))
+                {
+                    AddTypeName(type.Name);
+                }
+            }
+
+            for (int i = 0; i < decl.ChildrenCount; i++)
+            {
+                Visit(decl.GetChild((uint)i));
+            }
+        }
+
+        Visit(root);
+        CollectMaterialScalarTypeNamesFromSource(source, AddTypeName);
+        foreach (DependencyEntryData dependency in dependencies)
+        {
+            string dependencyPath = GetAbsoluteDependencyPath(projectRoot, dependency.RelativePath);
+            if (!File.Exists(dependencyPath))
+            {
+                continue;
+            }
+
+            CollectMaterialScalarTypeNamesFromSource(File.ReadAllText(dependencyPath), AddTypeName);
+        }
+
+        return result;
+    }
+
+    private static void CollectMaterialScalarTypeNamesFromSource(
+        string source,
+        Action<string> addTypeName
+    )
+    {
+        foreach (Match match in MaterialScalarsAttributeRegex().Matches(source))
+        {
+            if (match.Groups.Count > 1)
+            {
+                addTypeName(match.Groups[1].Value);
+            }
+        }
+    }
+
+    private static bool HasAttribute(TypeReflection type, string name)
+    {
+        for (uint i = 0; i < type.AttributeCount; i++)
+        {
+            AttributeReflection attribute = type.GetAttribute(i);
+            if (
+                attribute != AttributeReflection.Null
+                && string.Equals(attribute.Name, name, StringComparison.Ordinal)
+            )
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void CollectMaterialScalarLayouts(
+        ShaderReflection reflection,
+        IReadOnlyList<string> materialScalarTypes,
+        Schema.ShaderMetadata metadata
+    )
+    {
+        if (reflection == ShaderReflection.Null || materialScalarTypes.Count == 0)
+        {
+            return;
+        }
+
+        var existing = new HashSet<string>(
+            metadata.MaterialScalarLayouts?.Select(static layout => layout.Name ?? string.Empty)
+                ?? [],
+            StringComparer.Ordinal
+        );
+
+        metadata.MaterialScalarLayouts ??= [];
+
+        foreach (string typeName in materialScalarTypes)
+        {
+            if (string.IsNullOrWhiteSpace(typeName) || !existing.Add(typeName))
+            {
+                continue;
+            }
+
+            TypeReflection? maybeLayoutType = reflection.FindTypeByName(typeName);
+            if (maybeLayoutType == null)
+            {
+                continue;
+            }
+
+            TypeReflection layoutType = maybeLayoutType.Value;
+            TypeLayoutReflection? maybeLayout = reflection.GetTypeLayout(
+                layoutType,
+                LayoutRules.Default
+            );
+            if (maybeLayout == null)
+            {
+                continue;
+            }
+
+            TypeLayoutReflection typeLayout = maybeLayout.Value;
+            uint payloadSize = checked((uint)typeLayout.GetSize(SlangParameterCategory.Uniform));
+            var fields = new List<Schema.ShaderMaterialScalarField>((int)typeLayout.FieldCount);
+            uint baseOffset = uint.MaxValue;
+            uint maxFieldEnd = 0;
+
+            for (uint fieldIndex = 0; fieldIndex < typeLayout.FieldCount; fieldIndex++)
+            {
+                VariableLayoutReflection fieldLayout = typeLayout.GetFieldByIndex(fieldIndex);
+                if (
+                    fieldLayout == VariableLayoutReflection.Null
+                    || string.IsNullOrWhiteSpace(fieldLayout.Name)
+                )
+                {
+                    continue;
+                }
+
+                TypeLayoutReflection fieldTypeLayout = fieldLayout.TypeLayout;
+                uint fieldOffset = checked(
+                    (uint)fieldLayout.GetOffset(SlangParameterCategory.Uniform)
+                );
+                uint fieldSize = checked(
+                    (uint)fieldTypeLayout.GetSize(SlangParameterCategory.Uniform)
+                );
+                if (fieldSize == 0)
+                {
+                    fieldSize = checked(
+                        (uint)fieldTypeLayout.GetStride(SlangParameterCategory.Uniform)
+                    );
+                }
+
+                uint fieldEnd = fieldOffset + fieldSize;
+                baseOffset = Math.Min(baseOffset, fieldOffset);
+                maxFieldEnd = Math.Max(maxFieldEnd, fieldEnd);
+
+                fields.Add(
+                    new Schema.ShaderMaterialScalarField
+                    {
+                        Name = fieldLayout.Name,
+                        Offset = fieldOffset,
+                        Size = fieldSize,
+                        RowCount = fieldTypeLayout.RowCount,
+                        ColumnCount = fieldTypeLayout.ColumnCount,
+                        ScalarType = checked((byte)fieldTypeLayout.ScalarType),
+                    }
+                );
+            }
+
+            if (payloadSize == 0)
+            {
+                payloadSize = maxFieldEnd;
+            }
+
+            if (baseOffset != uint.MaxValue && baseOffset > 0)
+            {
+                if (payloadSize >= maxFieldEnd)
+                {
+                    payloadSize -= baseOffset;
+                }
+
+                payloadSize = Math.Max(payloadSize, maxFieldEnd - baseOffset);
+                for (int fieldIndex = 0; fieldIndex < fields.Count; fieldIndex++)
+                {
+                    Schema.ShaderMaterialScalarField field = fields[fieldIndex];
+                    field.Offset -= baseOffset;
+                    fields[fieldIndex] = field;
+                }
+            }
+
+            metadata.MaterialScalarLayouts.Add(
+                new Schema.ShaderMaterialScalarLayout
+                {
+                    Name = typeName,
+                    Size = payloadSize,
+                    Fields = fields,
+                }
+            );
+        }
+    }
+
+    [GeneratedRegex(
+        @"\[\s*MaterialScalars(?:\s*\([^\)]*\))?\s*\]\s*struct\s+([A-Za-z_][A-Za-z0-9_]*)"
+    )]
+    private static partial Regex MaterialScalarsAttributeRegex();
+
     private static bool IsAssetMetaMatching(Schema.ShaderAsset asset, AssetMeta existingAsset)
     {
         if (string.IsNullOrWhiteSpace(asset.AssetGuid))
@@ -401,12 +691,24 @@ public static class SlangShaderImporter
             return false;
         }
 
-        return AssetGuid.TryParse(asset.AssetGuid, out var assetGuid) && assetGuid == existingAsset.AssetGuid;
+        return AssetGuid.TryParse(asset.AssetGuid, out var assetGuid)
+            && assetGuid == existingAsset.AssetGuid;
     }
 
-    private static DependencyEntryData[] CollectDependenciesFromModule(IModule module, string sourcePath, string projectRoot)
+    private static AssetGuid ResolveImportedAssetGuid(SourceGuid sourceGuid, string subAssetKey)
     {
-        var dependencies = new Dictionary<string, DependencyEntryData>(StringComparer.OrdinalIgnoreCase);
+        return AssetGuid.FromSource(sourceGuid, subAssetKey);
+    }
+
+    private static DependencyEntryData[] CollectDependenciesFromModule(
+        IModule module,
+        string sourcePath,
+        string projectRoot
+    )
+    {
+        var dependencies = new Dictionary<string, DependencyEntryData>(
+            StringComparer.OrdinalIgnoreCase
+        );
 
         void AddDependency(string dependencyPath)
         {
@@ -431,12 +733,16 @@ public static class SlangShaderImporter
             AddDependency(module.GetDependencyFilePath(i));
         }
 
-        return dependencies.Values
-            .OrderBy(static x => x.RelativePath, StringComparer.Ordinal)
+        return dependencies
+            .Values.OrderBy(static x => x.RelativePath, StringComparer.Ordinal)
             .ToArray();
     }
 
-    private static string? TryComputeCurrentFingerprint(IReadOnlyList<DependencyEntryData> dependencies, string projectRoot, uint importerVersion)
+    public static AssetImportFingerprint? TryComputeCurrentFingerprint(
+        IReadOnlyList<DependencyEntryData> dependencies,
+        string projectRoot,
+        uint importerVersion
+    )
     {
         if (dependencies.Count == 0)
         {
@@ -459,13 +765,26 @@ public static class SlangShaderImporter
             };
         }
 
-        return ComputeFingerprint(currentDependencies, importerVersion);
+        return new AssetImportFingerprint
+        {
+            ContentFingerprint = ComputeFingerprint(currentDependencies, importerVersion),
+            Dependencies = currentDependencies,
+            ImporterVersion = importerVersion,
+        };
     }
 
-    private static string ComputeFingerprint(IReadOnlyList<DependencyEntryData> dependencies, uint importerVersion)
+    private static string ComputeFingerprint(
+        IReadOnlyList<DependencyEntryData> dependencies,
+        uint importerVersion
+    )
     {
         var builder = new StringBuilder();
-        foreach (var dependency in dependencies.OrderBy(static x => x.RelativePath, StringComparer.Ordinal))
+        foreach (
+            var dependency in dependencies.OrderBy(
+                static x => x.RelativePath,
+                StringComparer.Ordinal
+            )
+        )
         {
             builder.Append(dependency.RelativePath);
             builder.Append(':');
@@ -493,8 +812,10 @@ public static class SlangShaderImporter
         string? current = Path.GetDirectoryName(Path.GetFullPath(sourcePath));
         while (!string.IsNullOrEmpty(current))
         {
-            if (File.Exists(Path.Combine(current, "SomeEngine.slnx"))
-                || File.Exists(Path.Combine(current, "Directory.Build.props")))
+            if (
+                File.Exists(Path.Combine(current, "SomeEngine.slnx"))
+                || File.Exists(Path.Combine(current, "Directory.Build.props"))
+            )
             {
                 return current;
             }
@@ -540,11 +861,14 @@ public static class SlangShaderImporter
             SlangTypeKind.Resource => 0,
             SlangTypeKind.SamplerState => 1,
             SlangTypeKind.ConstantBuffer => 2,
-            _ => 255
+            _ => 255,
         };
     }
 
-    private static void FinalizeReflection(Dictionary<string, HashSet<ShaderStage>> resourceMap, Schema.ShaderReflectionData dest)
+    private static void FinalizeReflection(
+        Dictionary<ShaderResourceReflectionKey, uint> resourceMap,
+        Schema.ShaderReflectionData dest
+    )
     {
         if (dest.Resources == null)
         {
@@ -552,19 +876,22 @@ public static class SlangShaderImporter
         }
 
         var resources = dest.Resources;
-        foreach (var kvp in resourceMap)
+        foreach (
+            var kvp in resourceMap
+                .OrderBy(static kvp => kvp.Key.Space)
+                .ThenBy(static kvp => kvp.Key.Binding)
+                .ThenBy(static kvp => kvp.Key.ResourceType)
+                .ThenBy(static kvp => kvp.Key.Name, StringComparer.Ordinal)
+        )
         {
-            uint stageMask = 0;
-            foreach (var s in kvp.Value)
-            {
-                stageMask |= GetDiligentStageFlags(s);
-            }
-
             resources.Add(
                 new Schema.ShaderResourceReflection
                 {
-                    Name = kvp.Key,
-                    Stages = stageMask,
+                    Name = kvp.Key.Name,
+                    Stages = kvp.Value,
+                    Binding = kvp.Key.Binding,
+                    Space = kvp.Key.Space,
+                    ResourceType = kvp.Key.ResourceType,
                 }
             );
         }
@@ -573,35 +900,132 @@ public static class SlangShaderImporter
     private static void CollectResourceFromVar(
         VariableLayoutReflection varLayout,
         ShaderStage stage,
-        Dictionary<string, HashSet<ShaderStage>> resources
+        Dictionary<ShaderResourceReflectionKey, uint> resources
     )
     {
-        // Only collect top-level resources
-        var category = varLayout.Category;
-        if (
-            category != SlangParameterCategory.ConstantBuffer
-            && category != SlangParameterCategory.ShaderResource
-            && category != SlangParameterCategory.UnorderedAccess
-            && category != SlangParameterCategory.SamplerState
+        Visit(varLayout, 0, 0, false);
+
+        void Visit(
+            VariableLayoutReflection layout,
+            uint baseBinding,
+            uint baseSpace,
+            bool fieldBinding
         )
         {
-            return;
+            if (
+                layout == VariableLayoutReflection.Null
+                || TryAdd(layout, baseBinding, baseSpace, fieldBinding)
+            )
+                return;
+
+            TypeLayoutReflection typeLayout = layout.TypeLayout.UnwrapArray();
+            if (typeLayout == TypeLayoutReflection.Null)
+                return;
+
+            uint childBaseBinding = fieldBinding ? baseBinding : layout.BindingIndex;
+            uint childBaseSpace = fieldBinding
+                ? baseSpace
+                : GetSpace(layout, SlangParameterCategory.DescriptorTableSlot, 0);
+            for (uint i = 0; i < typeLayout.FieldCount; i++)
+                Visit(typeLayout.GetFieldByIndex(i), childBaseBinding, childBaseSpace, true);
         }
 
-        string name = varLayout.Name;
-        if (string.IsNullOrEmpty(name))
-            return;
-
-        Console.WriteLine(
-            $"[Slang Reflection] Detected resource: {name} Stage: {stage} Category: {category}"
-        );
-
-        if (!resources.TryGetValue(name, out var stages))
+        bool TryAdd(
+            VariableLayoutReflection layout,
+            uint baseBinding,
+            uint baseSpace,
+            bool fieldBinding
+        )
         {
-            stages = new HashSet<ShaderStage>();
-            resources[name] = stages;
+            byte resourceType = GetResourceType(layout, out var category);
+            if (
+                resourceType == DiligentShaderResourceTypeUnknown
+                || string.IsNullOrEmpty(layout.Name)
+            )
+                return resourceType != DiligentShaderResourceTypeUnknown;
+
+            var bindingCategory = fieldBinding
+                ? SlangParameterCategory.DescriptorTableSlot
+                : category;
+            uint binding = fieldBinding
+                ? baseBinding + checked((uint)layout.GetOffset(bindingCategory))
+                : layout.BindingIndex;
+            uint space = GetSpace(layout, bindingCategory, baseSpace);
+            var key = new ShaderResourceReflectionKey(layout.Name, binding, space, resourceType);
+            resources[key] = resources.GetValueOrDefault(key) | GetDiligentStageFlags(stage);
+            return true;
         }
-        stages.Add(stage);
+
+        static byte GetResourceType(
+            VariableLayoutReflection layout,
+            out SlangParameterCategory category
+        )
+        {
+            category = layout.Category;
+            TypeReflection type = layout.Type.UnwrapArray();
+            SlangResourceShape shape = type.ResourceShape & SlangResourceShape.BaseShapeMask;
+
+            return category switch
+            {
+                SlangParameterCategory.ConstantBuffer
+                or SlangParameterCategory.PushConstantBuffer =>
+                    DiligentShaderResourceTypeConstantBuffer,
+                SlangParameterCategory.SamplerState => DiligentShaderResourceTypeSampler,
+                SlangParameterCategory.Subpass => DiligentShaderResourceTypeInputAttachment,
+                SlangParameterCategory.ShaderResource => MapReadOnly(shape),
+                SlangParameterCategory.UnorderedAccess => MapReadWrite(shape),
+                _ => type.Kind switch
+                {
+                    SlangTypeKind.ConstantBuffer => DiligentShaderResourceTypeConstantBuffer,
+                    SlangTypeKind.SamplerState => DiligentShaderResourceTypeSampler,
+                    SlangTypeKind.Resource
+                    or SlangTypeKind.TextureBuffer
+                    or SlangTypeKind.ShaderStorageBuffer => IsWrite(type.ResourceAccess)
+                        ? MapReadWrite(shape)
+                        : MapReadOnly(shape),
+                    _ => DiligentShaderResourceTypeUnknown,
+                },
+            };
+        }
+
+        static uint GetSpace(
+            VariableLayoutReflection layout,
+            SlangParameterCategory category,
+            uint fallback
+        )
+        {
+            uint space = checked((uint)layout.GetBindingSpace(category));
+            if (space == 0 && layout.BindingSpace != 0)
+                space = layout.BindingSpace;
+            return space == 0 ? fallback : space;
+        }
+
+        static bool IsWrite(SlangResourceAccess access) =>
+            access
+                is SlangResourceAccess.ReadWrite
+                    or SlangResourceAccess.RasterOrdered
+                    or SlangResourceAccess.Append
+                    or SlangResourceAccess.Consume
+                    or SlangResourceAccess.Write;
+
+        static byte MapReadOnly(SlangResourceShape shape) =>
+            shape switch
+            {
+                SlangResourceShape.StructuredBuffer
+                or SlangResourceShape.ByteAddressBuffer
+                or SlangResourceShape.TextureBuffer => DiligentShaderResourceTypeBufferSrv,
+                SlangResourceShape.AccelerationStructure => DiligentShaderResourceTypeAccelStruct,
+                SlangResourceShape.TextureSubpass => DiligentShaderResourceTypeInputAttachment,
+                _ => DiligentShaderResourceTypeTextureSrv,
+            };
+
+        static byte MapReadWrite(SlangResourceShape shape) =>
+            shape
+                is SlangResourceShape.StructuredBuffer
+                    or SlangResourceShape.ByteAddressBuffer
+                    or SlangResourceShape.TextureBuffer
+                ? DiligentShaderResourceTypeBufferUav
+                : DiligentShaderResourceTypeTextureUav;
     }
 
     private static uint GetDiligentStageFlags(ShaderStage stage)
@@ -700,7 +1124,8 @@ public static class SlangShaderImporter
     /// </summary>
     private static byte[] StripSpirvNames(byte[] spirv)
     {
-        if (spirv.Length < 20) return spirv; // Too small for valid SPIR-V
+        if (spirv.Length < 20)
+            return spirv; // Too small for valid SPIR-V
 
         const ushort OpName = 5;
         const ushort OpMemberName = 6;
@@ -708,7 +1133,8 @@ public static class SlangShaderImporter
 
         var words = MemoryMarshal.Cast<byte, uint>(spirv.AsSpan());
         // Validate SPIR-V magic number
-        if (words[0] != 0x07230203) return spirv;
+        if (words[0] != 0x07230203)
+            return spirv;
 
         using var ms = new MemoryStream(spirv.Length);
         using var bw = new BinaryWriter(ms);
@@ -725,8 +1151,10 @@ public static class SlangShaderImporter
             ushort opcode = (ushort)(instrWord & 0xFFFF);
             ushort wordCount = (ushort)(instrWord >> 16);
 
-            if (wordCount == 0) break; // Malformed
-            if (pos + wordCount > words.Length) break;
+            if (wordCount == 0)
+                break; // Malformed
+            if (pos + wordCount > words.Length)
+                break;
 
             if (opcode != OpName && opcode != OpMemberName)
             {

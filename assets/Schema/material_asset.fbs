@@ -12,16 +12,21 @@ table TagEntry {
     value: int = 0;
 }
 
+table ComponentEntry {
+    type_name: string;
+    json: string;
+}
+
 table PassEntry {
     shader_guid: string;
-    shader: string;                       // ShaderAsset name or path
     entry_point: string;                  // specific entry point name (e.g. "CSDeformStatic")
     tags: [TagEntry] (fs_vector:"IList");
+    components: [ComponentEntry] (fs_vector:"IList");
 }
 
 table TextureBinding {
     name: string;                         // param name (e.g. "AlbedoMap")
-    path: string;                         // Texture asset path
+    texture_guid: string;
 }
 
 table ScalarParam {

@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace SomeEngine.Assets;
 
@@ -8,6 +10,25 @@ public readonly record struct AssetGuid(Guid Value)
 {
     public static readonly AssetGuid Empty = new(Guid.Empty);
     public static AssetGuid New() => new(Guid.NewGuid());
+    public static AssetGuid FromSource(SourceGuid sourceGuid, string subAssetKey)
+    {
+        if (sourceGuid.IsEmpty || string.IsNullOrWhiteSpace(subAssetKey))
+        {
+            return Empty;
+        }
+
+        byte[] namespaceBytes = sourceGuid.Value.ToByteArray();
+        SwapGuidByteOrder(namespaceBytes);
+        byte[] nameBytes = Encoding.UTF8.GetBytes(subAssetKey);
+
+        byte[] hash = SHA1.HashData(namespaceBytes.Concat(nameBytes).ToArray());
+        byte[] guidBytes = hash[..16];
+        guidBytes[6] = (byte)((guidBytes[6] & 0x0F) | 0x50);
+        guidBytes[8] = (byte)((guidBytes[8] & 0x3F) | 0x80);
+        SwapGuidByteOrder(guidBytes);
+        return new AssetGuid(new Guid(guidBytes));
+    }
+
     public bool IsEmpty => Value == Guid.Empty;
     public string ToFlatString() => Value.ToString("D");
     public override string ToString() => ToFlatString();
@@ -18,6 +39,14 @@ public readonly record struct AssetGuid(Guid Value)
         bool success = Guid.TryParse(value, out Guid parsed);
         guid = success ? new AssetGuid(parsed) : Empty;
         return success;
+    }
+
+    private static void SwapGuidByteOrder(byte[] guid)
+    {
+        (guid[0], guid[3]) = (guid[3], guid[0]);
+        (guid[1], guid[2]) = (guid[2], guid[1]);
+        (guid[4], guid[5]) = (guid[5], guid[4]);
+        (guid[6], guid[7]) = (guid[7], guid[6]);
     }
 }
 

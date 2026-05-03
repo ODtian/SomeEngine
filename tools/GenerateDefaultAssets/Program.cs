@@ -1,7 +1,7 @@
 using SomeEngine.Assets;
-using SomeEngine.Assets.Importers;
 using SomeEngine.Assets.Pipeline;
 using SomeEngine.Assets.Schema;
+using SomeEngine.Render.Data;
 
 string projectRoot = ResolveProjectRoot(Directory.GetCurrentDirectory());
 string assetsDir = Path.Combine(projectRoot, "assets");
@@ -11,34 +11,115 @@ if (!Directory.Exists(assetsDir))
 }
 
 string shadersDir = Path.Combine(assetsDir, "Shaders");
+string texturesDir = Path.Combine(assetsDir, "Textures");
 string materialsDir = Path.Combine(assetsDir, "Materials");
+Directory.CreateDirectory(texturesDir);
 Directory.CreateDirectory(materialsDir);
+WriteGeneratedFile(
+    Path.Combine(shadersDir, "generated", "instance_header_layout.slang"),
+    InstanceHeaderLayout.SlangSource);
 
-AssetGuid pbrShaderGuid = EnsureShaderAsset(shadersDir, "cluster_shade_material");
-AssetGuid unlitShaderGuid = EnsureShaderAsset(shadersDir, "cluster_shade_unlit");
-_ = EnsureShaderAsset(shadersDir, "sw_raster");
-_ = EnsureShaderAsset(shadersDir, "cluster_deform");
+using AssetDatabase assetDb = GeneratedAssetPipelineCatalog.CreateDatabase(projectRoot);
 
-string pbrPath = SaveMaterial(CreatePbrMaterial(pbrShaderGuid), Path.Combine(materialsDir, "DefaultPBR.material.asset"));
-string unlitPath = SaveMaterial(CreateUnlitMaterial(unlitShaderGuid), Path.Combine(materialsDir, "TestUnlit_1.material.asset"));
+AssetGuid defaultWhiteTextureGuid = GenerateDefault1x1Texture(assetDb, "default_white", PackRgba(255, 255, 255, 255));
+AssetGuid defaultNormalTextureGuid = GenerateDefault1x1Texture(
+    assetDb,
+    "default_normal",
+    PackRgba(128, 128, 255, 255)
+);
+AssetGuid defaultArmTextureGuid = GenerateDefault1x1Texture(assetDb, "default_arm", PackRgba(255, 255, 255, 255));
 
+string[] clusterShaderSources =
+[
+    "bvh_patch.slang",
+    "cluster_binning.slang",
+    "cluster_bvh_traverse.slang",
+    "cluster_cull.slang",
+    "cluster_deform.slang",
+    "cluster_deform_binning.slang",
+    "cluster_draw.slang",
+    "cluster_resolve.slang",
+    "cluster_shade_binning.slang",
+    "cluster_shade_material.slang",
+    "cluster_shade_unlit.slang",
+    "debug_aabb.slang",
+    "depth_merge.slang",
+    "hiz_build.slang",
+    "sw_raster.slang",
+];
+
+foreach (string shaderName in clusterShaderSources)
+{
+    string shaderPath = Path.Combine(shadersDir, shaderName);
+    if (File.Exists(shaderPath))
+    {
+        assetDb.Import(shaderPath);
+    }
+}
+
+GenerateMaterialTemplate(
+    assetDb,
+    "DefaultPBR",
+    shadeShaderGuid: ResolveRequired(assetDb, "assets/Shaders/cluster_shade_material.slang"),
+    shadeEntryPoint: "CSMaterialShadeCached",
+    defaultWhiteTextureGuid,
+    defaultNormalTextureGuid,
+    defaultArmTextureGuid,
+    pbrScalars: true
+);
+GenerateMaterialTemplate(
+    assetDb,
+    "TestUnlit_1",
+    shadeShaderGuid: ResolveRequired(assetDb, "assets/Shaders/cluster_shade_unlit.slang"),
+    shadeEntryPoint: "CSUnlitShadeCached",
+    defaultWhiteTextureGuid,
+    defaultNormalTextureGuid,
+    defaultArmTextureGuid,
+    pbrScalars: false
+);
+
+string icoSpherePath = Path.Combine(projectRoot, "samples", "IcoSphere.glb");
+if (File.Exists(icoSpherePath))
+{
+    assetDb.Import(icoSpherePath);
+}
+
+var diagnostics = assetDb.Validate();
+foreach (var diag in diagnostics)
+{
+    Console.WriteLine($"  [{diag.Severity}] {diag.Kind}: {diag.Message}");
+}
+
+if (diagnostics.Any(static d => d.Severity == AssetDiagnosticSeverity.Error))
+{
+    Console.Error.WriteLine("Asset validation failed with errors.");
+    Environment.ExitCode = 1;
+    return;
+}
+
+Console.WriteLine($"Generated default texture assets in: {texturesDir}");
+Console.WriteLine($"Generated material templates in: {materialsDir}");
 Console.WriteLine($"Generated shader assets in: {shadersDir}");
-Console.WriteLine($"Generated material asset: {pbrPath}");
-Console.WriteLine($"Generated material asset: {unlitPath}");
+Console.WriteLine("Manifest updated successfully.");
 
 static string ResolveProjectRoot(string startPath)
 {
     string current = Path.GetFullPath(startPath);
     while (!string.IsNullOrEmpty(current))
     {
-        if (File.Exists(Path.Combine(current, "SomeEngine.slnx")) ||
-            File.Exists(Path.Combine(current, "Directory.Build.props")))
+        if (
+            File.Exists(Path.Combine(current, "SomeEngine.slnx"))
+            || File.Exists(Path.Combine(current, "Directory.Build.props"))
+        )
         {
             return current;
         }
 
         string? parent = Path.GetDirectoryName(current);
-        if (string.IsNullOrEmpty(parent) || string.Equals(parent, current, StringComparison.OrdinalIgnoreCase))
+        if (
+            string.IsNullOrEmpty(parent)
+            || string.Equals(parent, current, StringComparison.OrdinalIgnoreCase)
+        )
         {
             break;
         }
@@ -49,102 +130,195 @@ static string ResolveProjectRoot(string startPath)
     throw new DirectoryNotFoundException($"Could not locate project root from '{startPath}'.");
 }
 
-static AssetGuid EnsureShaderAsset(string shadersDir, string shaderName)
+static void WriteGeneratedFile(string path, string content)
 {
-    string shaderSourcePath = Path.Combine(shadersDir, $"{shaderName}.slang");
-    if (!File.Exists(shaderSourcePath))
+    Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
+    string normalizedContent = content.Replace("\r\n", "\n");
+    if (File.Exists(path) && string.Equals(File.ReadAllText(path), normalizedContent, StringComparison.Ordinal))
     {
-        throw new FileNotFoundException($"Shader source not found: {shaderSourcePath}", shaderSourcePath);
+        return;
     }
 
-    ShaderAsset shaderAsset = SlangShaderImporter.Import(shaderSourcePath);
-    if (!AssetGuid.TryParse(shaderAsset.AssetGuid, out AssetGuid shaderGuid) || shaderGuid.IsEmpty)
-    {
-        throw new InvalidOperationException($"Shader '{shaderName}' did not produce a valid asset GUID.");
-    }
-
-    return shaderGuid;
+    File.WriteAllText(path, normalizedContent);
 }
 
-static MaterialAsset CreatePbrMaterial(AssetGuid shaderGuid)
+static AssetGuid GenerateDefault1x1Texture(AssetDatabase assetDb, string name, uint rgba)
 {
-    return new MaterialAsset
-    {
-        AssetGuid = AssetGuid.New().ToFlatString(),
-        Name = "DefaultPBR",
-        Passes =
-        [
-            CreateClusterShaderPass(shaderGuid, "cluster_shade_material"),
-            CreateTagOnlyPass("sw_raster", "ClusterRaster"),
-            CreateTagOnlyPass("cluster_deform", "VertexDeform"),
-        ],
-        Textures = CreateDefaultTextureBindings(),
-    };
-}
-
-static MaterialAsset CreateUnlitMaterial(AssetGuid shaderGuid)
-{
-    return new MaterialAsset
-    {
-        AssetGuid = AssetGuid.New().ToFlatString(),
-        Name = "TestUnlit_1",
-        Passes =
-        [
-            CreateClusterShaderPass(shaderGuid, "cluster_shade_unlit"),
-            CreateTagOnlyPass("sw_raster", "ClusterRaster"),
-            CreateTagOnlyPass("cluster_deform", "VertexDeform"),
-        ],
-        Textures = CreateDefaultTextureBindings(),
-    };
-}
-
-static PassEntry CreateClusterShaderPass(AssetGuid shaderGuid, string shaderName)
-{
-    return new PassEntry
-    {
-        ShaderGuid = shaderGuid.ToFlatString(),
-        Shader = shaderName,
-        Tags =
-        [
-            new TagEntry { Name = "opaque" },
-            new TagEntry { Name = "ClusterShader" },
-        ],
-    };
-}
-
-static PassEntry CreateTagOnlyPass(string shaderName, string tagName)
-{
-    return new PassEntry
-    {
-        Shader = shaderName,
-        Tags =
-        [
-            new TagEntry { Name = tagName },
-        ],
-    };
-}
-
-static List<TextureBinding> CreateDefaultTextureBindings()
-{
-    return
+    byte[] pixels =
     [
-        new TextureBinding { Name = "AlbedoMap", Path = "default:white" },
-        new TextureBinding { Name = "NormalMap", Path = "default:normal" },
-        new TextureBinding { Name = "ARMMap", Path = "default:arm" },
+        (byte)(rgba & 0xFF),
+        (byte)((rgba >> 8) & 0xFF),
+        (byte)((rgba >> 16) & 0xFF),
+        (byte)((rgba >> 24) & 0xFF),
     ];
+
+    string outputPath = $"assets/Textures/{name}.texture.asset";
+    var textureAsset = new TextureAsset
+    {
+        Name = name,
+        Width = 1,
+        Height = 1,
+        Format = "RGBA8_UNorm",
+        Payload = pixels,
+    };
+
+    AssetGuid guid = assetDb.CreateAsset(outputPath, textureAsset);
+    Console.WriteLine($"  Texture: {outputPath}");
+    return guid;
 }
 
-static string SaveMaterial(MaterialAsset asset, string path)
+static uint PackRgba(byte r, byte g, byte b, byte a)
+    => (uint)r | ((uint)g << 8) | ((uint)b << 16) | ((uint)a << 24);
+
+static void GenerateMaterialTemplate(
+    AssetDatabase assetDb,
+    string name,
+    AssetGuid shadeShaderGuid,
+    string shadeEntryPoint,
+    AssetGuid defaultWhiteTextureGuid,
+    AssetGuid defaultNormalTextureGuid,
+    AssetGuid defaultArmTextureGuid,
+    bool pbrScalars
+)
 {
-    if (File.Exists(path))
-    {
-        MaterialAsset existing = MaterialAssetSerializer.Load(path);
-        if (!string.IsNullOrWhiteSpace(existing.AssetGuid))
+    string outputPath = $"assets/Materials/{name}.material.asset";
+    AssetGuid swRasterShaderGuid = ResolveRequired(assetDb, "assets/Shaders/sw_raster.slang");
+    AssetGuid hwDrawShaderGuid = ResolveRequired(assetDb, "assets/Shaders/cluster_draw.slang");
+    AssetGuid deformShaderGuid = ResolveRequired(assetDb, "assets/Shaders/cluster_deform.slang");
+
+    assetDb.CreateAsset(
+        outputPath,
+        new MaterialAsset
         {
-            asset.AssetGuid = existing.AssetGuid;
+            Name = name,
+            Passes =
+            [
+                new PassEntry
+                {
+                    ShaderGuid = shadeShaderGuid.ToFlatString(),
+                    EntryPoint = shadeEntryPoint,
+                    Tags = [new TagEntry { Name = "opaque" }],
+                },
+                new PassEntry
+                {
+                    ShaderGuid = swRasterShaderGuid.ToFlatString(),
+                    Tags = [new TagEntry { Name = "opaque" }],
+                },
+                new PassEntry
+                {
+                    ShaderGuid = hwDrawShaderGuid.ToFlatString(),
+                    Tags = [new TagEntry { Name = "opaque" }],
+                },
+                new PassEntry
+                {
+                    ShaderGuid = deformShaderGuid.ToFlatString(),
+                    EntryPoint = "CSDeformWave",
+                    Tags = [new TagEntry { Name = "opaque" }],
+                    Components =
+                    [
+                        new ComponentEntry
+                        {
+                            TypeName = "ClusterDeform",
+                            Json = "{\"BoundsExpansion\":0.3}",
+                        },
+                    ],
+                },
+            ],
+            Textures = CreateDefaultTextureBindings(
+                defaultWhiteTextureGuid,
+                defaultNormalTextureGuid,
+                defaultArmTextureGuid,
+                pbrScalars
+            ),
+            Scalars = CreateDefaultScalars(pbrScalars),
         }
+    );
+    Console.WriteLine($"  Material: {outputPath}");
+}
+
+static AssetGuid ResolveRequired(AssetDatabase assetDb, string sourcePath) =>
+    assetDb.Resolve(sourcePath)
+    ?? throw new InvalidOperationException($"Required asset '{sourcePath}' was not imported.");
+
+static List<TextureBinding> CreateDefaultTextureBindings(
+    AssetGuid defaultWhiteTextureGuid,
+    AssetGuid defaultNormalTextureGuid,
+    AssetGuid defaultArmTextureGuid,
+    bool pbr
+)
+{
+    List<TextureBinding> textures =
+    [
+        new() { Name = "AlbedoMap", TextureGuid = defaultWhiteTextureGuid.ToFlatString() },
+    ];
+
+    if (pbr)
+    {
+        textures.Add(
+            new TextureBinding
+            {
+                Name = "NormalMap",
+                TextureGuid = defaultNormalTextureGuid.ToFlatString(),
+            }
+        );
+        textures.Add(
+            new TextureBinding { Name = "ARMMap", TextureGuid = defaultArmTextureGuid.ToFlatString() }
+        );
     }
 
-    MaterialAssetSerializer.Save(asset, path);
-    return path;
+    return textures;
+}
+
+static List<ScalarParam> CreateDefaultScalars(bool pbr)
+{
+    List<ScalarParam> scalars =
+    [
+        new()
+        {
+            Name = "BaseColorTint",
+            Value = new ParamValue(
+                new Vec4Val
+                {
+                    X = 1.0f,
+                    Y = 1.0f,
+                    Z = 1.0f,
+                    W = 1.0f,
+                }
+            ),
+        },
+    ];
+
+    if (pbr)
+    {
+        scalars.Add(
+            new ScalarParam
+            {
+                Name = "MetallicFactor",
+                Value = new ParamValue(new FloatVal { V = 0.0f }),
+            }
+        );
+        scalars.Add(
+            new ScalarParam
+            {
+                Name = "Roughness",
+                Value = new ParamValue(new FloatVal { V = 0.5f }),
+            }
+        );
+        scalars.Add(
+            new ScalarParam
+            {
+                Name = "EmissiveFactor",
+                Value = new ParamValue(
+                    new Vec3Val
+                    {
+                        X = 0.0f,
+                        Y = 0.0f,
+                        Z = 0.0f,
+                    }
+                ),
+            }
+        );
+    }
+
+    return scalars;
 }

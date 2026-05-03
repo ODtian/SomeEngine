@@ -15,6 +15,28 @@ public sealed class SlangSourceImporter : IAssetImporter
     public bool MatchesSourcePath(string sourcePath)
         => SourceExtensions.Any(extension => sourcePath.EndsWith(extension, StringComparison.OrdinalIgnoreCase));
 
+    public AssetImportFingerprint? GetFingerprint(string projectRoot, string sourcePath, SourceMeta sourceMeta)
+    {
+        string fullPath = Path.IsPathRooted(sourcePath)
+            ? Path.GetFullPath(sourcePath)
+            : Path.GetFullPath(Path.Combine(projectRoot, sourcePath));
+        string outputPath = Path.ChangeExtension(fullPath, ".shader.asset");
+        AssetMeta? existingAsset = AssetMetaManager.TryLoad(outputPath);
+        if (existingAsset == null)
+        {
+            return null;
+        }
+
+        return SlangShaderImporter.TryComputeCurrentFingerprint(
+                existingAsset.Dependencies,
+                projectRoot,
+                SlangShaderImporter.ImporterVersion)
+            ?? SlangShaderImporter.TryComputeCurrentFingerprint(
+                existingAsset.Dependencies,
+                Path.GetDirectoryName(fullPath) ?? projectRoot,
+                SlangShaderImporter.ImporterVersion);
+    }
+
     public IReadOnlyList<ImportedAsset> Import(string projectRoot, string sourcePath)
     {
         string fullPath = Path.IsPathRooted(sourcePath)

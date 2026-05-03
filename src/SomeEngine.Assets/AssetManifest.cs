@@ -65,6 +65,13 @@ public sealed class AssetManifest
         }
 
         string normalizedPath = AssetIoHelpers.NormalizePath(path);
+        if (_assetGuidsByPath.TryGetValue(normalizedPath, out AssetGuid existingGuidForPath)
+            && existingGuidForPath != guid)
+        {
+            _assets.Remove(existingGuidForPath);
+            _dependencies.Remove(existingGuidForPath);
+        }
+
         if (_assets.TryGetValue(guid, out AssetManifestRecord existing))
         {
             _assetGuidsByPath.Remove(existing.Path);

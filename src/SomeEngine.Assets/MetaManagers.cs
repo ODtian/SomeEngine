@@ -10,6 +10,7 @@ public sealed class SourceMeta
 {
     public required SourceGuid SourceGuid { get; init; }
     public required string Importer { get; init; }
+    public JsonElement? ImporterSettings { get; init; }
 }
 
 public sealed class AssetMeta
@@ -43,7 +44,15 @@ public static class SourceMetaManager
         string metaPath = GetMetaPath(sourcePath = Path.GetFullPath(sourcePath));
         SourceMetaDocument document = JsonSerializer.Deserialize<SourceMetaDocument>(File.ReadAllText(metaPath), AssetIoHelpers.JsonOptions)
             ?? throw new InvalidOperationException($"Failed to read source meta '{metaPath}'.");
-        return new SourceMeta { SourceGuid = SourceGuid.Parse(document.SourceGuid), Importer = document.Importer };
+        return new SourceMeta
+        {
+            SourceGuid = SourceGuid.Parse(document.SourceGuid),
+            Importer = document.Importer,
+            ImporterSettings = document.ImporterSettings.HasValue
+                && document.ImporterSettings.Value.ValueKind is not JsonValueKind.Null and not JsonValueKind.Undefined
+                    ? document.ImporterSettings.Value.Clone()
+                    : null,
+        };
     }
 
     public static void Save(string sourcePath, SourceMeta meta)
@@ -54,6 +63,7 @@ public static class SourceMetaManager
         {
             SourceGuid = meta.SourceGuid.ToFlatString(),
             Importer = meta.Importer,
+            ImporterSettings = meta.ImporterSettings?.Clone(),
         }, AssetIoHelpers.JsonOptions));
     }
 
@@ -63,6 +73,7 @@ public static class SourceMetaManager
     {
         public string SourceGuid { get; set; } = string.Empty;
         public string Importer { get; set; } = string.Empty;
+        public JsonElement? ImporterSettings { get; set; }
     }
 }
 

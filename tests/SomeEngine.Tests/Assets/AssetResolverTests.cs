@@ -1,7 +1,9 @@
 using System;
+using Friflo.Engine.ECS;
 using SomeEngine.Assets;
 using SomeEngine.Assets.Schema;
 using SomeEngine.Render.Assets;
+using SomeEngine.Render.Components;
 using SomeEngine.Render.Materials;
 using SomeEngine.Render.Pipelines;
 using SomeEngine.Tests.Materials;
@@ -13,7 +15,7 @@ public class LoaderDelegateIntegrationTests
     [Fact]
     public void MaterialAssetLoader_CanUseGuidDelegate()
     {
-        MaterialSystem materialSystem = new();
+        EntityStore materialStore = new();
         AssetGuid shaderGuid = AssetGuid.New();
         ShaderAsset shader = MaterialAssetPipelineTestHelpers.CreateShaderAsset(shaderGuid, "ShaderA", ("ClusterShade", Array.Empty<string>(), "CSMain"));
 
@@ -24,49 +26,39 @@ public class LoaderDelegateIntegrationTests
             Passes = [new PassEntry { ShaderGuid = shaderGuid.ToFlatString(), Tags = [new TagEntry { Name = "opaque" }] }],
         };
 
-        Material material = MaterialAssetLoader.LoadFromAsset(materialAsset, materialSystem, textureLoader: null, shaderLoader: guid => guid == shaderGuid ? shader : null);
+        Material material = MaterialAssetLoader.LoadFromAsset(materialAsset, materialStore, textureLoader: null, shaderLoader: guid => guid == shaderGuid ? shader : null);
 
         Assert.Equal(AssetGuid.Parse(materialAsset.AssetGuid!), material.AssetGuid);
-        Assert.Equal("CSMain", material.Entity.GetComponent<ClusterShadeComponent>().Default.EntryPoint);
-        Assert.True(material.Entity.Tags.Has<Opaque>());
+        Assert.Equal(1, material.PassEntities.Length);
+        Assert.True(material.PassEntities[0].Tags.Has<Opaque>());
+        Assert.True(material.PassEntities[0].TryGetComponent<ClusterShadeComponent>(out _));
     }
 
     [Fact]
     public void MaterialInstanceLoader_CanUseParentDelegate()
     {
-        MaterialSystem materialSystem = new();
-        Material parent = MaterialAssetPipelineTestHelpers.CreateMaterial(materialSystem, "Parent", AssetGuid.New());
-        parent.Entity.AddTag<Opaque>();
+        EntityStore materialStore = new();
+        Material parent = MaterialAssetPipelineTestHelpers.CreateMaterial(materialStore, "Parent", AssetGuid.New());
+        parent.PassEntities[0].AddTag<Opaque>();
 
         MaterialInstanceAsset instanceAsset = new()
         {
             AssetGuid = AssetGuid.New().ToFlatString(),
             ParentGuid = parent.AssetGuid.ToFlatString(),
-            TagOverrides = [new TagOverride { Name = "masked", Remove = false }],
         };
 
-        Material instance = MaterialInstanceLoader.LoadFromAsset(instanceAsset, materialSystem, guid => guid == parent.AssetGuid ? parent : null, textureLoader: null);
+        Material instance = MaterialInstanceLoader.LoadFromAsset(instanceAsset, materialStore, guid => guid == parent.AssetGuid ? parent : null, textureLoader: null);
 
         Assert.Equal(AssetGuid.Parse(instanceAsset.AssetGuid!), instance.AssetGuid);
-        Assert.True(instance.Entity.Tags.Has<Masked>());
+        Assert.True(instance.PassEntities[0].Tags.Has<Opaque>());
     }
 
     [Fact]
-    public void MeshMaterialResolver_CanUseGuidDelegate()
+    public void MeshMaterialBindings_Component_StoresMaterialGuidTable()
     {
-        Material material = new() { Name = "Mat", AssetGuid = AssetGuid.New() };
-        MeshAsset mesh = new()
-        {
-            AssetGuid = AssetGuid.New().ToFlatString(),
-            Name = "Mesh",
-            Bounds = new Bounds { Center = new Vec3(), Radius = 1f },
-            Attributes = [],
-            DefaultMaterialGuids = [material.AssetGuid.ToFlatString()],
-        };
+        AssetGuid materialGuid = AssetGuid.New();
+        MeshMaterialBindings bindings = new() { MaterialAssetGuids = [materialGuid] };
 
-        Material?[] resolved = MeshMaterialResolver.Resolve(mesh, guid => guid == material.AssetGuid ? material : null);
-
-        Assert.Single(resolved);
-        Assert.Same(material, resolved[0]);
+        Assert.Equal(materialGuid, bindings.MaterialAssetGuids[0]);
     }
 }

@@ -5,16 +5,51 @@ using System.Linq;
 
 namespace SomeEngine.Assets;
 
-public sealed class AssetDatabase
+public sealed class AssetDatabase : IDisposable
 {
     private readonly string _projectRoot;
     private readonly string _manifestDirectory;
+    private readonly IReadOnlyList<IAssetProvider> _providers;
+    private readonly IReadOnlyList<IAssetImporter> _importers;
 
-    public AssetDatabase(string projectRoot, string? manifestDirectory = null)
+    // ── 按运行时类型分桶的缓存 ──
+    private sealed class ProviderStore : IDisposable
     {
-        AssetTypeRegistry.EnsureConfigured();
+        public IAssetProvider Provider { get; }
+        public Dictionary<AssetGuid, object> Cache { get; } = new();
+
+        public ProviderStore(IAssetProvider provider) => Provider = provider;
+
+        public void Dispose()
+        {
+            foreach (object item in Cache.Values)
+                Provider.Destroy(item);
+            Cache.Clear();
+        }
+    }
+
+    private readonly Dictionary<Type, ProviderStore> _stores = new();
+
+    public AssetDatabase(
+        string projectRoot,
+        IEnumerable<IAssetProvider> providers,
+        IEnumerable<IAssetImporter> importers,
+        string? manifestDirectory = null)
+    {
         _projectRoot = Path.GetFullPath(projectRoot);
         _manifestDirectory = Path.GetFullPath(manifestDirectory ?? Path.Combine(_projectRoot, "Library", "AssetManifest"));
+        _providers = providers?.ToArray() ?? throw new ArgumentNullException(nameof(providers));
+        _importers = importers?.ToArray() ?? throw new ArgumentNullException(nameof(importers));
+        if (_providers.Count == 0)
+        {
+            throw new InvalidOperationException("No asset providers were provided to AssetDatabase.");
+        }
+
+        foreach (IAssetProvider provider in _providers)
+        {
+            RegisterStore(provider);
+        }
+
         Manifest = File.Exists(Path.Combine(_manifestDirectory, AssetManifest.AssetIndexFileName))
             ? AssetManifest.Load(_manifestDirectory)
             : new AssetManifest();
@@ -22,43 +57,109 @@ public sealed class AssetDatabase
 
     public AssetManifest Manifest { get; private set; }
 
-    public TAsset? Load<TAsset>(string sourcePath, string? subAssetKey = null)
-        where TAsset : class, IAsset
+    public AssetGuid CreateAsset<TAsset>(
+        string assetPath,
+        TAsset asset,
+        AssetSaveHandler<TAsset> save)
+        where TAsset : class, IMutableAsset
     {
-        string fullPath = ToProjectFullPath(sourcePath);
+        ArgumentNullException.ThrowIfNull(asset);
+        ArgumentNullException.ThrowIfNull(save);
 
-        // source 文件（如 .slang）→ 检查过期 → 按需 Import
-        if (File.Exists(fullPath) && AssetTypeRegistry.MatchImporter(fullPath) != null && !IsUpToDate(fullPath, sourcePath))
+        string fullPath = ToProjectFullPath(assetPath);
+        IAssetProvider provider = MatchProvider(fullPath)
+            ?? throw new NotSupportedException($"No provider is registered for '{fullPath}'.");
+
+        AssetGuid? registeredGuid = Resolve(assetPath);
+        AssetGuid guid = asset.AssetGuid;
+        if (!guid.IsEmpty && registeredGuid is AssetGuid existingGuid && existingGuid != guid)
         {
-            Import(sourcePath);
+            throw new InvalidOperationException(
+                $"Asset '{assetPath}' is already registered as '{existingGuid}', but the asset payload declares '{guid}'.");
         }
 
-        // .asset 文件不在 manifest 中 → 直接读并注册
-        if (Resolve(sourcePath, subAssetKey) == null && File.Exists(fullPath) && AssetTypeRegistry.Match(fullPath) != null)
+        if (guid.IsEmpty)
         {
-            Import(sourcePath);
+            guid = registeredGuid ?? AssetGuid.New();
+            asset.SetAssetGuid(guid);
         }
 
-        AssetGuid? guid = Resolve(sourcePath, subAssetKey);
-        return guid is AssetGuid assetGuid ? Load<TAsset>(assetGuid) : null;
+        string? directory = Path.GetDirectoryName(fullPath);
+        if (!string.IsNullOrEmpty(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        save(asset, fullPath);
+        RegisterAssetFile(fullPath, asset, provider);
+        return guid;
     }
 
-    public TAsset? Load<TAsset>(AssetGuid guid)
-        where TAsset : class, IAsset
+    // ── Load<T> by GUID: 运行时类型化加载 + 缓存 ──
+    public T? Load<T>(AssetGuid guid) where T : class
     {
         if (!Manifest.TryGetAsset(guid, out AssetManifestRecord record))
         {
             return null;
         }
 
-        IAssetTypeHandler? handler = AssetTypeRegistry.Match(ToProjectFullPath(record.Path));
-        return handler?.Load(ToProjectFullPath(record.Path)) as TAsset;
+        if (!_stores.TryGetValue(typeof(T), out ProviderStore? store))
+        {
+            return null;
+        }
+
+        if (store.Cache.TryGetValue(guid, out object? cached))
+        {
+            return (T)cached;
+        }
+
+        string filePath = ToProjectFullPath(record.Path);
+        if (!File.Exists(filePath))
+        {
+            return null;
+        }
+
+        object result = store.Provider.Create(guid, filePath);
+        if (result is not T typed)
+        {
+            store.Provider.Destroy(result);
+            throw new InvalidOperationException(
+                $"Provider '{store.Provider.GetType().Name}' returned '{result.GetType().Name}' for requested '{typeof(T).Name}'.");
+        }
+
+        if (typed is IAsset asset && asset.AssetGuid != guid)
+        {
+            store.Provider.Destroy(result);
+            throw new InvalidOperationException(
+                $"Asset payload guid '{asset.AssetGuid}' does not match manifest guid '{guid}' for '{record.Path}'.");
+        }
+
+        store.Cache[guid] = typed;
+        return typed;
     }
 
+    // ── Load<T> by source path: resolve → Load<T>(guid) ──
+    public T? Load<T>(string sourcePath, string? subAssetKey = null)
+        where T : class
+    {
+        string fullPath = ToProjectFullPath(sourcePath);
+
+        // source 文件（如 .slang）→ 检查过期 → 按需 Import
+        IAssetImporter? importer = MatchImporter(fullPath);
+        if (File.Exists(fullPath) && importer != null && !IsUpToDate(fullPath, sourcePath, importer))
+        {
+            Import(sourcePath);
+        }
+
+        AssetGuid? guid = Resolve(sourcePath, subAssetKey);
+        return guid is AssetGuid assetGuid ? Load<T>(assetGuid) : null;
+    }
+
+    // ── Import: 源文件 → .asset 文件 → manifest 注册 ──
     public IReadOnlyList<AssetGuid> Import(string sourcePath)
     {
         string fullPath = ToProjectFullPath(sourcePath);
-        if (AssetTypeRegistry.MatchImporter(fullPath) is IAssetImporter importer)
+        if (MatchImporter(fullPath) is IAssetImporter importer)
         {
             SourceMeta sourceMeta = SourceMetaManager.GetOrCreate(fullPath, importer.ImporterName);
             IReadOnlyList<ImportedAsset> importedAssets = importer.Import(_projectRoot, fullPath);
@@ -73,16 +174,16 @@ public sealed class AssetDatabase
                     continue;
                 }
 
-                IAssetTypeHandler? handler = AssetTypeRegistry.Match(imported.OutputPath);
-                IReadOnlyList<AssetGuid> deps = handler?.GetDependencies(imported.Asset) ?? [];
-                Manifest.AddAsset(
-                    imported.Asset.AssetGuid,
-                    imported.Asset.Name,
-                    ToManifestPath(imported.OutputPath),
-                    handler?.AssetType ?? string.Empty,
-                    sourceMeta.SourceGuid,
-                    imported.SubAssetKey,
-                    deps);
+                if (MatchProvider(imported.OutputPath) is IAssetProvider provider)
+                {
+                    RegisterAssetFile(
+                        imported.OutputPath,
+                        imported.Asset,
+                        provider,
+                        sourceMeta.SourceGuid,
+                        imported.SubAssetKey,
+                        saveManifest: false);
+                }
                 result.Add(imported.Asset.AssetGuid);
             }
 
@@ -91,29 +192,34 @@ public sealed class AssetDatabase
         }
 
         // 手写 .asset 文件（Material 等）：直接读并注册
-        if (File.Exists(fullPath) && AssetTypeRegistry.Match(fullPath) is IAssetTypeHandler directHandler)
+        if (File.Exists(fullPath) && MatchProvider(fullPath) is IAssetProvider directProvider)
         {
-            IAsset? asset = directHandler.Load(fullPath);
-            if (asset != null && !asset.AssetGuid.IsEmpty)
+            object obj = directProvider.Create(AssetGuid.Empty, fullPath);
+            try
             {
-                AssetMeta? meta = AssetMetaManager.TryLoad(fullPath);
-                IReadOnlyList<AssetGuid> deps = directHandler.GetDependencies(asset);
-                Manifest.AddAsset(
-                    asset.AssetGuid,
-                    asset.Name,
-                    ToManifestPath(fullPath),
-                    directHandler.AssetType,
-                    meta?.SourceGuid ?? SourceGuid.Empty,
-                    meta?.SubAssetKey ?? string.Empty,
-                    deps);
-                Manifest.Save(_manifestDirectory);
-                return [asset.AssetGuid];
+                if (obj is IAsset asset && !asset.AssetGuid.IsEmpty)
+                {
+                    AssetMeta? meta = AssetMetaManager.TryLoad(fullPath);
+                    RegisterAssetFile(
+                        fullPath,
+                        asset,
+                        directProvider,
+                        meta?.SourceGuid ?? SourceGuid.Empty,
+                        meta?.SubAssetKey ?? string.Empty);
+                    return [asset.AssetGuid];
+                }
+            }
+            finally
+            {
+                // Don't cache this temporary load; just for manifest registration
+                directProvider.Destroy(obj);
             }
         }
 
-        throw new NotSupportedException($"No importer or handler is registered for '{fullPath}'.");
+        throw new NotSupportedException($"No importer or provider is registered for '{fullPath}'.");
     }
 
+    // ── Resolve / Query ──
     public AssetGuid? Resolve(string sourcePath, string? subAssetKey = null)
     {
         string manifestPath = ToManifestPath(sourcePath);
@@ -221,12 +327,33 @@ public sealed class AssetDatabase
             .ToArray();
     }
 
+    public void Dispose()
+    {
+        foreach (ProviderStore store in _stores.Values)
+            store.Dispose();
+        _stores.Clear();
+    }
+
+    // ── Private helpers ──
+
     private string ToProjectFullPath(string path)
         => Path.IsPathRooted(path) ? Path.GetFullPath(path) : Path.GetFullPath(Path.Combine(_projectRoot, path));
 
     private string ToManifestPath(string path) => AssetIoHelpers.ToManifestPath(_projectRoot, path);
 
-    private bool IsUpToDate(string fullSourcePath, string sourcePath)
+    private IAssetProvider? MatchProvider(string path)
+    {
+        string normalized = AssetIoHelpers.NormalizePath(path);
+        return _providers.FirstOrDefault(provider => provider.Matches(normalized));
+    }
+
+    private IAssetImporter? MatchImporter(string path)
+    {
+        string normalized = AssetIoHelpers.NormalizePath(path);
+        return _importers.FirstOrDefault(importer => importer.MatchesSourcePath(normalized));
+    }
+
+    private bool IsUpToDate(string fullSourcePath, string sourcePath, IAssetImporter importer)
     {
         string manifestPath = ToManifestPath(sourcePath);
         if (!Manifest.TryGetSourceGuid(manifestPath, out SourceGuid sourceGuid))
@@ -240,7 +367,24 @@ public sealed class AssetDatabase
             return false;
         }
 
-        DateTime sourceTime = File.GetLastWriteTimeUtc(fullSourcePath);
+        string sourceMetaPath = SourceMetaManager.GetMetaPath(fullSourcePath);
+        if (!File.Exists(sourceMetaPath))
+        {
+            return false;
+        }
+
+        SourceMeta sourceMeta = SourceMetaManager.Load(fullSourcePath);
+        if (!string.Equals(sourceMeta.Importer, importer.ImporterName, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        AssetImportFingerprint? currentFingerprint = importer.GetFingerprint(_projectRoot, fullSourcePath, sourceMeta);
+        if (currentFingerprint == null)
+        {
+            return false;
+        }
+
         foreach (AssetGuid guid in assets)
         {
             if (!Manifest.TryGetAsset(guid, out AssetManifestRecord record))
@@ -249,12 +393,75 @@ public sealed class AssetDatabase
             }
 
             string assetPath = ToProjectFullPath(record.Path);
-            if (!File.Exists(assetPath) || File.GetLastWriteTimeUtc(assetPath) < sourceTime)
+            if (!File.Exists(assetPath))
+            {
+                return false;
+            }
+
+            AssetMeta? assetMeta = AssetMetaManager.TryLoad(assetPath);
+            if (assetMeta == null
+                || assetMeta.SourceGuid != sourceGuid
+                || assetMeta.ImporterVersion != currentFingerprint.ImporterVersion
+                || !string.Equals(assetMeta.ContentFingerprint, currentFingerprint.ContentFingerprint, StringComparison.Ordinal))
             {
                 return false;
             }
         }
 
         return true;
+    }
+
+    private void RegisterStore(IAssetProvider provider)
+    {
+        Type runtimeType = provider.RuntimeType;
+        if (_stores.ContainsKey(runtimeType))
+        {
+            return; // Already registered (e.g. multiple providers for the same type)
+        }
+
+        _stores[runtimeType] = new ProviderStore(provider);
+    }
+
+    private void RegisterAssetFile(
+        string fullPath,
+        IAsset asset,
+        IAssetProvider provider,
+        SourceGuid sourceGuid = default,
+        string subAssetKey = "",
+        bool saveManifest = true)
+    {
+        AssetMeta? meta = AssetMetaManager.TryLoad(fullPath);
+        if (meta != null && meta.AssetGuid != asset.AssetGuid)
+        {
+            throw new InvalidOperationException(
+                $"Asset meta guid '{meta.AssetGuid}' does not match payload guid '{asset.AssetGuid}' for '{fullPath}'.");
+        }
+
+        if (meta != null && !sourceGuid.IsEmpty && meta.SourceGuid != sourceGuid)
+        {
+            throw new InvalidOperationException(
+                $"Asset meta source guid '{meta.SourceGuid}' does not match registration source guid '{sourceGuid}' for '{fullPath}'.");
+        }
+
+        IReadOnlyList<AssetGuid> deps = provider.GetDependencies(fullPath);
+        Manifest.AddAsset(
+            asset.AssetGuid,
+            asset.Name,
+            ToManifestPath(fullPath),
+            provider.AssetType,
+            sourceGuid,
+            subAssetKey,
+            deps);
+
+        if (_stores.TryGetValue(provider.RuntimeType, out ProviderStore? store)
+            && store.Cache.Remove(asset.AssetGuid, out object? cached))
+        {
+            provider.Destroy(cached);
+        }
+
+        if (saveManifest)
+        {
+            Manifest.Save(_manifestDirectory);
+        }
     }
 }

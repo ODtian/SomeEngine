@@ -7,11 +7,6 @@ namespace SomeEngine.Tests.Assets;
 
 public class AssetProjectValidatorTests
 {
-    public AssetProjectValidatorTests()
-    {
-        AssetTypeRegistration.RegisterBuiltIns();
-    }
-
     [Fact]
     public void Validate_DoesNotReportReferencedAssetsAsOrphan()
     {
@@ -34,7 +29,7 @@ public class AssetProjectValidatorTests
             manifest.AddAsset(meshGuid, "MeshA", "assets/Meshes/a.mesh.asset", nameof(MeshAsset), dependencies: [materialGuid]);
             manifest.Save(Path.Combine(dir, "Library", "AssetManifest"));
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
             IReadOnlyList<AssetDiagnostic> diagnostics = db.Validate();
 
             Assert.DoesNotContain(diagnostics, diagnostic => diagnostic.Kind == AssetDiagnosticKind.MissingAssetFile);
@@ -63,7 +58,7 @@ public class AssetProjectValidatorTests
             manifest.AddAsset(shadowGuid, "Shadow", "assets/Shaders/shared.shadow.shader.asset", nameof(ShaderAsset), sourceGuid, "shader:shadow");
             manifest.Save(Path.Combine(dir, "Library", "AssetManifest"));
 
-            AssetDatabase db = new(dir);
+            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
 
             Assert.Null(db.Resolve("assets/Shaders/shared.slang"));
             Assert.Equal(mainGuid, db.Resolve("assets/Shaders/shared.slang", "shader:main"));

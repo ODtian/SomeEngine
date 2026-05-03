@@ -32,6 +32,10 @@ table VertexAttribute {
     offset: ushort;
 }
 
+table MeshRegion {
+    name: string;
+}
+
 table MeshAsset (fs_serializer) {
     asset_guid:string;
     name:string;
@@ -41,8 +45,7 @@ table MeshAsset (fs_serializer) {
     bvh_offset:ulong;
     quant_origin:Vec3;
     quant_step:float;
-    default_material_guids:[string] (fs_vector:"IList");
-    default_material_slots:[string] (fs_vector:"IList");  // Material paths, indexed by localMaterialIndex
+    regions:[MeshRegion] (fs_vector:"IList");
 }
 
 root_type MeshAsset;
