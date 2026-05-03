@@ -7,6 +7,7 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <UsesDiligentEngine>true</UsesDiligentEngine>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,6 +19,8 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
+    <PackageReference Include="DiligentGraphics.DiligentEngine.Core" Version="$(DiligentPackageVersion)" Condition="'$(DiligentUseLocalBuild)' != 'true'" />
+    <PackageReference Include="Diligent-SharpGen.Runtime" Version="$(DiligentSharpGenRuntimeVersion)" Condition="'$(DiligentUseLocalBuild)' == 'true'" />
     <PackageReference Include="FlatSharp.Runtime" Version="7.9.0" />
     <PackageReference Include="SharpGLTF.Toolkit" Version="1.0.6" />
   </ItemGroup>
