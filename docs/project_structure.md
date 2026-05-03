@@ -26,7 +26,7 @@ f:\SomeEngine
 │   │   └── Math/            # QVVS 坐标系统
 │   ├── SomeEngine.Render/   # 渲染系统
 │   │   ├── Graph/           # Render Graph（自动 barrier + DCE + 拓扑排序）
-│   │   ├── Materials/       # 材质系统（BinQueue + BinSpace + TagStore）
+│   │   ├── Materials/       # 材质系统（ShaderParamBag + BinQueue + BinSpace）
 │   │   ├── Pipelines/       # 渲染管线
 │   │   │   └── ClusterRender/  # GPU-Driven Cluster Rendering
 │   │   │       └── Stages/     # 10 个 Stage 编排类

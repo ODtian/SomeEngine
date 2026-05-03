@@ -68,7 +68,8 @@ dotnet run --project src/SomeEngine.Runtime/SomeEngine.Runtime.csproj
 2. ~~Phase 1: 核心管线加固~~ ✅
 3. ~~Phase 2: 文档补全~~ ✅
 4. ~~Phase 3: corrective asset rework~~ ✅ — `TASK-307` / `BATCH-07` 已完成
-5. **Phase 3: 后续功能候选** — `TASK-301` 光照 / `TASK-302` Page 流式 / `TASK-303` Tessellation
+5. **Phase 3: Asset + Material RenderWorld 完整改造** - `TASK-309` / `BATCH-09b`
+6. **Phase 3: 后续功能候选** — `TASK-301` 光照 / `TASK-302` Page 流式 / `TASK-303` Tessellation
 
 ## Developer Quick Start
 

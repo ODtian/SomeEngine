@@ -133,4 +133,4 @@ Cluster 通过 batch 协调读写同步，避免读到半写入的 cluster：
 
 2. **`NANITE_MAX_BVH_NODES_PER_GROUP`**：Nanite 中此值 = `ThreadGroupSize / NANITE_MAX_BVH_NODE_FANOUT`。当前 BVH fanout = 最多 8 子节点，`numthreads(64)` → 每 group 处理 8 个 node。
 
-3. **调试**：建议保留旧的逐层遍历路径（通过 bool flag 切换），方便 A/B 性能对比和 correctness 验证。
+3. **调试**：用离线 trace 和 golden output 做 correctness 验证；运行时只保留当前遍历实现。

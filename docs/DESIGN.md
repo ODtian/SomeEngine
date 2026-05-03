@@ -84,12 +84,16 @@ Upload Globals
 
 ### 3.3 材质系统
 
-- `Material`：瘦材质对象，持有 `ShaderParamBag` 和唯一 `Entity`
-- `MaterialSystem`：全局材质 `EntityStore`，负责材质实体生命周期
-- `MaterialRef`：Entity 回指 `Material`，供管线读取 `Params`
-- `BinQueue` / `BinSpace`：基于 `Entity` 做 `BinGroup` 查询、动态 region 和 layout
-- `MaterialSlotBuffer`：GPU 侧 `ushort[]` SOA 布局
-- `ShaderAsset.Metadata.MaterialBindings` + `EntryPointAttributes` 已接入资源布局和组件 authoring 路径
+- `MeshAsset`：只保留几何和 region 元数据，不再直接引用具体 `Material`
+- `MeshMaterialBindings`：当前 ECS authoring 数据，数组下标就是 mesh-local material slot
+- `MaterialAsset`：单一材质资产，持有 root params + 匿名 pass entity snapshots
+- `Material`：运行时材质容器，持有 `ShaderParamBag` 和 `PassEntities[]`
+- `RenderWorld`：由 extract 阶段展开 `(source entity, material pass)` 级别的执行态实体
+- `MaterialRef`：pass entity 回指 `Material`，供管线读取共享参数
+- `BinQueue` / `BinSpace` / `MaterialSlotBuffer`：Cluster pipeline 的派生数据，用于把 RenderWorld pass entities 映射到 GPU slot/bin 路径
+- `ShaderAsset.Metadata.MaterialBindings` + `EntryPointAttributes` 已接入资源布局和 pass/component authoring 路径
+- 通用的 ECS authoring 设计见 [`docs/core/ecs_authoring.md`](core/ecs_authoring.md)
+- 材质作为其中一个实例，见 [`docs/materials/authoring_system.md`](materials/authoring_system.md)
 
 ### 3.4 GPU 数据结构
 
@@ -99,12 +103,12 @@ Upload Globals
 | `GpuInstanceHeader` | `BVHRootIndex + MaterialSlotOffset + MetadataOffset + MetadataCount + BoundsExpansion` |
 | `ClusterShade` | 统一编排 ShadeBin + MaterialShade |
 
-### 3.5 Dual-Signature 绑定
+### 3.5 资源绑定（全 Dynamic 隐式签名）
 
-- **Sig0**（BindingIndex=0）：管线全局资源，per-pass SRB
-- **Sig1**（BindingIndex=1）：由 `MaterialRef.Owner.Params` + shader metadata 推导，per-material SRB
-- `ShadePSOGroup.ComputeShaderGroups()` 已有纯 CPU 测试
-- Sig1 cache key、descriptor 构建和 cache reuse 已有直接测试
+- 所有 PSO 使用 `DefaultVariableType = Dynamic` + Diligent 隐式反射
+- 无显式 `IPipelineResourceSignature`（BATCH-08 已消灭 Sig0/Sig1 双签名）
+- 每个 shader group 持有 1 个 SRB，per-dispatch 绑定所有资源
+- `MaterialPSOGroup.ComputeShaderGroups()` 已有纯 CPU 测试
 
 ---
 
@@ -113,8 +117,6 @@ Upload Globals
 Phase 0、Phase 1、Phase 2 的当前基线工作已完成，当前剩余问题主要转为中长期维护与新系统补全：
 
 - `src/SomeEngine.Runtime/Program.cs` 仍然过大且无测试
-- 缺少专门的 Dual-Signature 设计文档
-- `docs/assets/asset_identity.md` 仍保留部分 pre-ECS material identity 叙述
 - 光照 / page streaming / tessellation 仍处于下一阶段
 - 编辑器 / 物理 / 动画 / UI 仍未真正落地
 
@@ -138,7 +140,8 @@ Phase 0、Phase 1、Phase 2 的当前基线工作已完成，当前剩余问题�
 
 ### Phase 1: Core Hardening
 - 状态：`DONE`
-- ECS 测试同步点、Sig1 cache、DeformCache 资源级镜像测试均已补齐
+- ECS 测试同步点、DeformCache 资源级镜像测试均已补齐
+- 全 Dynamic PSO 简化（BATCH-08：消灭 dual-sig + StaticPSOInit + SRBPool）
 
 ### Phase 2: Documentation Coverage
 - 状态：`DONE`

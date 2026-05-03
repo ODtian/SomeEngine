@@ -138,10 +138,10 @@ public class CascadedShadowFeature : IRenderFeature
                 graph, _ctx, bvhPass, clusterMgr, instanceMgr,
                 globals, lightCam, ClusterTraverseConfig.Default());
 
-            // Legacy Cull（阴影无需 HiZ）
+            // Phase1 Cull；阴影路径可以选择不执行后续 Phase2/HiZ build
             var cullOut = ClusterCull.AddPasses(graph, _ctx, traverse, globals,
                 traverse.CullingUniforms,
-                ClusterCullConfig.Default() with { HiZMode = HiZDebugMode.Legacy },
+                ClusterCullConfig.Default() with { HiZMode = HiZDebugMode.Phase1Only },
                 RenderGraphHandle.Invalid, RenderGraphHandle.Invalid,
                 false, RenderGraphHandle.Invalid);
 

@@ -5,7 +5,7 @@
 | ID | Area | Source | Description | Status |
 |---|---|---|---|---|
 | DEBT-013 | ECS Transform | test failure | `TransformSystemTests.TestRotation` 失败，根因是测试未等待 job completion | DONE (TASK-103) |
-| DEBT-007 | Dual-Signature | review 发现 | Sig1 cache key / descriptor 构建 / cache reuse 已补直接测试 | DONE (TASK-101) |
+| DEBT-007 | 资源绑定 | BATCH-08 | ~~Sig1 cache key / descriptor 构建~~ dual-sig 已删除（BATCH-08），原测试随架构删除 | DONE (BATCH-08) |
 
 ## P2 — 近期修
 
@@ -29,9 +29,11 @@
 | DEBT-014 | sw_raster docs | 文档漂移 | `docs/rendering/sw_raster/sw_raster.md` 旧的 `DeformedBuffer` 命名已同步 | DONE |
 | DEBT-001 | ClusterRenderFeature | 废弃代码 | 91KB 废弃文件 | DONE (TASK-009) |
 | DEBT-015 | asset_identity.md | 文档漂移 | `docs/assets/asset_identity.md` 仍保留 pre-ECS `MaterialPass / MaterialRegistry` material identity 叙述 | OPEN |
+| DEBT-016 | pipeline_overview.md | 文档过期 | `IAssetTypeHandler` / `AssetTypeRegistry` 段落残留 | DONE (BATCH-07c review) |
+| DEBT-017 | ShaderParamBag | BATCH-08 review | Dynamic 变量要求非 null 绑定。当 texture view 为 null 时需绑 fallback（`default_white/default_normal/default_arm`）。BATCH-11 增加 renderer-owned fallback resources 与 `ShaderParamBag.ApplyFallbacks`。 | DONE (TASK-311d) |
 
 ## 统计
 
-- **DONE**: 13
+- **DONE**: 15
 - **OPEN / PARTIAL**: 2
-- **当前测试基线（2026-04-03）**: `124 passed, 0 failed, 1 skipped`
+- **当前测试基线（2026-05-03）**: `200 passed, 0 failed, 0 skipped`

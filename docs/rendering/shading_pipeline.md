@@ -1,6 +1,6 @@
 # Compute Shade Pipeline 设计文档
 
-> **状态：✅ 已实施并接入 Entity-based material 路线**
+> **状态：✅ 全 Dynamic 隐式签名方案已实施（BATCH-08）**
 
 ---
 
@@ -10,7 +10,7 @@ VisBuffer Resolve + Compute Material Shading，参考 UE5 Nanite Compute Shade B
 
 当前管线：
 
-`VisBuffer → ShadeBin (Count/Reserve/Scatter) → ShadePSOGroup 分组 → Per-Bin MaterialShade Dispatch → Color`
+`VisBuffer → ShadeBin (Count/Reserve/Scatter) → MaterialPSOGroup 分组 → Per-Bin MaterialShade Dispatch → Color`
 
 ---
 
@@ -50,11 +50,22 @@ VisBuffer Resolve + Compute Material Shading，参考 UE5 Nanite Compute Shade B
 5. 材质求值（PBR: BaseColor/Normal/Metallic/Roughness）
 6. 写入 `OutputColor` UAV
 
-### Dual-Signature 绑定
+### 全 Dynamic 隐式签名绑定（BATCH-08）
 
-- **Sig0**：每个 PSO group 共用的全局资源（VisBuffer / VisibleClusters / PageHeap / OutputColor 等）
-- **Sig1**：由 `MaterialRef.Owner.Params` + shader metadata / entry-point variant 推导出的材质资源，按 cache key 缓存在 `ClusterShade` 静态字典中
-- `ClusterMaterialShadePass` 执行阶段按 group 绑定 Sig0，再按 bin 提交 Sig1 SRB
+所有资源使用单一 `PipelineResourceLayoutDesc { DefaultVariableType = Dynamic }` + Diligent 隐式反射。不再有显式 `IPipelineResourceSignature`。
+
+每个 shader group（连续同 shader 的 bin）持有 **1 个 SRB**，每次 dispatch 前通过 `Set()` 绑定所有资源（per-pass + per-material），利用 Diligent 的 ring buffer 自动回收描述符。
+
+```
+PSO 创建: per-shader-group，通过 GlobalPsoCache 缓存
+SRB 创建: per-group 一次（存入 MaterialPSOGroup.SRB）
+每帧执行: Set(所有资源) → CommitShaderResources → DispatchComputeIndirect
+描述符回收: ring buffer 自动回收，无需手动 Dispose
+```
+
+#### Immutable Sampler
+
+`MaterialSampler` 烘入 `PipelineResourceLayoutDesc.ImmutableSamplers`，运行时零 sampler 描述符开销。材质运行时 API 不再提供 sampler override；需要修改 sampler 时应调整管线签名/PSO 定义。
 
 ### 泛型着色管线
 
@@ -70,9 +81,9 @@ void CSShade<TVE : IVertexEvaluate, TMaterial : ISurfaceEvaluate>(
 
 | 文件 | 职责 |
 |------|------|
-| `ClusterMaterialShadePass.cs` | Per-bin dispatch |
-| `ClusterShade.cs` | Sig0/Sig1、PSO 分组构建、pass 编排 |
-| `ShadePSOGroup.cs` | 纯 CPU break-on-change 分组逻辑 |
+| `ClusterMaterialShadePass.cs` | Per-bin dispatch，绑定 per-pass + per-material 资源到 group SRB |
+| `ClusterShade.cs` | PSO 分组构建、pass 编排、`StaticPSOInit.Once` 初始化 |
+| `MaterialPSOGroup.cs` | 纯 CPU break-on-change 分组逻辑 + SRB 持有 + IDisposable |
 | `cluster_shade_material.slang` | 标准 PBR 着色 |
 | `cluster_shade_unlit.slang` | Unlit 着色 |
 | `cluster_shade_pipeline.slang` | 泛型着色管线共享代码 |
@@ -80,12 +91,27 @@ void CSShade<TVE : IVertexEvaluate, TMaterial : ISurfaceEvaluate>(
 
 ---
 
-## 4. 当前状态
+## 4. 样板代码基础设施
+
+### StaticPSOInit
+
+所有 PSO 类的 `EnsureInitialized` 使用 `StaticPSOInit.Once(ref bool, Lock, Action)` 消除手写 double-check 样板。
+
+### SRBPool
+
+所有 PSO 类的 SRB 池使用 `SRBPool` 类封装 `ConcurrentBag<IShaderResourceBinding>`，提供 `Rent(pso)` / `Return(srb)` 接口。
+
+---
+
+## 5. 当前状态
 
 - [x] ShadeBin 3-pass（Count / Reserve / Scatter）
 - [x] `ClusterShade` 静态编排器替代原 `ClusterShadeBinStage` / `ClusterShadeStage`
-- [x] `ShadePSOGroup.ComputeShaderGroups()` 已提取，按 shader break-on-change 进行分组
-- [x] Sig0 / Sig1 双签名绑定已接入实际管线
-- [x] `ClusterShadeSig1Tests` 已覆盖 Sig1 cache key、resource layout 与 cache reuse
+- [x] `MaterialPSOGroup.ComputeShaderGroups()` 按 shader break-on-change 分组
+- [x] 全 Dynamic 隐式签名绑定（BATCH-08：消灭 Sig0/Sig1 双签名）
+- [x] Dynamic SRB per-group（BATCH-08：per-dispatch Set + Commit）
+- [x] Immutable Sampler（BATCH-08：MaterialSampler 烘入 layout）
+- [x] StaticPSOInit + SRBPool 样板消除（BATCH-08：覆盖全部 PSO 类）
 - [ ] 1x1 vs 2x2 Quad 双模式（当前统一 1x1）
 - [ ] 更多 `ISurfaceEvaluate` 实现（SSS、Refraction 等）
+- [ ] Bindless 描述符索引（Dynamic SRB 为中间态）

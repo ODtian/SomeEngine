@@ -1,6 +1,10 @@
-# Material System 架构设计 (v10)
+# Material System 架构设计 (v11)
 
-> 前版见 [architecture_v8_archived.md](architecture_v8_archived.md)
+> **Status:** 当前代码已从 `1 Material = 1 Entity` 继续演化到 `Material root params + PassEntities[] + GameWorld authoring bindings + RenderWorld extract` 路线。本文大部分原则仍有效，但涉及“材质唯一实体”“多 pass 通过多个 Material 组合”的旧描述已不再准确，应以下面的更新段落为准。
+>
+> **Authoring split:** 通用 ECS authoring 设计见 [../core/ecs_authoring.md](../core/ecs_authoring.md)；材质作为具体实例的说明见 [authoring_system.md](authoring_system.md)。
+>
+> **Genericity note:** 本文中的 `ClusterRaster` / `ClusterShade` / `ClusterRender` 示例应视为“当前 feature adapter”，不是 authoring 核心层对外暴露的唯一模型。
 
 ## 设计原则
 
@@ -8,9 +12,9 @@
 2. **材质只描述能力**：材质声明实现了哪些 evaluate 接口，不关心管线内部的 mode（inline/cached/SW/HW）
 3. **管线定义 Component**：每条管线定义自己的 IComponent 类型，材质系统核心不包含管线语义
 4. **Importer 管线无关**：Importer 只做 Slang attribute → 注册 Author 的透传调度，不解释管线含义
-5. **瘦 Material**：1 Material = 1 shader + 1 params + tags = 1 Entity。Material 是原子的资产单元
-6. **组合靠 tag/component**：overlay 等多 pass 角色通过 Entity 上的 Component 表达，BinQueue 直接 query。无容器层级
-7. **Material 是资产容器**：Material 对象持有 shader 引用、参数、tags，不参与 dispatch 逻辑
+5. **Material 是参数容器，不是提交实体**：`Material` 持有 root params 和 `PassEntities[]`
+6. **pass 直接是实体**：component/tag 直接挂在 pass entity 上，不经过额外 feature 容器
+7. **组合靠 authoring + extract**：当前 `MeshMaterialBindings` 表达 mesh-local material table，RenderWorld 再把 `(source, local slot, pass)` 展开为提交单元
 8. **Bin key = 一次 dispatch 的完整工作单元**：只要 shader/固定状态/绑定集合不同就分 bin
 9. **localMaterialIndex < 128**（per-mesh-asset 局部上限，7 bit）
 10. **BinGroup 动态排序**：BinQueue 按 Entity 上的 orderKey 自动产出有序 region，管线不做拓扑排序
@@ -29,22 +33,21 @@ ShaderAsset (编译产物)
   │  包含 N 个 variant + 每个 variant 的 pipeline attribute metadata
   ▼
 Material (.mat 资产)
-  │  引用 1 个 ShaderAsset + 声明贴图/标量参数 + tags
-  │  1 Material = 1 shader = 1 Entity
+  │  声明共享参数 + 匿名 pass entity snapshots
   ▼
 Material (运行时资产容器)
-  │  持有 ShaderParamBag + 1 Entity
+  │  持有 ShaderParamBag + PassEntities[]
   │
-  └──▶ Entity
-         Tags: [Opaque]
-         Components: [ClusterRaster, ClusterShade, ClusterDeform, MaterialRef, ...]
-         Params: material.Params (引用)
+  └──▶ Pass Entities[]
+         Tags: [Opaque] / [Masked] / ...
+         Components: [ClusterRaster, ClusterShade, OverlayShade, MaterialRef, ...]
+         Params: material.Params (共享) + pass-local overrides
 
-多 pass 组合 (MaterialStack 或实例级)
-  │  [skin.mat, stocking.mat, outline.mat]
-  │  多个 Material → 多个 Entity
-  └──▶ Author 单阶段：每个 Entity 独立挂 Component
-       管线通过 BinGroup 动态排序消费
+GameWorld Entity
+  │  MeshAssetGuid + MeshMaterialBindings
+  └──▶ Extract
+       RenderWorld pass entities:
+       (source entity, material pass)
 ```
 
 ### Material — 资产/参数容器
@@ -54,23 +57,24 @@ public class Material
 {
     public string Name;
     public AssetGuid AssetGuid;
-    public string ShaderAssetName;         // 引用的 ShaderAsset
-    public ShaderParamBag Params;          // 贴图、采样器、标量
-    public Entity Entity;                  // 此材质的唯一 Entity
+    public ShaderParamBag Params;          // 贴图、Buffer、标量
+    public Entity[] PassEntities;          // 匿名 pass entities
 
     public void SetTexture(string name, ITextureView view) => Params.Set(name, view);
-    public void SetSampler(string name, ISampler sampler) => Params.Set(name, sampler);
-    public Material Instantiate();         // clone Params + 创建新 Entity
+    public Material Instantiate();         // clone Params + clone PassEntities
 }
 ```
 
-Material 不参与 dispatch 路径。dispatch 只读 Entity Component。
+Material 不参与 dispatch 路径。dispatch 只读 pass entities 上的 component/tag。
 
 ### Entity — 渲染意图
 
-**1 Material = 1 Entity**。Entity 代表一个材质的渲染身份。
+当前模型不是 `1 Material = 1 Entity`，而是：
 
-所有使用同一 Material 的物体实例共享同一 Entity。Entity 描述材质级策略，不描述实例级状态。
+- `1 Material = 1 root param bag + N pass entities`
+- pass entity 才是渲染身份
+- GameWorld entity 只持有 authoring 材质绑定数据
+- RenderWorld 里才出现真正参与提交的 pass entity 实例
 
 ### Tag vs Component
 
@@ -83,7 +87,7 @@ Material 不参与 dispatch 路径。dispatch 只读 Entity Component。
 | stencil 配置 | StencilState | 携带 Ref/Compare/PassOp 字段 | `IComponent`（管线定义） |
 | 材质引用 | MaterialRef | 回指 Material 对象 | `IComponent` |
 
-不再有 ReusePixels / ReuseVisibleSet — 跨 Entity 引用已消除。
+跨 Entity 引用不进入材质提交模型。
 
 ---
 
@@ -349,7 +353,7 @@ materialSystem.RegisterAuthor(new StencilConfigAuthor());
 
 | 不在 .mat | 为什么 |
 |---|---|
-| **passes** | 1 Material = 1 shader。多 pass 通过多个 Material + tag/component 组合 |
+| **passes** | `MaterialAsset` 直接持有匿名 pass entity snapshots |
 | **reuse / stencil** | 管线概念，来自 shader attribute → Author |
 | **管线角色** | 来自 shader attribute → Author |
 
@@ -391,26 +395,22 @@ overlay 通过运行时给 Entity 挂 `OverlayShade` Component 表达。
 ```text
 MaterialAssetLoader.LoadFromAsset(matAsset)
   │
-  ├── 创建 Material 对象，设 ShaderAssetName + Params
+  ├── 创建 Material 对象，设 Params
   │
-  ├── 加载对应 ShaderAsset
-  │
-  ├── 在 MaterialSystem.Store（独立 static EntityStore）创建 Entity
+  ├── 对每个 pass snapshot：
+  │     ├── 在传入的 materialStore 创建 pass entity
   │     ├── 挂 MaterialRef { Owner = material }
-  │     ├── 从 .mat tags 设置 ITag（Opaque / Masked / ...）
-  │     └── 遍历 ShaderAsset variant 的 entry point attributes
-  │           └── 对每个 attribute，调用注册的 Author
-  │               Author 解释 attr → 挂管线 Component + 角色 Component
-  │               (单阶段，不引用其他 Entity)
+  │     ├── 反序列化显式 tags/components
+  │     └── 加载 shader 并应用 entry-point authoring
   │
-  └── material.Entity = 创建的 Entity
+  └── material.PassEntities = 所有创建的 pass entities
 ```
 
 ---
 
 ## 多 Pass 组合
 
-多 pass 角色（overlay、outline 等）通过 Entity 上的 tag/Component 表达。没有容器层级。
+多 pass 现在是 `MaterialAsset` 的一等能力。每个 pass 都直接是实体快照，component/tag 直接挂在 pass 上，没有 feature 容器层。
 
 ### 角色来源
 
@@ -420,19 +420,7 @@ MaterialAssetLoader.LoadFromAsset(matAsset)
 | overlay shade | `ClusterShade` + `OverlayShade { Layer }` | 运行时代码 / 编辑器 | 同一 shader 在不同上下文可做 primary 或 overlay |
 | stencil | `StencilState { Ref, Compare, PassOp }` | Author（shader attr `[StencilConfig]`） | shader 固有 |
 
-overlay 角色**不来自 shader attribute**（同一个 PBR shader 可以在 mesh A 上做 primary，在 mesh B 上做 overlay）。
-由使用侧直接设在 Entity 上：
-
-```csharp
-// 皮肤做 primary（默认，无需额外操作）
-var skin = materialSystem.Load("skin.mat");
-// skin.Entity 有 ClusterShade，没有 OverlayShade → BinQueue 归入 primary region
-
-// 丝袜做 overlay —— 直接改 Entity，不复制
-var stocking = materialSystem.Load("stocking.mat");
-stocking.Entity.AddComponent(new OverlayShade { Layer = 1 });
-// BinQueue query 看到 OverlayShade → 归入 overlay region
-```
+overlay 关系依然不是材质系统核心语义；它只是在 pass entity 上表现为 `OverlayShade` 等 component，由具体管线解释。
 
 ### BinQueue 直接 query
 
@@ -442,9 +430,9 @@ stocking.Entity.AddComponent(new OverlayShade { Layer = 1 });
 
 ## Bin 系统
 
-### BinGroup（替代固定 Region）
+### BinGroup
 
-原 `RegisterRegion(name, query, sig)` 改为 `RegisterGroup(group)`：
+管线通过 `RegisterGroup(group)` 注册提交分组：
 
 ```csharp
 public struct BinGroup
@@ -453,8 +441,8 @@ public struct BinGroup
     public Func<Entity[]> Query;
 
     /// <summary>
-    /// 从 Entity 计算 orderKey。相同 key 的 Entity 归入同一 region。
-    /// Region 按 key 升序排列。key 间插入 barrier。
+    /// 从 Entity 计算 orderKey。相同 key 的 Entity 归入同一提交段。
+    /// 提交段按 key 升序排列。key 间插入 barrier。
     /// </summary>
     public Func<Entity, int> OrderKey;
 
@@ -569,11 +557,12 @@ ulong ShadeSignatureFunc(Entity entity)
 
 ### BinSpace
 
-BinSpace 作为 BinQueue 之上的统一层，管理：
+当前代码中，BinSpace 作为 Cluster pipeline 的 bridge，管理：
 
 - 多个 BinQueue field（per stage）
 - MaterialSlotBuffer SOA 布局
 - MaterialSlotCache（hash + refcount 共享）
+- per-field slot entity 选择（同一个 local material slot 可对不同 field 指向不同的 render pass entity）
 - 脏检测与 rebuild
 
 ```csharp
@@ -600,14 +589,13 @@ public sealed class BinSpace
 
 ## PSO/SRB 管理
 
-### Sig0 / Sig1 双签名
+### 全 Dynamic 隐式签名（BATCH-08）
 
-已在 ClusterShade 中实现：
+所有 PSO 使用 `PipelineResourceLayoutDesc { DefaultVariableType = Dynamic }` + Diligent 隐式反射。不再有显式 `IPipelineResourceSignature`。
 
-- **Sig0**：全局资源（VisBuffer、ClusterData、Lights 等），所有 bin 共享
-- **Sig1**：per-material 资源（贴图、采样器），按 material 参数布局缓存
-
-Sig1 cache key 基于 ShaderAsset metadata 过滤后的 binding layout（BATCH-05 已实现）。
+- 每个 shader group 持有 1 个 SRB，per-dispatch 绑定所有资源（per-pass + per-material）
+- `MaterialSampler` 作为 `ImmutableSamplerDesc` 烘入 layout
+- material 纹理通过 `ShaderParamBag.ApplyTo(srb)` 绑定
 
 ### PSO 构建
 
@@ -668,37 +656,6 @@ void BuildPSOForBin(Entity entity, ref PipelineStateDesc desc)
 
 ---
 
-## 与 v8 架构的迁移
-
-| v8 概念 | v10 概念 | 变化 |
-|---|---|---|
-| `MaterialPass` | **删除** | 职责分散到 Entity Component + 管线代码 |
-| `MaterialRegistry` | **删除** | 用 friflo `EntityStore` 替代 |
-| `TagStore<MaterialPass>` | **删除** | 用 friflo archetype query 替代 |
-| `IMaterialTag` | `ITag`（零大小）或 `IComponent`（带数据） | friflo 原生类型 |
-| `MaterialPass.ShaderRef` | Component 字段 `ShaderVariantRef` | |
-| `MaterialPass.MaterialID` | Entity 上的 `MaterialSlotId : IComponent` | |
-| `MaterialPass.ComputeSignature()` | 管线 signatureFunc(Entity) | |
-| `MaterialPass.ApplyToSRB()` | 管线 stage dispatch 代码 | |
-| `MaterialPass.Params` | `MaterialRef` → `Material.Params` | 回指 Material 共享 Params |
-| `Material.AddPass()` | **删除** | 多 pass 通过 MaterialStack 组合多个 Material |
-| `MaterialTagDeserializerGenerator` | 更新为生成 `entity.AddTag<T>()` / `entity.AddComponent()` | |
-| `FindSibling<TTag>` | **删除** | 无跨 Entity 引用 |
-| `RegisterRegion` (固定) | `RegisterGroup` (动态 orderKey) | BinQueue 自动产出有序 region |
-| `ReusePixels` / `ReuseVisibleSet` | **删除** | 用 OverlayShade.Layer + BinGroup orderKey 替代 |
-| 旧 .mat FlatBuffer schema | **破坏性变更**，新 schema（1 shader + 1 params + tags） | |
-
-### 不变的部分
-
-- BinQueue 核心算法（分组 + 签名去重），API 从固定 region 改为动态 BinGroup
-- BinSpace 统一层
-- MaterialSlotBuffer SOA 布局
-- MaterialSlotCache hash+refcount 共享
-- ShaderParamBag（结构不变，位置在 Material 上）
-- ShaderAsset 资产格式（扩展 variant metadata）
-
----
-
 ## Cluster 多材质（未来）
 
 GPU 侧材质 slot 查找的完整路径：
@@ -716,7 +673,7 @@ MaterialSlotBuffer[offset + localIndex] → MaterialSlot { RasterBin, ShadingBin
    └── 一次 Load 得到所有 stage 的 bin key
 ```
 
-此部分设计不变，但数据源从 MaterialPass 切换到 Entity。
+此部分设计不变，数据源来自 RenderWorld pass entity。
 
 ---
 
@@ -728,15 +685,12 @@ MaterialSlotBuffer[offset + localIndex] → MaterialSlot { RasterBin, ShadingBin
 | 多 pass 组合位置 | Material 内部 / 外部（Stack/Instance） | **外部** | 组合关系不是材质固有属性 |
 | 管线 mode 透明性 | mode 暴露到材质 / 对材质不透明 | **不透明** | mode 是管线全局配置，不应污染材质模型 |
 | variant 寻址 | string key 查找 / Component typed 字段 | **typed 字段** | 编译时安全，无运行时查找开销 |
-| Entity 粒度 | 1 Material = 1 Entity / 1 Material = N Entity | **1:1** | 资源归属无歧义，无跨 Entity 引用 |
+| Entity 粒度 | 1 Material = 1 Entity / 1 Material = N pass Entities | **1 Material = N pass Entities** | pass 才是渲染身份；材质是参数容器 |
 | Author 阶段 | 单阶段（只操作当前 Entity）/ 二阶段（需跨 Entity） | **单阶段** | 消除 Phase 2，简化加载流程 |
 | BinQueue region | 固定命名 / 动态 orderKey | **动态 orderKey** | 支持任意层数 overlay，管线不做拓扑排序 |
 | 入口点展开 | importer 知道管线 / 用户展开 + importer 透传 | **用户展开 + 透传** | importer 管线无关 |
 | Author 协议 | importer 解析 attr / 透传给 Author | **透传** | attr 协议是 Slang shader ↔ C# Author 的私有契约 |
-| MaterialPass | 保留 / 删除 | **删除** | Entity + Component 替代全部职责 |
-| TagStore | 保留 / 用 EntityStore 替代 | **替代** | friflo archetype query 更高效 |
 | overlay/stencil 来源 | .mat 声明 / shader attribute + Author | **shader attribute + Author** | 材质不知道管线概念 |
-| 跨 Entity 引用 | ReusePixels{Primary=Entity} / Entity 自描述 + BinGroup 排序 | **自描述 + BinGroup** | 消除图解析，管线按 region 顺序 dispatch |
 | L2 多 view | 材质建模 / 管线基础设施 | **管线** | multi-view 不是材质的关注点 |
 | Material 保留 | 保留为容器 / 全部 ECS 化 | **保留** | 承担资产生命周期 + 参数容器 + 用户 API |
-| 旧 .mat 兼容 | 兼容 / 破坏性变更 | **破坏性变更** | 架构改动太大，无法兼容 |
+| 历史 .mat 迁移 | 保留 / 破坏性变更 | **破坏性变更** | 架构改动收敛到当前 schema |

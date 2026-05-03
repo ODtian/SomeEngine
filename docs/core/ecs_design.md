@@ -4,6 +4,8 @@
 
 SomeEngine 的 ECS 基于 [**friflo Engine ECS**](https://github.com/friflo/Friflo.Engine.ECS)，一个高性能的 Archetype-based Entity Component System。
 
+> **Authoring note:** 通用的 authoring/runtime/extractor 关系见 [ecs_authoring.md](ecs_authoring.md)。
+
 ## 核心类型
 
 ### GameWorld

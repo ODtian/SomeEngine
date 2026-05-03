@@ -24,23 +24,37 @@ RenderGraph 使用 placed/aliased 资源，transient resource 共享 memory heap
 - **Static 变量不可用**（PSO 创建时不知道具体资源）
 - 为使用 Static 而放弃 aliasing（committed resource）**不值得**——用显存换 ns 级 CPU
 
-### 解决方案：Mutable + `ALLOW_OVERWRITE`
-
-`ALLOW_OVERWRITE` 允许每帧覆写 Mutable 绑定。由于 immediate context 顺序执行，帧间 `Present`/fence **天然满足 GPU 同步要求**。覆写只是 CPU 侧写 descriptor（ns 级），Commit 时仍走与 Static 相同的 descriptor table 路径。
-
 ---
 
-## 3. 变量分层策略
+## 3. 当前策略：全 Dynamic（BATCH-08 后）
 
-| 变量类别 | 推荐类型 | 理由 |
-|---------|---------|------|
-| RG transient 资源（VisBuffer, PageHeap, OutputColor 等） | **Mutable + `ALLOW_OVERWRITE`** | placed resource 每帧对象可能变，但 Commit 开销与 Static 相同 |
-| Uniform CB（`USAGE_DYNAMIC`） | **Dynamic** | Map/Unmap 改 GPU 地址，需要 Dynamic 路径 |
-| 材质纹理（未来） | **Mutable**（每材质独立 SRB） | 材质创建时绑定一次，不变 |
+所有 PSO 使用 `DefaultVariableType = Dynamic`，依赖 Diligent 隐式反射（不创建显式 `IPipelineResourceSignature`）。
+
+### 理由
+
+- 架构简单：无需手写 signature/layout，无需 sig 缓存
+- PSO + SRB 创建快：隐式签名由引擎自动推导
+- 运行时绑定统一：per-dispatch `Set()` + `CommitShaderResources`
+- 对 RenderGraph placed resource 天然兼容
+
+### Immutable Sampler
+
+`MaterialSampler` 作为 `ImmutableSamplerDesc` 烘入 `PipelineResourceLayoutDesc`，运行时零 sampler 描述符开销。对应 shader 中所有 `SamplerState MaterialSampler` 声明。
+
+### SRB 管理
+
+| pass 类型 | SRB 来源 | 生命周期 |
+|-----------|---------|---------|
+| 材质着色（`ClusterMaterialShadePass`） | `MaterialPSOGroup.SRB`（per-group） | 随 group rebuild |
+| 通用 compute pass | `SRBPool.Rent(pso)` / `SRBPool.Return(srb)` | 帧内借还 |
 
 ---
 
 ## 4. 关键优化标志
+
+### `SetShaderResourceFlags.AllowOverwrite`
+
+材质 `ShaderParamBag.ApplyTo()` 使用此标志覆写已绑定的纹理变量。
 
 ### `SHADER_VARIABLE_FLAG_NO_DYNAMIC_BUFFERS`
 
@@ -56,28 +70,11 @@ Dynamic 变量若绑定的不是 `USAGE_DYNAMIC` buffer，加此标志可跳过 
 
 ---
 
-## 5. 当前管线诊断
+## 5. 资源绑定演进路径
 
-当前 `ClusterMaterialShadePass` 的问题：
+### 当前 → S1：变量类型精细化
 
-```csharp
-// ⚠️ 全部 Dynamic → 每次 Commit 有额外开销
-DefaultVariableType = ShaderResourceVariableType.Dynamic
-
-// ⚠️ 逐材质 Map/Unmap → GPU 地址每次变化，无法用 BUFFERS_INTACT
-for (matID...) {
-    MapBuffer(Discard) → UnmapBuffer → CommitSRB → Dispatch
-}
-```
-
----
-
-## 6. 资源绑定演进路径（S0 → S3）
-
-### S0（当前）→ S1：变量类型优化
-
-- `DefaultVariableType` 从 Dynamic 改为 Mutable
-- RG 资源用 Mutable + `ALLOW_OVERWRITE` 每帧重绑
+- 纹理等绑定稳定的变量改为 Mutable + `ALLOW_OVERWRITE`
 - 只有 Uniforms 保留 Dynamic
 - 用大 uniform buffer + `SetBufferOffset` 替代逐材质 Map/Unmap
 
@@ -89,18 +86,18 @@ for (matID...) {
 
 ### S2 → S3：Bindless
 
-- Bin Key 从 `MaterialID` → `ShaderTypeID`，Dispatch 次数 N → 1
+- Bin Key 从 material slot 派生提交 → `ShaderTypeID`，Dispatch 次数 N → 1
 - 所有纹理进 bindless heap，材质参数存 StructuredBuffer 查表
 - 当前 Binning 架构天然适配
 
 ---
 
-## 7. 性能对比
+## 6. 性能对比
 
-| 操作 | S0 (当前) | S1 (优化变量类型) | S2 (多SRB) | S3 (Bindless) |
-|------|-----------|-----------------|-----------|--------------|
+| 操作 | 当前 (全 Dynamic) | S1 (精细化类型) | S2 (多SRB) | S3 (Bindless) |
+|------|-------------------|----------------|-----------|--------------|
 | Dynamic descriptor 开销 | 全部变量 | **仅 Uniform** | 仅 Uniform | 无 |
 | Per-material MapBuffer | N次 | **0次** | 0次 | 0次 |
-| Per-material CommitSRB | N次（重） | N次（**轻**） | N次（轻） | 1次 |
-| Per-material 纹理支持 | ❌ | ❌ | ✅ | ✅ |
+| Per-material CommitSRB | N次 | N次（**轻**） | N次（轻） | 1次 |
+| Per-material 纹理 | ✅ 每 dispatch 重绑 | ✅ | ✅ | ✅ |
 | Dispatch 次数 | N | N | N | **1** |
