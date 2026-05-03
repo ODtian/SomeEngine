@@ -83,21 +83,23 @@ struct StaticVertexEval : IVertexEvaluate
         return v.position;
     }
 
-    // Cache: half3 packed into 2×uint = 8 bytes
-    uint getCacheStride() { return 8; }
+    // Cache: float3, preserving world-space precision for cached raster/shade paths.
+    uint getCacheStride() { return 12; }
 
     void writeCache(RWByteAddressBuffer buf, uint byteAddr, DeformedVertex v)
     {
-        buf.Store(byteAddr,     f32tof16(v.position.x) | (f32tof16(v.position.y) << 16));
-        buf.Store(byteAddr + 4, f32tof16(v.position.z));
+        buf.Store(byteAddr,     asuint(v.position.x));
+        buf.Store(byteAddr + 4, asuint(v.position.y));
+        buf.Store(byteAddr + 8, asuint(v.position.z));
     }
 
     DeformedVertex readCache(ByteAddressBuffer buf, uint byteAddr)
     {
-        uint xy = buf.Load(byteAddr);
-        uint z_ = buf.Load(byteAddr + 4);
         DeformedVertex v;
-        v.position = float3(f16tof32(xy), f16tof32(xy >> 16), f16tof32(z_));
+        v.position = float3(
+            asfloat(buf.Load(byteAddr)),
+            asfloat(buf.Load(byteAddr + 4)),
+            asfloat(buf.Load(byteAddr + 8)));
         return v;
     }
 };
@@ -127,21 +129,23 @@ struct WaveVertexEval : IVertexEvaluate
         return v.position;
     }
 
-    // Cache: half3 packed into 2×uint = 8 bytes
-    uint getCacheStride() { return 8; }
+    // Cache: float3, preserving world-space precision for cached raster/shade paths.
+    uint getCacheStride() { return 12; }
 
     void writeCache(RWByteAddressBuffer buf, uint byteAddr, DeformedVertex v)
     {
-        buf.Store(byteAddr,     f32tof16(v.position.x) | (f32tof16(v.position.y) << 16));
-        buf.Store(byteAddr + 4, f32tof16(v.position.z));
+        buf.Store(byteAddr,     asuint(v.position.x));
+        buf.Store(byteAddr + 4, asuint(v.position.y));
+        buf.Store(byteAddr + 8, asuint(v.position.z));
     }
 
     DeformedVertex readCache(ByteAddressBuffer buf, uint byteAddr)
     {
-        uint xy = buf.Load(byteAddr);
-        uint z_ = buf.Load(byteAddr + 4);
         DeformedVertex v;
-        v.position = float3(f16tof32(xy), f16tof32(xy >> 16), f16tof32(z_));
+        v.position = float3(
+            asfloat(buf.Load(byteAddr)),
+            asfloat(buf.Load(byteAddr + 4)),
+            asfloat(buf.Load(byteAddr + 8)));
         return v;
     }
 };
@@ -241,9 +245,15 @@ struct CachedSource<TVE : IVertexEvaluate> : IVertexSource
 
     float4 fetchClipPosition(VertexFetchArgs args)
     {
-        uint baseVert = cacheOffsets[args.visibleClusterIndex];
-        uint stride = evaluator.getCacheStride();
-        uint byteAddr = (baseVert + args.localVertIdx) * stride;
+        uint baseByte = cacheOffsets[args.visibleClusterIndex];
+        if (baseByte >= 0xFFFFFFFDu)
+        {
+            InlineSource<TVE> fallback;
+            fallback.evaluator = evaluator;
+            return fallback.fetchClipPosition(args);
+        }
+
+        uint byteAddr = baseByte + args.localVertIdx * evaluator.getCacheStride();
         TVE.DeformedVertex v = evaluator.readCache(deformCache, byteAddr);
         float3 worldPos = evaluator.getPosition(v);
         return mul(float4(worldPos, 1.0), args.viewProj);

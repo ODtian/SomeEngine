@@ -14,7 +14,7 @@ public class ShaderGroupTests
     {
         using var binSpace = SetupBinSpace([]);
 
-        var groups = ShadePSOGroup.ComputeShaderGroups(binSpace, 0, static entity => entity.GetComponent<ClusterShadeComponent>().Default);
+        var groups = MaterialPSOGroup.ComputeShaderGroups(binSpace, 0, static entity => entity.GetComponent<ClusterShadeComponent>().Default);
 
         Assert.Empty(groups);
     }
@@ -22,12 +22,12 @@ public class ShaderGroupTests
     [Fact]
     public void SingleBin_ReturnsSingleGroup()
     {
-        var materialSystem = new MaterialSystem();
+        EntityStore materialStore = new();
         var shader = MaterialAssetPipelineTestHelpers.CreateShaderAsset(AssetGuid.New(), "A", ("ClusterShade", Array.Empty<string>(), "CSMain"));
-        var entity = CreateShadeEntity(materialSystem, shader, "M1");
+        var entity = CreateShadeEntity(materialStore, shader, "M1");
         using var binSpace = SetupBinSpace([entity]);
 
-        var groups = ShadePSOGroup.ComputeShaderGroups(binSpace, 0, static e => e.GetComponent<ClusterShadeComponent>().Default);
+        var groups = MaterialPSOGroup.ComputeShaderGroups(binSpace, 0, static e => e.GetComponent<ClusterShadeComponent>().Default);
 
         Assert.Single(groups);
         Assert.Equal(0, groups[0].BinStart);
@@ -40,16 +40,16 @@ public class ShaderGroupTests
     [Fact]
     public void SameShader_ConsecutiveBins_MergedIntoOneGroup()
     {
-        var materialSystem = new MaterialSystem();
+        EntityStore materialStore = new();
         var shader = MaterialAssetPipelineTestHelpers.CreateShaderAsset(AssetGuid.New(), "A", ("ClusterShade", Array.Empty<string>(), "CSMain"));
         using var binSpace = SetupBinSpace(
         [
-            CreateShadeEntity(materialSystem, shader, "M1"),
-            CreateShadeEntity(materialSystem, shader, "M2"),
-            CreateShadeEntity(materialSystem, shader, "M3"),
+            CreateShadeEntity(materialStore, shader, "M1"),
+            CreateShadeEntity(materialStore, shader, "M2"),
+            CreateShadeEntity(materialStore, shader, "M3"),
         ]);
 
-        var groups = ShadePSOGroup.ComputeShaderGroups(binSpace, 0, static e => e.GetComponent<ClusterShadeComponent>().Default);
+        var groups = MaterialPSOGroup.ComputeShaderGroups(binSpace, 0, static e => e.GetComponent<ClusterShadeComponent>().Default);
 
         Assert.Single(groups);
         Assert.Same(shader, groups[0].VariantRef.Shader);
@@ -58,7 +58,7 @@ public class ShaderGroupTests
     [Fact]
     public void DifferentEntryPoints_BreakIntoSeparateGroups()
     {
-        var materialSystem = new MaterialSystem();
+        EntityStore materialStore = new();
         var shader = MaterialAssetPipelineTestHelpers.CreateShaderAsset(
             AssetGuid.New(),
             "A",
@@ -67,11 +67,11 @@ public class ShaderGroupTests
 
         using var binSpace = SetupBinSpace(
         [
-            CreateShadeEntity(materialSystem, shader, "Primary", "CSMain"),
-            CreateShadeEntity(materialSystem, shader, "Overlay", "CSOverlay"),
+            CreateShadeEntity(materialStore, shader, "Primary", "CSMain"),
+            CreateShadeEntity(materialStore, shader, "Overlay", "CSOverlay"),
         ]);
 
-        var groups = ShadePSOGroup.ComputeShaderGroups(binSpace, 0, static e => e.GetComponent<ClusterShadeComponent>().Default);
+        var groups = MaterialPSOGroup.ComputeShaderGroups(binSpace, 0, static e => e.GetComponent<ClusterShadeComponent>().Default);
 
         Assert.Equal(2, groups.Count);
         Assert.Contains(groups, group => group.VariantRef.EntryPoint == "CSMain");
@@ -81,15 +81,15 @@ public class ShaderGroupTests
     [Fact]
     public void GroupEntities_MatchBinSpaceOrdering()
     {
-        var materialSystem = new MaterialSystem();
+        EntityStore materialStore = new();
         var shader = MaterialAssetPipelineTestHelpers.CreateShaderAsset(AssetGuid.New(), "A", ("ClusterShade", Array.Empty<string>(), "CSMain"));
         using var binSpace = SetupBinSpace(
         [
-            CreateShadeEntity(materialSystem, shader, "M1"),
-            CreateShadeEntity(materialSystem, shader, "M2"),
+            CreateShadeEntity(materialStore, shader, "M1"),
+            CreateShadeEntity(materialStore, shader, "M2"),
         ]);
 
-        var groups = ShadePSOGroup.ComputeShaderGroups(binSpace, 0, static e => e.GetComponent<ClusterShadeComponent>().Default);
+        var groups = MaterialPSOGroup.ComputeShaderGroups(binSpace, 0, static e => e.GetComponent<ClusterShadeComponent>().Default);
 
         Assert.Single(groups);
         for (int i = 0; i < groups[0].BinCount; i++)
@@ -99,12 +99,13 @@ public class ShaderGroupTests
         }
     }
 
-    private static Entity CreateShadeEntity(MaterialSystem materialSystem, ShaderAsset shader, string name, string entryPoint = "CSMain")
+    private static Entity CreateShadeEntity(EntityStore materialStore, ShaderAsset shader, string name, string entryPoint = "CSMain")
     {
-        var material = MaterialAssetPipelineTestHelpers.CreateMaterial(materialSystem, name, AssetGuid.New());
-        material.Entity.AddComponent(new ClusterShadeComponent { Default = new ShaderVariantRef(shader, entryPoint) });
-        material.Entity.AddTag<Opaque>();
-        return material.Entity;
+        var material = MaterialAssetPipelineTestHelpers.CreateMaterial(materialStore, name, AssetGuid.New());
+        Entity passEntity = material.PassEntities[0];
+        passEntity.AddComponent(new ClusterShadeComponent { Default = new ShaderVariantRef(shader, entryPoint) });
+        passEntity.AddTag<Opaque>();
+        return passEntity;
     }
 
     private static BinSpace SetupBinSpace(Entity[] entities)
@@ -117,7 +118,7 @@ public class ShaderGroupTests
             {
                 Query = () => entities,
                 OrderKey = static _ => 0,
-                SignatureFunc = entity => MaterialEntityUtility.ComputeMaterialSignature(entity, entity.GetComponent<ClusterShadeComponent>().Default),
+                SignatureFunc = entity => (ulong)entity.Id,
             });
         binSpace.FreezeLayout();
 

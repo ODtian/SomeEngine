@@ -1,5 +1,6 @@
 #include "cluster_structures.slang"
 #include "common.slang"
+#include "generated/instance_header_layout.slang"
 
 struct CullingUniforms
 {
@@ -44,6 +45,7 @@ struct CullingUniforms
 ConstantBuffer<CullingUniforms> Uniforms;
 
 StructuredBuffer<GpuTransform> Instances;
+ByteAddressBuffer InstanceHeaders;
 ByteAddressBuffer PageHeap;
 StructuredBuffer<uint3> CandidateClusters;
 RWStructuredBuffer<uint> CandidateCount;
@@ -62,11 +64,112 @@ RWByteAddressBuffer Phase2DrawArgs;          // IndirectArgs: must stay raw, lay
 // Max 4096 entries → buffer size = 4 + 4096*32 = 131076 bytes
 RWByteAddressBuffer DebugHiZOutput;
 
+static const uint DEBUG_HIZ_MAX_SAMPLES = 4096;
+static const uint DEBUG_HIZ_HEADER_BYTES = 128;
+static const uint DEBUG_HIZ_SAMPLE_STRIDE_BYTES = 80;
+
+static const uint DEBUG_WORD_SAMPLE_COUNT = 0;
+static const uint DEBUG_WORD_PHASE1_INPUT = 1;
+static const uint DEBUG_WORD_PHASE1_LOD_REJECTED = 2;
+static const uint DEBUG_WORD_PHASE1_NO_HISTORY = 3;
+static const uint DEBUG_WORD_PHASE1_TESTED = 4;
+static const uint DEBUG_WORD_PHASE1_DEFERRED = 5;
+static const uint DEBUG_WORD_PHASE1_DRAWN = 6;
+static const uint DEBUG_WORD_PHASE2_INPUT = 7;
+static const uint DEBUG_WORD_PHASE2_LOD_REJECTED = 8;
+static const uint DEBUG_WORD_PHASE2_TESTED = 9;
+static const uint DEBUG_WORD_PHASE2_CULLED = 10;
+static const uint DEBUG_WORD_PHASE2_DRAWN = 11;
+static const uint DEBUG_WORD_HIZ_DISABLED = 12;
+static const uint DEBUG_WORD_SAMPLE_OVERFLOW = 13;
+static const uint DEBUG_WORD_PHASE1_DEPTH_VISIBLE = 14;
+static const uint DEBUG_WORD_PHASE2_DEPTH_VISIBLE = 15;
+
+static const uint DEBUG_SAMPLE_FLAG_OCCLUDED = 1u << 0;
+static const uint DEBUG_SAMPLE_FLAG_USE_PREV = 1u << 1;
+static const uint DEBUG_SAMPLE_FLAG_BOUNDS_EXPANDED = 1u << 2;
+static const uint DEBUG_SAMPLE_FLAG_FULLSCREEN_BOUNDS = 1u << 3;
+static const uint DEBUG_SAMPLE_FLAG_HIZ_DISABLED = 1u << 4;
+
+float3 LoadFloat3(ByteAddressBuffer buffer, uint offset)
+{
+    return asfloat(uint3(
+        buffer.Load(offset + 0),
+        buffer.Load(offset + 4),
+        buffer.Load(offset + 8)));
+}
+
+bool DebugHiZEnabled()
+{
+    return Uniforms.DumpHiZData != 0 || Uniforms.Pad5 != 0;
+}
+
+void DebugCounterAdd(uint wordOffset)
+{
+    if (!DebugHiZEnabled())
+        return;
+
+    uint ignored;
+    DebugHiZOutput.InterlockedAdd(wordOffset * 4, 1, ignored);
+}
+
+void DebugStoreHiZSample(
+    uint pageOffset,
+    uint clusterID,
+    uint instanceID,
+    float2 minUv,
+    float2 maxUv,
+    float nearDepth,
+    float hizDepth,
+    uint mipLevel,
+    uint flags,
+    float3 worldCenter,
+    float worldRadius,
+    float boundsExpansion,
+    float epsilon)
+{
+    if (!DebugHiZEnabled())
+        return;
+
+    uint debugIdx;
+    DebugHiZOutput.InterlockedAdd(DEBUG_WORD_SAMPLE_COUNT * 4, 1, debugIdx);
+    if (debugIdx >= DEBUG_HIZ_MAX_SAMPLES)
+    {
+        DebugCounterAdd(DEBUG_WORD_SAMPLE_OVERFLOW);
+        return;
+    }
+
+    float pixelWidth = (maxUv.x - minUv.x) * max((float)Uniforms.ScreenWidth, 1.0);
+    float pixelHeight = (maxUv.y - minUv.y) * max((float)Uniforms.ScreenHeight, 1.0);
+    uint base = DEBUG_HIZ_HEADER_BYTES + debugIdx * DEBUG_HIZ_SAMPLE_STRIDE_BYTES;
+
+    DebugHiZOutput.Store(base + 0, asuint(minUv.x));
+    DebugHiZOutput.Store(base + 4, asuint(minUv.y));
+    DebugHiZOutput.Store(base + 8, asuint(maxUv.x));
+    DebugHiZOutput.Store(base + 12, asuint(maxUv.y));
+    DebugHiZOutput.Store(base + 16, asuint(nearDepth));
+    DebugHiZOutput.Store(base + 20, asuint(hizDepth));
+    DebugHiZOutput.Store(base + 24, mipLevel);
+    DebugHiZOutput.Store(base + 28, flags);
+    DebugHiZOutput.Store(base + 32, asuint(worldCenter.x));
+    DebugHiZOutput.Store(base + 36, asuint(worldCenter.y));
+    DebugHiZOutput.Store(base + 40, asuint(worldCenter.z));
+    DebugHiZOutput.Store(base + 44, asuint(worldRadius));
+    DebugHiZOutput.Store(base + 48, pageOffset);
+    DebugHiZOutput.Store(base + 52, clusterID);
+    DebugHiZOutput.Store(base + 56, instanceID);
+    DebugHiZOutput.Store(base + 60, asuint(boundsExpansion));
+    DebugHiZOutput.Store(base + 64, asuint(pixelWidth));
+    DebugHiZOutput.Store(base + 68, asuint(pixelHeight));
+    DebugHiZOutput.Store(base + 72, asuint(nearDepth - hizDepth));
+    DebugHiZOutput.Store(base + 76, asuint(epsilon));
+}
+
 GPUCluster LoadCluster(uint pageOffset, uint clusterIndex)
 {
     uint headerOffset = pageOffset;
     uint clustersOffset = PageHeap.Load(headerOffset + 16);
-    uint offset = headerOffset + clustersOffset + (clusterIndex * 64);
+    uint offset = headerOffset + clustersOffset + (clusterIndex * GPU_CLUSTER_STRIDE_BYTES);
     GPUCluster c;
 
     // IntBase (0..11)
@@ -104,13 +207,18 @@ GPUCluster LoadCluster(uint pageOffset, uint clusterIndex)
     c.MaterialTableOffset = PageHeap.Load(offset + 56);
     c.VRBBatchInfo = PageHeap.Load(offset + 60);
 
+    // BoundMin (64..75), BoundMax (76..87)
+    c.BoundMin = LoadFloat3(PageHeap, offset + 64);
+    c.BoundMax = LoadFloat3(PageHeap, offset + 76);
+
     return c;
 }
 
 [numthreads(1, 1, 1)]
 void UpdateIndirectArgs(uint3 id: SV_DispatchThreadID)
 {
-    uint count = CandidateCount[0];
+    uint count = min(CandidateCount[0], Uniforms.MaxCandidates);
+    CandidateCount[0] = count;
     uint groups = (count + 63) / 64;
     CandidateArgs.Store<DispatchArgs>(0, DispatchArgs(groups, 1, 1));
 }
@@ -141,91 +249,64 @@ bool PassesLODFilter(GPUCluster cluster, GpuTransform t)
     return visible;
 }
 
-void BuildScreenBoundsAndNearDepth(
-    float3 worldCenter,
-    float worldRadius,
+void BuildWorldAabbScreenBoundsAndNearDepth(
+    float3 worldMin,
+    float3 worldMax,
     bool usePrev,
     out float2 minUv,
     out float2 maxUv,
     out float nearDepth,
     out uint mipLevel)
 {
-    minUv = 0.0.xx;
-    maxUv = 1.0.xx;
-    nearDepth = 0.0;
-    mipLevel = 0;
-
-    // Select matrices based on phase
-    float4x4 viewMat = usePrev ? Uniforms.PrevView : Uniforms.View;
     float4x4 viewProjMat = usePrev ? Uniforms.PrevViewProj : Uniforms.ViewProj;
-    float projP00 = usePrev ? Uniforms.PrevP00 : Uniforms.P00;
-    float projP11 = usePrev ? Uniforms.PrevP11 : Uniforms.P11;
 
-    // Transform bounds to view space for Exact Sphere Projection
-    float3 viewPos = mul(float4(worldCenter, 1.0), viewMat).xyz;
-    // View matrix uses right-hand convention (forward = -Z), negate to match
-    // the sphere projection math which assumes positive Z = forward
-    viewPos.z = -viewPos.z;
+    float3 corners[8];
+    corners[0] = float3(worldMin.x, worldMin.y, worldMin.z);
+    corners[1] = float3(worldMax.x, worldMin.y, worldMin.z);
+    corners[2] = float3(worldMin.x, worldMax.y, worldMin.z);
+    corners[3] = float3(worldMax.x, worldMax.y, worldMin.z);
+    corners[4] = float3(worldMin.x, worldMin.y, worldMax.z);
+    corners[5] = float3(worldMax.x, worldMin.y, worldMax.z);
+    corners[6] = float3(worldMin.x, worldMax.y, worldMax.z);
+    corners[7] = float3(worldMax.x, worldMax.y, worldMax.z);
 
-    float zNear = 0.1; // Safe distance for near plane
-    if (viewPos.z < worldRadius + zNear)
+    float2 ndcMin = 1e20.xx;
+    float2 ndcMax = -1e20.xx;
+    uint validCornerCount = 0;
+    bool touchesNearPlane = false;
+    nearDepth = 1.0;
+
+    [unroll]
+    for (uint i = 0; i < 8; i++)
     {
-        // Intersects near plane: bounds cover screen conservatively
+        float4 clip = mul(float4(corners[i], 1.0), viewProjMat);
+        if (clip.w <= 1e-5 || clip.z < 0.0)
+        {
+            touchesNearPlane = true;
+            continue;
+        }
+
+        float3 ndc = clip.xyz / clip.w;
+        ndcMin = min(ndcMin, ndc.xy);
+        ndcMax = max(ndcMax, ndc.xy);
+        nearDepth = min(nearDepth, saturate(ndc.z));
+        validCornerCount++;
+    }
+
+    if (touchesNearPlane || validCornerCount == 0)
+    {
         minUv = 0.0.xx;
         maxUv = 1.0.xx;
+        nearDepth = 0.0;
     }
     else
     {
-        float r = worldRadius;
-        float cx2 = viewPos.x * viewPos.x;
-        float cy2 = viewPos.y * viewPos.y;
-        float cz2 = viewPos.z * viewPos.z;
-        float r2 = r * r;
-
-        // X bounds — tangent lines from origin to circle (cx, cz) radius r
-        // When denominator ≤ 0, the silhouette extends past FOV edge in that
-        // direction → set the bound to ±large so it clamps to screen edge.
-        float dx = max(0.0, cx2 + cz2 - r2);
-        float tx = sqrt(dx);
-
-        float denom_minx = viewPos.z * tx + viewPos.x * r;
-        float denom_maxx = viewPos.z * tx - viewPos.x * r;
-        float minx = (denom_minx > 1e-6) ? (viewPos.x * tx - r * viewPos.z) / denom_minx : -1e6;
-        float maxx = (denom_maxx > 1e-6) ? (viewPos.x * tx + r * viewPos.z) / denom_maxx :  1e6;
-
-        // Y bounds — tangent lines from origin to circle (cy, cz) radius r
-        float dy = max(0.0, cy2 + cz2 - r2);
-        float ty = sqrt(dy);
-
-        float denom_miny = viewPos.z * ty + viewPos.y * r;
-        float denom_maxy = viewPos.z * ty - viewPos.y * r;
-        float miny = (denom_miny > 1e-6) ? (viewPos.y * ty - r * viewPos.z) / denom_miny : -1e6;
-        float maxy = (denom_maxy > 1e-6) ? (viewPos.y * ty + r * viewPos.z) / denom_maxy :  1e6;
-
-        // Convert to NDC and then UV
-        float2 minNdc = float2(minx * projP00, miny * projP11);
-        float2 maxNdc = float2(maxx * projP00, maxy * projP11);
-
-        float2 ndcMin = min(minNdc, maxNdc);
-        float2 ndcMax = max(minNdc, maxNdc);
-
         ndcMin = clamp(ndcMin, -1.0.xx, 1.0.xx);
         ndcMax = clamp(ndcMax, -1.0.xx, 1.0.xx);
-
-
-
-        // Convert NDC to UV (Y is flipped)
         float2 uv1 = ndcMin * float2(0.5, -0.5) + 0.5.xx;
         float2 uv2 = ndcMax * float2(0.5, -0.5) + 0.5.xx;
-
         minUv = saturate(min(uv1, uv2));
         maxUv = saturate(max(uv1, uv2));
-
-        if (any(isnan(minUv)) || any(isnan(maxUv)))
-        {
-            minUv = 0.0.xx;
-            maxUv = 1.0.xx;
-        }
     }
 
     float2 onePixel = float2(1.0 / Uniforms.ScreenWidth, 1.0 / Uniforms.ScreenHeight);
@@ -241,16 +322,72 @@ void BuildScreenBoundsAndNearDepth(
     uint maxMip = Uniforms.HiZMipCount > 0 ? Uniforms.HiZMipCount - 1 : 0;
     mipLevel = (uint)clamp((int)mipF, 0, (int)maxMip);
 
-    // Compute nearDepth by projecting the sphere point closest along the
-    // view Z axis.  The depth buffer is a function of view-space Z, so the
-    // point with minimum depth is at (center - camForward * radius), NOT
-    // at (center - normalize(center-eye) * radius).
-    float3 camForward = -float3(viewMat[0][2], viewMat[1][2], viewMat[2][2]);
-    float3 nearPoint = worldCenter - camForward * worldRadius;
-    float4 clipNear = mul(float4(nearPoint, 1.0), viewProjMat);
-    nearDepth = (clipNear.w > 1e-5)
-                    ? saturate(clipNear.z / clipNear.w)
-                    : 0.0;
+    if (any(isnan(minUv)) || any(isnan(maxUv)) || isnan(nearDepth))
+    {
+        minUv = 0.0.xx;
+        maxUv = 1.0.xx;
+        nearDepth = 0.0;
+        mipLevel = 0;
+    }
+}
+
+void BuildClusterAabbScreenBoundsAndNearDepth(
+    GPUCluster cluster,
+    GpuTransform transform,
+    bool usePrev,
+    float boundsExpansion,
+    out float2 minUv,
+    out float2 maxUv,
+    out float nearDepth,
+    out uint mipLevel,
+    out float3 debugWorldCenter,
+    out float debugWorldRadius)
+{
+    uint vertexCount = cluster.PackedCounts & 0xFF;
+    if (vertexCount == 0)
+    {
+        minUv = 0.0.xx;
+        maxUv = 1.0.xx;
+        nearDepth = 0.0;
+        mipLevel = 0;
+        debugWorldCenter = 0.0.xxx;
+        debugWorldRadius = 0.0;
+        return;
+    }
+
+    float3 localMin = cluster.BoundMin;
+    float3 localMax = cluster.BoundMax;
+
+    float3 localCorners[8];
+    localCorners[0] = float3(localMin.x, localMin.y, localMin.z);
+    localCorners[1] = float3(localMax.x, localMin.y, localMin.z);
+    localCorners[2] = float3(localMin.x, localMax.y, localMin.z);
+    localCorners[3] = float3(localMax.x, localMax.y, localMin.z);
+    localCorners[4] = float3(localMin.x, localMin.y, localMax.z);
+    localCorners[5] = float3(localMax.x, localMin.y, localMax.z);
+    localCorners[6] = float3(localMin.x, localMax.y, localMax.z);
+    localCorners[7] = float3(localMax.x, localMax.y, localMax.z);
+
+    float3 worldMin = 1e20.xxx;
+    float3 worldMax = -1e20.xxx;
+    [unroll]
+    for (uint cornerIdx = 0; cornerIdx < 8; cornerIdx++)
+    {
+        float3 worldPos = ApplyTransform(localCorners[cornerIdx], transform);
+        worldMin = min(worldMin, worldPos);
+        worldMax = max(worldMax, worldPos);
+    }
+
+    float expansion = max(0.0, boundsExpansion);
+    worldMin -= expansion.xxx;
+    worldMax += expansion.xxx;
+
+    debugWorldCenter = (worldMin + worldMax) * 0.5;
+    debugWorldRadius = length(worldMax - worldMin) * 0.5;
+
+    BuildWorldAabbScreenBoundsAndNearDepth(
+        worldMin, worldMax, usePrev,
+        minUv, maxUv, nearDepth, mipLevel);
 }
 
 float SampleHiZMax(float2 minUv, float2 maxUv, uint mipLevel)
@@ -284,42 +421,55 @@ float SampleHiZMax(float2 minUv, float2 maxUv, uint mipLevel)
     return max(max(d0, d1), max(d2, d3));
 }
 
-bool IsOccludedByHiZ(float3 worldCenter, float worldRadius, bool usePrev, out float2 minUv, out float2 maxUv)
+bool IsOccludedByHiZ(
+    uint pageOffset,
+    uint clusterID,
+    uint instanceID,
+    GPUCluster cluster,
+    GpuTransform transform,
+    float boundsExpansion,
+    bool usePrev,
+    out float2 minUv,
+    out float2 maxUv)
 {
     float nearDepth;
     uint mipLevel;
-    BuildScreenBoundsAndNearDepth(
-        worldCenter, worldRadius, usePrev, minUv, maxUv, nearDepth, mipLevel);
+    float3 debugWorldCenter;
+    float debugWorldRadius;
+    BuildClusterAabbScreenBoundsAndNearDepth(
+        cluster, transform, usePrev, boundsExpansion,
+        minUv, maxUv, nearDepth, mipLevel, debugWorldCenter, debugWorldRadius);
+
+    DebugCounterAdd(usePrev ? DEBUG_WORD_PHASE1_TESTED : DEBUG_WORD_PHASE2_TESTED);
+
+    float hizDepth = 0.0;
+    float epsilon = 5e-5 + 0.5 * max(Uniforms.HiZInvSize.x, Uniforms.HiZInvSize.y);
+    bool result = false;
+    uint flags = (usePrev ? DEBUG_SAMPLE_FLAG_USE_PREV : 0u)
+        | (boundsExpansion > 0.0 ? DEBUG_SAMPLE_FLAG_BOUNDS_EXPANDED : 0u)
+        | (minUv.x <= 0.0 && minUv.y <= 0.0 && maxUv.x >= 1.0 && maxUv.y >= 1.0
+            ? DEBUG_SAMPLE_FLAG_FULLSCREEN_BOUNDS
+            : 0u);
 
     if (Uniforms.HiZMipCount == 0)
-        return false;
-
-    float hizDepth = SampleHiZMax(minUv, maxUv, mipLevel);
-    float epsilon = 5e-5 + 0.5 * max(Uniforms.HiZInvSize.x, Uniforms.HiZInvSize.y);
-    bool result = nearDepth > (hizDepth + epsilon);
-
-    // Write debug data (DumpHiZData is set when dumping is requested)
-    if (Uniforms.DumpHiZData != 0)
     {
-        uint debugIdx;
-        DebugHiZOutput.InterlockedAdd(0, 1, debugIdx);
-        if (debugIdx < 4096)
-        {
-            uint base = 4 + debugIdx * 48;
-            DebugHiZOutput.Store(base + 0, asuint(minUv.x));
-            DebugHiZOutput.Store(base + 4, asuint(minUv.y));
-            DebugHiZOutput.Store(base + 8, asuint(maxUv.x));
-            DebugHiZOutput.Store(base + 12, asuint(maxUv.y));
-            DebugHiZOutput.Store(base + 16, asuint(nearDepth));
-            DebugHiZOutput.Store(base + 20, asuint(hizDepth));
-            DebugHiZOutput.Store(base + 24, mipLevel);
-            DebugHiZOutput.Store(base + 28, (result ? 1u : 0u) | (usePrev ? 2u : 0u));
-            DebugHiZOutput.Store(base + 32, asuint(worldCenter.x));
-            DebugHiZOutput.Store(base + 36, asuint(worldCenter.y));
-            DebugHiZOutput.Store(base + 40, asuint(worldCenter.z));
-            DebugHiZOutput.Store(base + 44, asuint(worldRadius));
-        }
+        DebugCounterAdd(DEBUG_WORD_HIZ_DISABLED);
+        DebugStoreHiZSample(
+            pageOffset, clusterID, instanceID, minUv, maxUv, nearDepth, hizDepth, mipLevel,
+            flags | DEBUG_SAMPLE_FLAG_HIZ_DISABLED,
+            debugWorldCenter, debugWorldRadius, boundsExpansion, epsilon);
+        return false;
     }
+
+    hizDepth = SampleHiZMax(minUv, maxUv, mipLevel);
+    result = nearDepth > (hizDepth + epsilon);
+    if (!result)
+        DebugCounterAdd(usePrev ? DEBUG_WORD_PHASE1_DEPTH_VISIBLE : DEBUG_WORD_PHASE2_DEPTH_VISIBLE);
+
+    DebugStoreHiZSample(
+        pageOffset, clusterID, instanceID, minUv, maxUv, nearDepth, hizDepth, mipLevel,
+        flags | (result ? DEBUG_SAMPLE_FLAG_OCCLUDED : 0u),
+        debugWorldCenter, debugWorldRadius, boundsExpansion, epsilon);
 
     return result;
 }
@@ -342,6 +492,11 @@ bool ShouldUseSWRaster(float2 minUv, float2 maxUv)
 
 void AppendVisible(uint pageOffset, uint clusterID, uint instanceID, bool isSW)
 {
+    uint totalIdx;
+    DrawArgs.InterlockedAdd(12, 1, totalIdx);
+    if (totalIdx >= Uniforms.MaxCandidates)
+        return;
+
     uint outIdx;
     if (isSW)
     {
@@ -372,21 +527,29 @@ void AppendPhase2Candidate(uint pageOffset, uint clusterID, uint instanceID)
 
 bool LoadAndFilterCandidate(
     uint threadId,
+    uint debugPhase,
     out uint pageOffset,
     out uint clusterID,
     out uint instanceID,
     out GPUCluster cluster,
-    out GpuTransform t)
+    out GpuTransform t,
+    out float boundsExpansion)
 {
     pageOffset = 0;
     clusterID = 0;
     instanceID = 0;
     cluster = (GPUCluster)0;
     t = (GpuTransform)0;
+    boundsExpansion = 0.0;
 
     uint count = CandidateCount[0];
     if (threadId >= count)
         return false;
+
+    if (debugPhase == 1)
+        DebugCounterAdd(DEBUG_WORD_PHASE1_INPUT);
+    else if (debugPhase == 2)
+        DebugCounterAdd(DEBUG_WORD_PHASE2_INPUT);
 
     uint3 candidate = CandidateClusters[threadId];
     pageOffset = candidate.x;
@@ -395,32 +558,18 @@ bool LoadAndFilterCandidate(
 
     cluster = LoadCluster(pageOffset, clusterID);
     t = Instances[instanceID];
+    boundsExpansion = max(0.0, LoadInstanceBoundsExpansionWorld(InstanceHeaders, instanceID));
 
-    return PassesLODFilter(cluster, t);
-}
+    bool passesLod = PassesLODFilter(cluster, t);
+    if (!passesLod)
+    {
+        if (debugPhase == 1)
+            DebugCounterAdd(DEBUG_WORD_PHASE1_LOD_REJECTED);
+        else if (debugPhase == 2)
+            DebugCounterAdd(DEBUG_WORD_PHASE2_LOD_REJECTED);
+    }
 
-[numthreads(64, 1, 1)]
-void main(uint3 dispatchThreadID: SV_DispatchThreadID)
-{
-    uint pageOffset;
-    uint clusterID;
-    uint instanceID;
-    GPUCluster cluster;
-    GpuTransform t;
-    if (!LoadAndFilterCandidate(dispatchThreadID.x, pageOffset, clusterID, instanceID, cluster, t))
-        return;
-    // Decode spatial bounds directly
-    float3 worldCenter = ApplyTransform(DecodeClusterCenter(cluster, Uniforms.QuantOrigin, Uniforms.QuantStep), t);
-    float maxScale = t.Scale * max(max(t.Stretch.x, t.Stretch.y), t.Stretch.z);
-    float worldRadius = DecodeClusterRadius(cluster, Uniforms.QuantStep) * maxScale;
-
-    float2 minUv, maxUv;
-    float nearDepth;
-    uint mipLevel;
-    BuildScreenBoundsAndNearDepth(worldCenter, worldRadius, false, minUv, maxUv, nearDepth, mipLevel);
-
-    bool isSW = ShouldUseSWRaster(minUv, maxUv);
-    AppendVisible(pageOffset, clusterID, instanceID, isSW);
+    return passesLod;
 }
 
 [numthreads(64, 1, 1)]
@@ -431,27 +580,27 @@ void main_phase1(uint3 dispatchThreadID: SV_DispatchThreadID)
     uint instanceID;
     GPUCluster cluster;
     GpuTransform t;
-    if (!LoadAndFilterCandidate(dispatchThreadID.x, pageOffset, clusterID, instanceID, cluster, t))
+    float boundsExpansion;
+    if (!LoadAndFilterCandidate(dispatchThreadID.x, 1, pageOffset, clusterID, instanceID, cluster, t, boundsExpansion))
         return;
 
     if (Uniforms.HasPrevHistory == 0)
     {
+        DebugCounterAdd(DEBUG_WORD_PHASE1_NO_HISTORY);
         AppendPhase2Candidate(pageOffset, clusterID, instanceID);
         return;
     }
 
-    float3 worldCenter = ApplyTransform(DecodeClusterCenter(cluster, Uniforms.QuantOrigin, Uniforms.QuantStep), t);
-    float maxScale = t.Scale * max(max(t.Stretch.x, t.Stretch.y), t.Stretch.z);
-    float worldRadius = DecodeClusterRadius(cluster, Uniforms.QuantStep) * maxScale;
-
     float2 minUv, maxUv;
-    bool occluded = IsOccludedByHiZ(worldCenter, worldRadius, true, minUv, maxUv);
+    bool occluded = IsOccludedByHiZ(pageOffset, clusterID, instanceID, cluster, t, boundsExpansion, true, minUv, maxUv);
     if (occluded)
     {
+        DebugCounterAdd(DEBUG_WORD_PHASE1_DEFERRED);
         AppendPhase2Candidate(pageOffset, clusterID, instanceID);
     }
     else
     {
+        DebugCounterAdd(DEBUG_WORD_PHASE1_DRAWN);
         bool isSW = ShouldUseSWRaster(minUv, maxUv);
         AppendVisible(pageOffset, clusterID, instanceID, isSW);
     }
@@ -464,6 +613,12 @@ void AppendVisiblePhase2(uint pageOffset, uint clusterID, uint instanceID, bool 
     CullDrawArgs phase1 = DrawArgs.Load<CullDrawArgs>(0);
     uint phase1SWCount = phase1.SWCount;
     uint phase1HWCount = phase1.HWCount;
+    uint phase1Count = phase1SWCount + phase1HWCount;
+
+    uint totalIdx;
+    Phase2DrawArgs.InterlockedAdd(12, 1, totalIdx);
+    if (phase1Count + totalIdx >= Uniforms.MaxCandidates)
+        return;
 
     if (isSW)
     {
@@ -491,18 +646,20 @@ void main_phase2(uint3 dispatchThreadID: SV_DispatchThreadID)
     uint instanceID;
     GPUCluster cluster;
     GpuTransform t;
-    if (!LoadAndFilterCandidate(dispatchThreadID.x, pageOffset, clusterID, instanceID, cluster, t))
+    float boundsExpansion;
+    if (!LoadAndFilterCandidate(dispatchThreadID.x, 2, pageOffset, clusterID, instanceID, cluster, t, boundsExpansion))
         return;
 
-    float3 worldCenter = ApplyTransform(DecodeClusterCenter(cluster, Uniforms.QuantOrigin, Uniforms.QuantStep), t);
-    float maxScale = t.Scale * max(max(t.Stretch.x, t.Stretch.y), t.Stretch.z);
-    float worldRadius = DecodeClusterRadius(cluster, Uniforms.QuantStep) * maxScale;
-
     float2 minUv, maxUv;
-    bool occluded = IsOccludedByHiZ(worldCenter, worldRadius, false, minUv, maxUv);
+    bool occluded = IsOccludedByHiZ(pageOffset, clusterID, instanceID, cluster, t, boundsExpansion, false, minUv, maxUv);
     if (!occluded)
     {
+        DebugCounterAdd(DEBUG_WORD_PHASE2_DRAWN);
         bool isSW = ShouldUseSWRaster(minUv, maxUv);
         AppendVisiblePhase2(pageOffset, clusterID, instanceID, isSW);
+    }
+    else
+    {
+        DebugCounterAdd(DEBUG_WORD_PHASE2_CULLED);
     }
 }

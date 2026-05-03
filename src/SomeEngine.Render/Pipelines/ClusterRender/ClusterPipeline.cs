@@ -2,7 +2,9 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using Diligent;
 using Friflo.Engine.ECS;
+using SomeEngine.Assets;
 using SomeEngine.Assets.Schema;
+using SomeEngine.Render.Frame;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.Materials;
 using SomeEngine.Render.RHI;
@@ -11,8 +13,7 @@ using SomeEngine.Render.Systems;
 namespace SomeEngine.Render.Pipelines;
 
 /// <summary>
-/// Level 2: 预设管线 — 组合 Level 1 Stage 实现常见渲染配置。
-/// 示例代码，演示如何用内置 Stage 组装管线。
+/// Level 2 preset pipeline that assembles cluster render stages.
 /// </summary>
 public class ClusterPipeline : IRenderFeature
 {
@@ -22,9 +23,13 @@ public class ClusterPipeline : IRenderFeature
     private readonly RenderContext _context;
     private readonly ClusterResourceManager _clusterMgr;
     private readonly InstanceDataManager _instanceMgr;
-    private readonly MaterialSystem _materialSystem;
+    private readonly RenderWorld? _renderWorld;
+    private readonly RenderWorldExtractor? _renderWorldExtractor;
+    private readonly ClusterMaterialSlotPreparer? _materialSlotPreparer;
     private readonly ClusterUploadStage _uploadStage;
     private readonly ClusterBVHTraversePass _bvhTraversePass;
+    private readonly ClusterHiZ.Resources _hizResources = new();
+    private readonly ClusterShade.Resources _shadeResources = new();
     private readonly ClusterStreamer _clusterStreamer;
     private readonly PingPongHandle _hizPingPong = new();
     private readonly GlobalPsoCache _psoCache;
@@ -35,10 +40,18 @@ public class ClusterPipeline : IRenderFeature
         _vertexEvalFieldIndex;
 
     internal ClusterDebugReadbackPass? _debugReadbackPass;
-    private ShadePSOGroup[] _shadePSOGroups = [];
-    private ShadePSOGroup[] _swRasterPSOGroups = [];
-    private ShadePSOGroup[] _deformPSOGroups = [];
+    private MaterialPSOGroup[] _MaterialPSOGroups = [];
+    private MaterialPSOGroup[] _swRasterPSOGroups = [];
+    private MaterialPSOGroup[] _hwDrawPSOGroups = [];
+    private MaterialPSOGroup[] _deformPSOGroups = [];
     private uint _lastBinSpaceVersion = uint.MaxValue;
+    private uint _lastPreparedRenderWorldVersion = uint.MaxValue;
+    private Entity[] _shadeFeatureEntities = [];
+    private int _shadeFeatureEntityCount;
+    private Entity[] _rasterFeatureEntities = [];
+    private int _rasterFeatureEntityCount;
+    private Entity[] _deformFeatureEntities = [];
+    private int _deformFeatureEntityCount;
     private HiZDebugMode _prevHiZMode = HiZDebugMode.Full2Phase;
 
     // ─── Configuration ───
@@ -53,6 +66,7 @@ public class ClusterPipeline : IRenderFeature
     public bool DebugShowHiZAABBs { get; set; }
     public bool IncludeTransparentPass { get; set; }
     public bool UseSWRaster { get; set; } = true;
+    public ulong DeformCacheByteCapacity { get; set; } = ClusterLimits.DefaultDeformCacheByteCapacity;
 
     private bool _useDeformCache = true;
     public bool UseDeformCache
@@ -114,8 +128,12 @@ public class ClusterPipeline : IRenderFeature
     // ─── Debug readback stats (1-frame latency) ───
     public uint DebugCandidateCount => _debugReadbackPass?.CandidateCount ?? 0;
     public uint DebugDrawVertexCount => _debugReadbackPass?.DrawVertexCount ?? 0;
+    public uint DebugDrawSWCount => _debugReadbackPass?.DrawSWCount ?? 0;
+    public uint DebugDrawHWCount => _debugReadbackPass?.DrawHWCount ?? 0;
     public uint DebugDrawInstanceCount => _debugReadbackPass?.DrawInstanceCount ?? 0;
     public uint DebugPhase2DrawVertexCount => _debugReadbackPass?.Phase2DrawVertexCount ?? 0;
+    public uint DebugPhase2DrawSWCount => _debugReadbackPass?.Phase2DrawSWCount ?? 0;
+    public uint DebugPhase2DrawHWCount => _debugReadbackPass?.Phase2DrawHWCount ?? 0;
     public uint DebugPhase2DrawInstanceCount => _debugReadbackPass?.Phase2DrawInstanceCount ?? 0;
     public uint DebugCandidateArgsX => _debugReadbackPass?.CandidateArgs[0] ?? 0;
     public uint DebugPhase2Count => _debugReadbackPass?.Phase2CandidateCount ?? 0;
@@ -143,16 +161,18 @@ public class ClusterPipeline : IRenderFeature
         RenderContext context,
         ClusterResourceManager clusterMgr,
         InstanceDataManager instanceMgr,
-        MaterialSystem materialSystem,
         GlobalPsoCache psoCache,
-        bool includeTransparent
+        bool includeTransparent,
+        RenderWorld? renderWorld = null
     )
     {
         Name = name;
         _context = context;
         _clusterMgr = clusterMgr;
         _instanceMgr = instanceMgr;
-        _materialSystem = materialSystem;
+        _renderWorld = renderWorld;
+        _renderWorldExtractor = renderWorld != null ? new RenderWorldExtractor(renderWorld) : null;
+        _materialSlotPreparer = renderWorld != null ? new ClusterMaterialSlotPreparer(_binSpace, renderWorld.Store, _instanceMgr) : null;
         _psoCache = psoCache;
         IncludeTransparentPass = includeTransparent;
         _clusterStreamer = new ClusterStreamer(clusterMgr);
@@ -173,19 +193,49 @@ public class ClusterPipeline : IRenderFeature
         RenderContext ctx,
         ClusterResourceManager cm,
         InstanceDataManager im,
-        MaterialSystem materialSystem,
-        GlobalPsoCache pc
-    ) => new("ClusterPipeline.Opaque", ctx, cm, im, materialSystem, pc, false);
+        GlobalPsoCache pc,
+        RenderWorld? renderWorld = null
+    ) => new("ClusterPipeline.Opaque", ctx, cm, im, pc, false, renderWorld);
 
     public static ClusterPipeline OpaqueAndTransparent(
         RenderContext ctx,
         ClusterResourceManager cm,
         InstanceDataManager im,
-        MaterialSystem materialSystem,
-        GlobalPsoCache pc
-    ) => new("ClusterPipeline.OpaqueAndTransparent", ctx, cm, im, materialSystem, pc, true);
+        GlobalPsoCache pc,
+        RenderWorld? renderWorld = null
+    ) => new("ClusterPipeline.OpaqueAndTransparent", ctx, cm, im, pc, true, renderWorld);
 
     // ─── Public API ───
+
+    public void PrepareFrame(EntityStore sourceStore, Func<AssetGuid, Material?> materialResolver)
+    {
+        if (_renderWorldExtractor == null || _materialSlotPreparer == null)
+            throw new InvalidOperationException("ClusterPipeline requires RenderWorld-backed prepare path.");
+
+        _renderWorldExtractor.Rebuild(sourceStore, materialResolver);
+        bool renderWorldChanged = _lastPreparedRenderWorldVersion != _renderWorldExtractor.Version;
+        if (renderWorldChanged)
+        {
+            GatherFeatureEntities();
+            _lastPreparedRenderWorldVersion = _renderWorldExtractor.Version;
+        }
+
+        bool slotsChanged = _materialSlotPreparer.Prepare(
+            _rasterBinFieldIndex,
+            _shadingBinFieldIndex,
+            _vertexEvalFieldIndex,
+            _renderWorldExtractor.Version);
+        if (slotsChanged)
+        {
+            _binSpace.MarkDirty();
+        }
+
+        _binSpace.RebuildIfDirty();
+        if (_binSpace.Version != _lastBinSpaceVersion)
+        {
+            RebuildPSOGroups();
+        }
+    }
 
     public void SetCamera(
         in Matrix4x4 view,
@@ -222,52 +272,33 @@ public class ClusterPipeline : IRenderFeature
         else
             _vertexEvalFieldIndex = -1;
 
-        _binSpace.RegisterGroup(
-            _rasterBinFieldIndex,
-            new BinQueue.BinGroup
-            {
-                Query = QueryRasterEntities,
-                OrderKey = static _ => 0,
-                SignatureFunc = entity => MaterialEntityUtility.ComputeMaterialSignature(entity, SelectRasterVariant(entity)),
-            });
-
-        _binSpace.RegisterGroup(
-            _shadingBinFieldIndex,
-            new BinQueue.BinGroup
-            {
-                Query = QueryPrimaryShadeEntities,
-                OrderKey = static _ => 0,
-                SignatureFunc = entity => MaterialEntityUtility.ComputeMaterialSignature(entity, SelectShadeVariant(entity)),
-            });
-
-        _binSpace.RegisterGroup(
-            _shadingBinFieldIndex,
-            new BinQueue.BinGroup
-            {
-                Query = QueryOverlayShadeEntities,
-                OrderKey = entity => entity.GetComponent<OverlayShade>().Layer + 1,
-                SignatureFunc = entity => MaterialEntityUtility.ComputeMaterialSignature(entity, SelectShadeVariant(entity)),
-            });
-
-        _binSpace.RegisterGroup(
-            _shadingBinFieldIndex,
-            new BinQueue.BinGroup
-            {
-                Query = QueryMaskedShadeEntities,
-                OrderKey = static _ => 10000,
-                SignatureFunc = entity => MaterialEntityUtility.ComputeMaterialSignature(entity, SelectShadeVariant(entity)),
-            });
-
-        if (UseDeformCache)
+        _binSpace.RegisterGroup(_rasterBinFieldIndex, new BinQueue.BinGroup
         {
-            _binSpace.RegisterGroup(
-                _vertexEvalFieldIndex,
-                new BinQueue.BinGroup
-                {
-                    Query = QueryDeformEntities,
-                    OrderKey = static _ => 0,
-                    SignatureFunc = entity => MaterialEntityUtility.ComputeMaterialSignature(entity, SelectDeformVariant(entity)),
-                });
+            Query = () => _rasterFeatureEntities.AsSpan(0, _rasterFeatureEntityCount),
+            OrderKey = static _ => 0,
+            SignatureFunc = ComputeRasterDispatchSignature,
+        });
+        _binSpace.RegisterGroup(_shadingBinFieldIndex, new BinQueue.BinGroup
+        {
+            Query = () => _shadeFeatureEntities.AsSpan(0, _shadeFeatureEntityCount),
+            OrderKey = static entity => entity.TryGetComponent<OverlayShade>(out OverlayShade overlay)
+                ? 1 + overlay.Layer
+                : 0,
+            SignatureFunc = static entity => ComputeMaterialDispatchSignature(
+                entity,
+                entity.GetComponent<ClusterShadeComponent>().Default),
+        });
+
+        if (_vertexEvalFieldIndex >= 0)
+        {
+            _binSpace.RegisterGroup(_vertexEvalFieldIndex, new BinQueue.BinGroup
+            {
+                Query = () => _deformFeatureEntities.AsSpan(0, _deformFeatureEntityCount),
+                OrderKey = static _ => 0,
+                SignatureFunc = static entity => ComputeMaterialDispatchSignature(
+                    entity,
+                    entity.GetComponent<ClusterDeform>().Default),
+            });
         }
 
         _binSpace.FreezeLayout();
@@ -279,63 +310,91 @@ public class ClusterPipeline : IRenderFeature
     {
         _lastBinSpaceVersion = _binSpace.Version;
 
-        // Shade PSO groups (per-material with Sig1/SRB)
-        _shadePSOGroups = ClusterShade.BuildPSOGroups(
+        DisposePSOGroups(_MaterialPSOGroups);
+        DisposePSOGroups(_swRasterPSOGroups);
+        DisposePSOGroups(_hwDrawPSOGroups);
+        DisposePSOGroups(_deformPSOGroups);
+
+        _MaterialPSOGroups = ClusterShade.BuildPSOGroups(
             _binSpace,
             _shadingBinFieldIndex,
             _psoCache,
-            _context
-        );
+            _context);
 
-        // SW Raster PSO groups (from raster bin field)
         _swRasterPSOGroups = RasterPSOBuilder.BuildComputePSOGroups(
             _binSpace,
             _rasterBinFieldIndex,
             _psoCache,
             _context,
             "SWRaster",
-            SelectRasterVariant
-        );
+            SelectSWRasterVariant);
 
-        // Deform PSO groups (from vertex eval bin field)
-        if (UseDeformCache && _vertexEvalFieldIndex >= 0)
-        {
-            _deformPSOGroups = RasterPSOBuilder.BuildComputePSOGroups(
+        _hwDrawPSOGroups = RasterPSOBuilder.BuildGraphicsPSOGroups(
+            _binSpace,
+            _rasterBinFieldIndex,
+            _psoCache,
+            _context,
+            "HWClusterDraw",
+            SelectHWVSVariant,
+            SelectHWPSVariant,
+            useVisBuffer: true,
+            depthWrite: true);
+
+        _deformPSOGroups = _vertexEvalFieldIndex >= 0
+            ? RasterPSOBuilder.BuildComputePSOGroups(
                 _binSpace,
                 _vertexEvalFieldIndex,
                 _psoCache,
                 _context,
-                "Deform",
-                SelectDeformVariant
-            );
-        }
-        else
-        {
-            _deformPSOGroups = [];
-        }
+                "ClusterDeform",
+                static entity => entity.GetComponent<ClusterDeform>().Default)
+            : [];
+    }
+
+    private static void DisposePSOGroups(MaterialPSOGroup[] groups)
+    {
+        foreach (var group in groups)
+            group.Dispose();
     }
 
     // ─── Main pipeline assembly ───
 
     public void AddPasses(RenderGraph graph)
     {
+        AddPasses(graph, null);
+    }
+
+    public void AddPasses(RenderGraph graph, FrameTargetRegistry? frameTargets)
+    {
         _clusterStreamer.Update();
 
-        var colorTarget = graph.GetResourceHandle("ColorTarget");
-        var depthTarget = graph.GetResourceHandle("DepthTarget");
         var camera = _freezeCullingCamera ? _frozenCamera : _camera;
+        if (frameTargets != null && !frameTargets.TryGetDeclaration(StandardFrameTargets.HiZ, out _))
+        {
+            frameTargets.DeclareTexture(
+                StandardFrameTargets.HiZ,
+                _ => ClusterHiZ.CreateHiZTextureDesc(camera),
+                FrameTargetLifetime.History,
+                ResourceState.Unknown,
+                "HiZ"
+            );
+        }
+
+        var colorTarget = frameTargets?.ResolveTexture(StandardFrameTargets.SceneColor)
+            ?? ResolveGraphTarget(graph, "SceneColor", "ColorTarget");
+        var depthTarget = frameTargets?.ResolveTexture(StandardFrameTargets.SceneDepth)
+            ?? ResolveGraphTarget(graph, "SceneDepth", "DepthTarget");
 
         // Reset HiZ history on mode change
         if (HiZMode != _prevHiZMode)
         {
-            _hizPingPong.Reset();
+            if (frameTargets != null)
+                frameTargets.Invalidate(StandardFrameTargets.HiZ);
+            else
+                _hizPingPong.Reset();
             _prevHiZMode = HiZMode;
         }
 
-        // Prepare
-        _binSpace.RebuildIfDirty();
-        if (_binSpace.Version != _lastBinSpaceVersion)
-            RebuildPSOGroups();
         var globals = _uploadStage.AddPasses(graph);
         LastGlobalResources = globals;
 
@@ -361,6 +420,7 @@ public class ClusterPipeline : IRenderFeature
             graph,
             _context,
             _bvhTraversePass,
+            _hizResources.Cull,
             _clusterMgr,
             _instanceMgr,
             globals,
@@ -375,6 +435,7 @@ public class ClusterPipeline : IRenderFeature
         var hizResult = ClusterHiZ.Add2PhasePipeline(
             graph,
             _context,
+            _hizResources,
             traverseOut,
             globals,
             camera,
@@ -395,12 +456,15 @@ public class ClusterPipeline : IRenderFeature
                 DumpNextFrame = DumpNextFrame,
                 UseSWRaster = UseSWRaster,
                 UseDeformCache = UseDeformCache,
+                DeformCacheByteCapacity = DeformCacheByteCapacity,
                 QuantStep = _clusterMgr.QuantStep,
                 QuantOrigin = _clusterMgr.QuantOrigin,
             },
             (uint)_instanceMgr.Count,
             deformPSOGroups: _deformPSOGroups,
-            swRasterPSOGroups: _swRasterPSOGroups
+            swRasterPSOGroups: _swRasterPSOGroups,
+            hwDrawPSOGroups: _hwDrawPSOGroups,
+            frameTargets: frameTargets
         );
         LastCullOutput = hizResult.Cull;
         LastOpaqueRasterOutput = hizResult.Raster;
@@ -413,17 +477,18 @@ public class ClusterPipeline : IRenderFeature
             var (shadeBinOut, shadeOut) = ClusterShade.AddPasses(
                 graph,
                 _context,
+                _shadeResources,
                 LastOpaqueRasterOutput,
                 hizResult.Cull,
                 globals,
                 hDrawUB,
                 hMaterialSlots,
-                _shadePSOGroups,
+                _MaterialPSOGroups,
                 colorTarget,
                 depthTarget,
                 _binSpace,
                 _shadingBinFieldIndex,
-                CountMaterialEntities(),
+                (uint)_shadeFeatureEntityCount,
                 _camera.View,
                 _camera.Proj,
                 camPos,
@@ -443,7 +508,7 @@ public class ClusterPipeline : IRenderFeature
         // Debug readback
         if (_debugReadbackPass != null)
         {
-            _debugReadbackPass.AddPasses(graph, traverseOut, hizResult.Cull);
+            _debugReadbackPass.AddPasses(graph, traverseOut, hizResult.Cull, DumpNextFrame);
             _lastDebugHiZData = _debugReadbackPass.DebugHiZData;
         }
 
@@ -459,61 +524,74 @@ public class ClusterPipeline : IRenderFeature
 
     public void Dispose()
     {
+        DisposePSOGroups(_MaterialPSOGroups);
+        DisposePSOGroups(_swRasterPSOGroups);
+        DisposePSOGroups(_hwDrawPSOGroups);
+        DisposePSOGroups(_deformPSOGroups);
+        _hizResources.Dispose();
+        _shadeResources.Dispose();
         _uploadStage.Dispose();
         _bvhTraversePass.Dispose();
         _binSpace.Dispose();
     }
 
-    private Entity[] QueryRasterEntities()
+    private void GatherFeatureEntities()
     {
-        return ToEntityArray(_materialSystem.Store.Query<ClusterRaster>().ToEntityList());
-    }
-
-    private Entity[] QueryPrimaryShadeEntities()
-    {
-        return ToEntityArray(
-            _materialSystem.Store
-                .Query<ClusterShadeComponent>()
-                .AllTags(Tags.Get<Opaque>())
-                .WithoutAllComponents(ComponentTypes.Get<OverlayShade>())
-                .ToEntityList());
-    }
-
-    private Entity[] QueryOverlayShadeEntities()
-    {
-        return ToEntityArray(_materialSystem.Store.Query<ClusterShadeComponent, OverlayShade>().ToEntityList());
-    }
-
-    private Entity[] QueryMaskedShadeEntities()
-    {
-        return ToEntityArray(
-            _materialSystem.Store
-                .Query<ClusterShadeComponent>()
-                .AllTags(Tags.Get<Masked>())
-                .WithoutAllComponents(ComponentTypes.Get<OverlayShade>())
-                .ToEntityList());
-    }
-
-    private Entity[] QueryDeformEntities()
-    {
-        return ToEntityArray(_materialSystem.Store.Query<ClusterDeform>().ToEntityList());
-    }
-
-    private uint CountMaterialEntities()
-    {
-        uint count = 0;
-        foreach (var _ in _materialSystem.Store.Query<MaterialRef>().ToEntityList())
+        if (_renderWorld == null)
         {
-            count++;
+            _shadeFeatureEntityCount = 0;
+            _rasterFeatureEntityCount = 0;
+            _deformFeatureEntityCount = 0;
+            return;
         }
 
-        return count;
+        int shadeCount = 0;
+        int rasterCount = 0;
+        int deformCount = 0;
+
+        foreach (Entity entity in _renderWorld.Store.Entities)
+        {
+            if (entity.TryGetComponent<ClusterShadeComponent>(out ClusterShadeComponent shade)
+                && !shade.Default.IsEmpty)
+            {
+                EnsureEntityCapacity(ref _shadeFeatureEntities, shadeCount + 1);
+                _shadeFeatureEntities[shadeCount++] = entity;
+            }
+
+            if (entity.TryGetComponent<ClusterRaster>(out _)
+                && HasRasterVariant(entity))
+            {
+                EnsureEntityCapacity(ref _rasterFeatureEntities, rasterCount + 1);
+                _rasterFeatureEntities[rasterCount++] = entity;
+            }
+
+            if (_vertexEvalFieldIndex >= 0
+                && entity.TryGetComponent<ClusterDeform>(out ClusterDeform deform)
+                && !deform.Default.IsEmpty)
+            {
+                EnsureEntityCapacity(ref _deformFeatureEntities, deformCount + 1);
+                _deformFeatureEntities[deformCount++] = entity;
+            }
+        }
+
+        _shadeFeatureEntityCount = shadeCount;
+        _rasterFeatureEntityCount = rasterCount;
+        _deformFeatureEntityCount = deformCount;
     }
 
-    private ShaderVariantRef SelectRasterVariant(Entity entity)
+    private static RenderGraphHandle ResolveGraphTarget(
+        RenderGraph graph,
+        string primaryName,
+        string legacyName)
     {
-        var raster = entity.GetComponent<ClusterRaster>();
-        if (UseDeformCache && !raster.SWCached.IsEmpty)
+        var handle = graph.GetResourceHandle(primaryName);
+        return handle.IsValid ? handle : graph.GetResourceHandle(legacyName);
+    }
+
+    private ShaderVariantRef SelectSWRasterVariant(Entity entity)
+    {
+        ClusterRaster raster = entity.GetComponent<ClusterRaster>();
+        if (_useDeformCache && !raster.SWCached.IsEmpty)
         {
             return raster.SWCached;
         }
@@ -526,25 +604,128 @@ public class ClusterPipeline : IRenderFeature
         return raster.SWCached;
     }
 
-    private static ShaderVariantRef SelectShadeVariant(Entity entity)
+    private bool HasRasterVariant(Entity entity)
     {
-        return entity.GetComponent<ClusterShadeComponent>().Default;
+        ShaderVariantRef sw = SelectSWRasterVariant(entity);
+        ShaderVariantRef hwVS = SelectHWVSVariant(entity);
+        ShaderVariantRef hwPS = SelectHWPSVariant(entity);
+        return !sw.IsEmpty || (!hwVS.IsEmpty && !hwPS.IsEmpty);
     }
 
-    private static ShaderVariantRef SelectDeformVariant(Entity entity)
+    private ShaderVariantRef SelectHWVSVariant(Entity entity)
     {
-        return entity.GetComponent<ClusterDeform>().Default;
-    }
-
-    private static Entity[] ToEntityArray(EntityList entityList)
-    {
-        var entities = new Entity[entityList.Count];
-        int index = 0;
-        foreach (var entity in entityList)
+        ClusterRaster raster = entity.GetComponent<ClusterRaster>();
+        if (_useDeformCache && !raster.HWVSCached.IsEmpty)
         {
-            entities[index++] = entity;
+            return raster.HWVSCached;
         }
 
-        return entities;
+        if (!raster.HWVSInline.IsEmpty)
+        {
+            return raster.HWVSInline;
+        }
+
+        return raster.HWVSCached;
     }
+
+    private static ShaderVariantRef SelectHWPSVariant(Entity entity)
+        => entity.GetComponent<ClusterRaster>().HWPS;
+
+    private ulong ComputeRasterDispatchSignature(Entity entity)
+    {
+        ulong hash = 14695981039346656037UL;
+        hash = HashValue(hash, ComputeMaterialDispatchSignature(entity, SelectSWRasterVariant(entity)));
+        hash = HashValue(hash, ComputeMaterialDispatchSignature(entity, SelectHWVSVariant(entity)));
+        hash = HashValue(hash, ComputeMaterialDispatchSignature(entity, SelectHWPSVariant(entity)));
+        return hash;
+    }
+
+    private static ulong ComputeMaterialDispatchSignature(Entity entity, ShaderVariantRef variantRef)
+    {
+        ulong hash = 14695981039346656037UL;
+        hash = HashString(hash, variantRef.Shader?.AssetGuid);
+        hash = HashString(hash, variantRef.EntryPoint);
+
+        if (entity.TryGetComponent<MaterialRef>(out MaterialRef materialRef)
+            && materialRef.Owner != null)
+        {
+            ulong paramSignature = materialRef.Owner.Params.GetFilteredSignatureHash(
+                EnumerateShaderBindingNames(variantRef.Shader),
+                includeScalars: true);
+            hash = HashValue(hash, paramSignature);
+        }
+
+        return hash;
+    }
+
+    private static IEnumerable<string> EnumerateShaderBindingNames(ShaderAsset? shader)
+    {
+        if (shader?.Metadata?.MaterialBindings is { Count: > 0 } materialBindings)
+        {
+            foreach (var binding in materialBindings)
+            {
+                if (!string.IsNullOrWhiteSpace(binding.Name))
+                {
+                    yield return binding.Name;
+                }
+            }
+
+            yield break;
+        }
+
+        if (shader?.Reflections == null)
+        {
+            yield break;
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var backendReflection in shader.Reflections)
+        {
+            if (backendReflection.Reflection?.Resources == null)
+            {
+                continue;
+            }
+
+            foreach (var resource in backendReflection.Reflection.Resources)
+            {
+                if (!string.IsNullOrWhiteSpace(resource.Name) && seen.Add(resource.Name))
+                {
+                    yield return resource.Name;
+                }
+            }
+        }
+    }
+
+    private static ulong HashString(ulong hash, string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return HashValue(hash, 0UL);
+        }
+
+        foreach (char c in value)
+        {
+            hash ^= c;
+            hash *= 1099511628211UL;
+        }
+
+        return hash;
+    }
+
+    private static ulong HashValue<T>(ulong hash, T value)
+    {
+        int valueHash = value is null ? 0 : EqualityComparer<T>.Default.GetHashCode(value);
+        hash ^= unchecked((ulong)valueHash);
+        hash *= 1099511628211UL;
+        return hash;
+    }
+
+    private static void EnsureEntityCapacity(ref Entity[] entities, int count)
+    {
+        if (entities.Length < count)
+        {
+            Array.Resize(ref entities, Math.Max(count, entities.Length == 0 ? 16 : entities.Length * 2));
+        }
+    }
+
 }

@@ -146,7 +146,7 @@ public class ClusterBuilderTests
     }
 
     [Fact]
-    public void ProcessRaw_WritesDefaultMaterialGuids_WhenResolverProvided()
+    public void ProcessRaw_WritesMeshRegions_FromSourceSlots()
     {
         var positions = new Vector3[]
         {
@@ -156,20 +156,17 @@ public class ClusterBuilderTests
         };
         var indices = new uint[] { 0, 1, 2 };
         var materialGuid = SomeEngine.Assets.AssetGuid.New();
+        var materialSlot = new MeshMaterialSlot(materialGuid);
 
         var asset = ClusterBuilder.ProcessRaw(
             positions,
             new List<RawAttribute>(),
             indices,
-            new List<string> { "MatA" },
-            "GuidMesh",
-            name => name == "MatA" ? materialGuid : SomeEngine.Assets.AssetGuid.Empty);
+            new List<MeshMaterialSlot> { materialSlot },
+            "GuidMesh");
 
-        Assert.NotNull(asset.DefaultMaterialGuids);
-        Assert.Single(asset.DefaultMaterialGuids);
-        Assert.Equal(materialGuid.ToFlatString(), asset.DefaultMaterialGuids[0]);
-        Assert.NotNull(asset.DefaultMaterialSlots);
-        Assert.Single(asset.DefaultMaterialSlots);
-        Assert.Equal("MatA", asset.DefaultMaterialSlots[0]);
+        Assert.NotNull(asset.Regions);
+        Assert.Single(asset.Regions);
+        Assert.Equal("region_0", asset.Regions[0].Name);
     }
 }

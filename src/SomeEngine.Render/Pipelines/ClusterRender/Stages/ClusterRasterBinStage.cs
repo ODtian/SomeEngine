@@ -9,7 +9,7 @@ namespace SomeEngine.Render.Pipelines;
 /// 无状态 Raster Binning 工具函数。
 /// PSO/SRB 在 ClusterBinningPSOs 中 static 缓存。
 /// </summary>
-public static class ClusterRasterBin
+internal static partial class ClusterRasterBin
 {
     /// <summary>
     /// 添加 Raster Binning pass（Init + Scatter），返回 binned 结果。
@@ -17,6 +17,7 @@ public static class ClusterRasterBin
     public static ClusterRasterBinOutput AddPasses(
         RenderGraph graph,
         RenderContext context,
+        Resources resources,
         in ClusterCullOutput cull,
         RenderGraphHandle hInstanceHeaders,
         RenderGraphHandle hDrawArgs,
@@ -29,7 +30,7 @@ public static class ClusterRasterBin
         string? tag = null
     )
     {
-        ClusterBinningPSOs.EnsureInitialized(context);
+        resources.EnsureInitialized(context);
 
         string prefix = tag != null ? $"{tag}_" : "";
 
@@ -44,7 +45,7 @@ public static class ClusterRasterBin
         });
         var hBinnedClusterIndex = graph.CreateBuffer($"{prefix}BinnedClusterIndexBuffer", new BufferDesc
         {
-            Size = (ulong)(ClusterLimits.MaxDraws * 8 * 6), // uint2 per entry, ~6 entries per cluster (per-batch)
+            Size = ClusterLimits.MaxDraws * ClusterLimits.MaxBinnedEntriesPerCluster * 8UL,
             BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
             Mode = BufferMode.Structured,
             ElementByteStride = 8,
@@ -59,7 +60,7 @@ public static class ClusterRasterBin
         var hBinnedHWDrawArgs = graph.CreateBuffer($"{prefix}BinnedHWDrawArgs", new BufferDesc
         {
             Size = maxBins * 16,
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
             Mode = BufferMode.Raw,
             ElementByteStride = 4,
         });
@@ -75,6 +76,13 @@ public static class ClusterRasterBin
             Size = maxBins * 24, // Two sections: [0..maxBins*12) = SW, [maxBins*12..maxBins*24) = HW
             BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
             Mode = BufferMode.Raw,
+            ElementByteStride = 4,
+        });
+        var hReserveCounters = graph.CreateBuffer($"{prefix}RasterBinReserveCounters", new BufferDesc
+        {
+            Size = 8,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+            Mode = BufferMode.Structured,
             ElementByteStride = 4,
         });
 
@@ -111,16 +119,17 @@ public static class ClusterRasterBin
             }
         );
 
-        graph.AddPass(new ClusterBinningInitPass(context)
+        graph.AddPass(new ClusterBinningInitPass(context, resources)
         {
             HBinningUniforms = hBinningUniforms,
             HDrawArgs = hDrawArgs,
             HBinningDispatchArgs = hBinningDispatchArgs,
             HRasterBinMeta = hRasterBinMeta,
             MaxBins = maxBins,
+            HReserveCounters = hReserveCounters,
         });
 
-        graph.AddPass(new ClusterBinningCountPass(context)
+        graph.AddPass(new ClusterBinningCountPass(context, resources)
         {
             HBinningUniforms = hBinningUniforms,
             HVisibleClusters = cull.VisibleClusters,
@@ -133,16 +142,18 @@ public static class ClusterRasterBin
             HPageHeap = hPageHeap,
         });
 
-        graph.AddPass(new ClusterBinningReservePass(context)
+        graph.AddPass(new ClusterBinningReservePass(context, resources)
         {
             HBinningUniforms = hBinningUniforms,
             HRasterBinMeta = hRasterBinMeta,
             HBinnedDrawArgs = hBinnedDrawArgs,
             HBinnedHWDrawArgs = hBinnedHWDrawArgs,
             HBinnedSWDispatchArgs = hBinnedSWDispatchArgs,
+            HReserveCounters = hReserveCounters,
+            MaxBins = maxBins,
         });
 
-        graph.AddPass(new ClusterBinningScatterPass(context)
+        graph.AddPass(new ClusterBinningScatterPass(context, resources)
         {
             HBinningUniforms = hBinningUniforms,
             HVisibleClusters = cull.VisibleClusters,

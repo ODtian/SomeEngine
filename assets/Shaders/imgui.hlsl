@@ -21,6 +21,7 @@ cbuffer UniformBuffer
 Texture2D g_Texture;
 SamplerState g_Texture_sampler;
 
+[shader("vertex")]
 PSInput VSMain(VSInput input)
 {
     PSInput output;
@@ -41,6 +42,7 @@ float3 Heatmap(float t)
     return c;
 }
 
+[shader("pixel")]
 float4 PSMain(PSInput input) : SV_TARGET
 {
     float4 texCol = g_Texture.Sample(g_Texture_sampler, input.uv);

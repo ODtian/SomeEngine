@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using Diligent;
 using ImGuiNET;
 using SomeEngine.Assets.Importers;
+using SomeEngine.Assets.Schema;
 using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Utils;
@@ -19,6 +20,7 @@ public class ImGuiRenderer : IDisposable
     private IBuffer? _uniformBuffer;
     private IPipelineState? _pso;
     private IShaderResourceBinding? _srb;
+    private ShaderAsset? _shaderAsset;
     private ITexture? _fontTexture;
     public ITexture? FontTexture => _fontTexture;
     private ITextureView? _fontTextureView;
@@ -143,55 +145,22 @@ public class ImGuiRenderer : IDisposable
             "../../../../../../assets/Shaders/imgui.hlsl"
         );
 
-        // Use standard Diligent HLSL shader creation
-        using var shaderSourceFactory = _context.Factory?.CreateDefaultShaderSourceStreamFactory(
-            "assets/Shaders"
-        );
-        var shaderCI = new ShaderCreateInfo
-        {
-            SourceLanguage = ShaderSourceLanguage.Hlsl,
-            ShaderCompiler = ShaderCompiler.Dxc,
-            FilePath = shaderPath,
-            ShaderSourceStreamFactory = shaderSourceFactory,
-        };
-
-        shaderCI.Desc.Name = "ImGui VS";
-        shaderCI.Desc.ShaderType = ShaderType.Vertex;
-        shaderCI.EntryPoint = "VSMain";
-        using var vs = device.CreateShader(shaderCI, out _);
-
-        shaderCI.Desc.Name = "ImGui PS";
-        shaderCI.Desc.ShaderType = ShaderType.Pixel;
-        shaderCI.EntryPoint = "PSMain";
-        using var ps = device.CreateShader(shaderCI, out _);
+        _shaderAsset = SlangShaderImporter.Import(shaderPath);
+        var vs = _shaderAsset.CreateShader(_context, "VSMain");
+        var ps = _shaderAsset.CreateShader(_context, "PSMain");
 
         GraphicsPipelineStateCreateInfo psoCI = new GraphicsPipelineStateCreateInfo();
         psoCI.PSODesc.Name = "ImGui PSO";
         psoCI.PSODesc.ResourceLayout.DefaultVariableType = ShaderResourceVariableType.Mutable;
 
-        // Use standard Diligent variable description instead of
-        // shaderAsset.GetResourceVariables
-        psoCI.PSODesc.ResourceLayout.Variables =
-        [
-            new ShaderResourceVariableDesc
+        psoCI.PSODesc.ResourceLayout.Variables = _shaderAsset.GetResourceVariables(
+            _context,
+            static name => name switch
             {
-                Name = "UniformBuffer",
-                ShaderStages = ShaderType.Vertex,
-                Type = ShaderResourceVariableType.Static,
-            },
-            new ShaderResourceVariableDesc
-            {
-                Name = "g_Texture",
-                ShaderStages = ShaderType.Pixel,
-                Type = ShaderResourceVariableType.Mutable,
-            },
-            new ShaderResourceVariableDesc
-            {
-                Name = "g_Texture_sampler",
-                ShaderStages = ShaderType.Pixel,
-                Type = ShaderResourceVariableType.Mutable,
-            },
-        ];
+                "UniformBuffer" => ShaderResourceVariableType.Static,
+                "g_Texture" or "g_Texture_sampler" => ShaderResourceVariableType.Mutable,
+                _ => null,
+            });
 
         psoCI.GraphicsPipeline.NumRenderTargets = 1;
         psoCI.GraphicsPipeline.RTVFormats = [_context.SwapChain!.GetDesc().ColorBufferFormat];
@@ -250,14 +219,13 @@ public class ImGuiRenderer : IDisposable
                     + "CreateGraphicsPipelineState returned null."
             );
 
-        _pso.GetStaticVariableByName(ShaderType.Vertex, "UniformBuffer")
+        _pso.GetStaticVariableByReflectedBinding(_context, _shaderAsset, ShaderType.Vertex, "UniformBuffer")
             ?.Set(_uniformBuffer, SetShaderResourceFlags.None);
         _srb = _pso.CreateShaderResourceBinding(true);
 
-        // Name-based binding
-        _srb.GetVariableByName(ShaderType.Pixel, "g_Texture")
+        _srb.GetVariableByReflectedBinding(_context, _shaderAsset, ShaderType.Pixel, "g_Texture")
             ?.Set(_fontTextureView, SetShaderResourceFlags.None);
-        _srb.GetVariableByName(ShaderType.Pixel, "g_Texture_sampler")
+        _srb.GetVariableByReflectedBinding(_context, _shaderAsset, ShaderType.Pixel, "g_Texture_sampler")
             ?.Set(_sampler, SetShaderResourceFlags.None);
     }
 
@@ -271,9 +239,9 @@ public class ImGuiRenderer : IDisposable
             return IntPtr.Zero;
 
         var srb = _pso.CreateShaderResourceBinding(true);
-        srb.GetVariableByName(ShaderType.Pixel, "g_Texture")
+        srb.GetVariableByReflectedBinding(_context, _shaderAsset, ShaderType.Pixel, "g_Texture")
             ?.Set(textureView, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Pixel, "g_Texture_sampler")
+        srb.GetVariableByReflectedBinding(_context, _shaderAsset, ShaderType.Pixel, "g_Texture_sampler")
             ?.Set(_pointSampler, SetShaderResourceFlags.None);
 
         var id = (IntPtr)_nextTextureId++;

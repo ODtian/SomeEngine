@@ -8,14 +8,25 @@ namespace SomeEngine.Render.Pipelines;
 /// 一组共享同一 PSO 的 shade bins。Feature 持有，rebuild 时构建。
 /// BinQueue 保证同 ShaderAsset 的 bin 在 region 内连续，所以用 BinStart + BinCount。
 /// </summary>
-public struct ShadePSOGroup
+public sealed class MaterialPSOGroup : IDisposable
 {
-    public IPipelineState PSO;
-    public IShaderResourceBinding[] SRBs;
-    public Entity[] Entities;
-    public int[] ArgsBins;
+    public IPipelineState? PSO;
+    /// <summary>Per-layout SRB (Dynamic variables, shared across all bins in this group).</summary>
+    public IShaderResourceBinding? SRB;
+    public ShaderVariantRef ComputeVariant;
+    public ShaderVariantRef VertexVariant;
+    public ShaderVariantRef PixelVariant;
+    public Entity[] Entities = [];
+    public int[] ArgsBins = [];
     public int BinStart;
     public int BinCount;
+
+    public void Dispose()
+    {
+        SRB?.Dispose();
+        SRB = null;
+        // PSO is managed by GlobalPsoCache, not disposed here
+    }
 
     /// <summary>
     /// 按 Shader 引用相等性将连续 bin 分组。

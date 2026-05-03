@@ -15,13 +15,14 @@ using Silk.NET.Maths;
 using Silk.NET.Windowing;
 using SomeEngine.Assets;
 using SomeEngine.Assets.Importers;
-using SomeEngine.Assets.Pipeline;
 using SomeEngine.Assets.Schema;
 using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
 using SomeEngine.Core.Math;
 using SomeEngine.Render.Data;
+using SomeEngine.Render.Frame;
 using SomeEngine.Render.Graph;
+using SomeEngine.Render.Components;
 using SomeEngine.Render.Materials;
 using SomeEngine.Render.Pipelines;
 using SomeEngine.Render.RHI;
@@ -122,8 +123,6 @@ class Program
 {
     static void Main(string[] args)
     {
-        AssetTypeRegistration.RegisterBuiltIns();
-
         var options = WindowOptions.Default;
         options.Size = new Vector2D<int>(1280, 720);
         options.Title = "SomeEngine Runtime - Cluster Rendering";
@@ -137,8 +136,11 @@ class Program
         RenderContext? context = null;
         ClusterResourceManager? resourceManager = null;
         ClusterPipeline? clusterPipeline = null;
-        MaterialSystem? materialSystem = null;
+        EntityStore? materialStore = null;
+        RenderWorld? renderWorld = null;
         RenderGraph? renderGraph = null;
+        FrameTargetRegistry frameTargets = new();
+        GlobalPsoCache? psoCache = null;
         SimpleMeshRenderPass? simplePass = null;
         ImGuiRenderer? imguiRenderer = null;
         ImGuiInputHandler? imguiInput = null;
@@ -161,37 +163,98 @@ class Program
         bool _keyF6Pressed = false;
         bool showEntityEditor = true;
         int spawnedEntityCount = 1;
+        int startupInstanceCount = ResolveStartupInstanceCount();
         int selectedAvailableMeshIndex = 0;
         int selectedEntityMeshIndex = 0;
         string importModelPath = string.Empty;
         string meshUiMessage = string.Empty;
         List<string> availableMeshes = new();
         var random = new Random();
-        Dictionary<string, uint> MeshDefaultMaterialOffsets = new();
-        Material? defaultPbrMaterial = null;
-        Material? defaultUnlitMaterial = null;
         AssetDatabase? assetDb = null;
+        var materialCache = new Dictionary<AssetGuid, Material>();
+        var textureCache = new Dictionary<AssetGuid, ITexture>();
+        var availableMaterialGuids = new List<AssetGuid>();
+        Func<AssetGuid, Material?>? resolveRuntimeMaterial = null;
+        ClusterDebugMode[] debugModeValues = ClusterDebugModeExtensions.GetValues();
+        string[] debugModeNames = ClusterDebugModeExtensions.GetNames();
+        HiZDebugMode[] hizModeValues = HiZDebugModeExtensions.GetValues();
+        string[] hizModeNames = HiZDebugModeExtensions.GetNames();
 
-        static string ResolveSamplesDirectory()
+        static string? TryFindProjectRoot(string startDirectory)
+        {
+            string? current = Path.GetFullPath(startDirectory);
+
+            while (!string.IsNullOrEmpty(current))
+            {
+                if (File.Exists(Path.Combine(current, "SomeEngine.slnx"))
+                    && Directory.Exists(Path.Combine(current, "samples")))
+                {
+                    return current;
+                }
+
+                current = Directory.GetParent(current)?.FullName;
+            }
+
+            return null;
+        }
+
+        static string ResolveProjectRoot()
+        {
+            foreach (string startDirectory in new[]
+            {
+                AppContext.BaseDirectory,
+                Directory.GetCurrentDirectory(),
+            })
+            {
+                if (TryFindProjectRoot(startDirectory) is string projectRoot)
+                    return projectRoot;
+            }
+
+            return Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../"));
+        }
+
+        static string ResolveSamplesDirectory(string projectRoot)
         {
             string[] candidates =
             [
-                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../samples")),
+                Path.Combine(projectRoot, "samples"),
                 Path.GetFullPath("samples"),
-                Path.GetFullPath("../../../../../samples"),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../samples")),
                 "d:/SomeEngine/samples",
             ];
 
             foreach (string candidate in candidates)
             {
-                if (Directory.Exists(candidate))
-                    return candidate;
+                string fullPath = Path.GetFullPath(candidate);
+                if (Directory.Exists(fullPath))
+                    return fullPath;
             }
 
-            return candidates[0];
+            return Path.GetFullPath(candidates[0]);
         }
 
-        string samplesDirectory = ResolveSamplesDirectory();
+        static int ResolveStartupInstanceCount()
+        {
+            const int defaultInstanceCount = 1024;
+            const int maxInstanceCount = 100_000;
+
+            string? value = Environment.GetEnvironmentVariable("SOMEENGINE_RUNTIME_INSTANCE_COUNT");
+            if (string.IsNullOrWhiteSpace(value))
+                return defaultInstanceCount;
+
+            if (!int.TryParse(value, out int parsed))
+            {
+                Console.WriteLine(
+                    $"Invalid SOMEENGINE_RUNTIME_INSTANCE_COUNT='{value}', using {defaultInstanceCount}."
+                );
+                return defaultInstanceCount;
+            }
+
+            return Math.Clamp(parsed, 1, maxInstanceCount);
+        }
+
+        string projectRoot = ResolveProjectRoot();
+        string samplesDirectory = ResolveSamplesDirectory(projectRoot);
 
         void RefreshAvailableMeshes()
         {
@@ -208,6 +271,30 @@ class Program
 
             if (selectedAvailableMeshIndex >= availableMeshes.Count)
                 selectedAvailableMeshIndex = Math.Max(availableMeshes.Count - 1, 0);
+        }
+
+        void RefreshAvailableMaterialGuids()
+        {
+            availableMaterialGuids.Clear();
+            if (assetDb == null)
+            {
+                return;
+            }
+
+            foreach (AssetManifestRecord record in assetDb.List(nameof(MaterialAsset)))
+            {
+                string path = record.Path.Replace('\\', '/');
+                if (record.Guid.IsEmpty
+                    || string.Equals(
+                        path,
+                        GltfImporterSettings.DefaultUnlitMaterialTemplate,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                availableMaterialGuids.Add(record.Guid);
+            }
         }
 
         bool TryLoadMeshFromFile(string meshFilePath, out string message)
@@ -228,8 +315,12 @@ class Program
 
             try
             {
-                byte[] bytes = File.ReadAllBytes(meshFilePath);
-                var meshAsset = MeshAsset.Serializer.Parse(bytes);
+                var meshAsset = assetDb!.Load<MeshAsset>(meshFilePath);
+                if (meshAsset == null)
+                {
+                    message = $"Load Mesh failed: AssetDatabase could not load {Path.GetFileName(meshFilePath)}.";
+                    return false;
+                }
                 uint rootIndex = resourceManager.AddMesh(meshAsset);
 
                 if (rootIndex == uint.MaxValue)
@@ -243,47 +334,6 @@ class Program
                     meshAsset.Name ?? Path.GetFileNameWithoutExtension(meshFilePath);
                 message =
                     $"Loaded mesh '{loadedName}' from {Path.GetFileName(meshFilePath)} (BVHRootIndex={rootIndex}).";
-
-                Material? ResolveDefaultMaterial(AssetGuid guid)
-                {
-                    if (!guid.IsEmpty)
-                    {
-                        if (defaultUnlitMaterial != null && defaultUnlitMaterial.AssetGuid == guid)
-                        {
-                            return defaultUnlitMaterial;
-                        }
-
-                        if (defaultPbrMaterial != null && defaultPbrMaterial.AssetGuid == guid)
-                        {
-                            return defaultPbrMaterial;
-                        }
-                    }
-
-                    return defaultPbrMaterial;
-                }
-
-                uint slotOffset = 0;
-                if (clusterPipeline != null)
-                {
-                    int slotCount = meshAsset.DefaultMaterialGuids?.Count ?? 0;
-                    for (int i = 0; i < slotCount; i++)
-                    {
-                        AssetGuid guid = meshAsset.DefaultMaterialGuids != null &&
-                                         i < meshAsset.DefaultMaterialGuids.Count &&
-                                         AssetGuid.TryParse(meshAsset.DefaultMaterialGuids[i], out AssetGuid parsedGuid)
-                            ? parsedGuid
-                            : AssetGuid.Empty;
-
-                        Material? mat = ResolveDefaultMaterial(guid);
-                        if (mat != null && !mat.Entity.IsNull)
-                        {
-                            slotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots([mat.Entity]);
-                            break;
-                        }
-                    }
-                }
-                
-                MeshDefaultMaterialOffsets[loadedName] = slotOffset;
 
                 return true;
             }
@@ -320,32 +370,27 @@ class Program
 
             try
             {
-                AssetGuid ResolveMaterialGuidByName(string materialName)
+                if (assetDb == null)
                 {
-                    if (assetDb == null)
-                    {
-                        return AssetGuid.Empty;
-                    }
-
-                    AssetManifestRecord match = assetDb.List(nameof(MaterialAsset))
-                        .FirstOrDefault(asset =>
-                            string.Equals(asset.Name, materialName, StringComparison.Ordinal) &&
-                            asset.Path.EndsWith(".material.asset", StringComparison.OrdinalIgnoreCase));
-                    return match.Guid;
+                    message = "Import failed: asset database is not initialized.";
+                    return false;
                 }
 
-                var importedMesh = ClusterBuilder.Process(resolvedPath, ResolveMaterialGuidByName);
-                string outBaseName = Path.GetFileNameWithoutExtension(resolvedPath);
-                importedMesh.Name = outBaseName;
+                IReadOnlyList<AssetGuid> importedGuids = assetDb.Import(resolvedPath);
+                int meshCount = importedGuids.Count(guid =>
+                {
+                    if (!assetDb.Manifest.TryGetAsset(guid, out AssetManifestRecord record))
+                    {
+                        return false;
+                    }
 
-                Directory.CreateDirectory(samplesDirectory);
-                string outMeshPath = Path.Combine(samplesDirectory, outBaseName + ".mesh.asset");
-                MeshAssetSerializer.Save(importedMesh, outMeshPath);
-                assetDb?.Import(outMeshPath);
+                    return string.Equals(record.AssetType, nameof(MeshAsset), StringComparison.Ordinal);
+                });
 
                 RefreshAvailableMeshes();
+                RefreshAvailableMaterialGuids();
                 selectedAvailableMeshIndex = 0;
-                message = $"Imported {Path.GetFileName(resolvedPath)} to {outMeshPath}";
+                message = $"Imported {Path.GetFileName(resolvedPath)} and generated {meshCount} mesh asset(s).";
                 return true;
             }
             catch (Exception ex)
@@ -368,12 +413,144 @@ class Program
             return NativeFileDialog.ShowOpenModelDialog("Select GLTF/GLB file", initialDirectory);
         }
 
-        void SpawnEntity(GameWorld targetWorld, uint rootIndex, Vector3 position, float scale, uint materialSlotOffset = 0)
+        void SpawnEntity(
+            GameWorld targetWorld,
+            uint rootIndex,
+            Vector3 position,
+            float scale,
+            AssetGuid materialAssetGuid = default)
         {
             var e = targetWorld.EntityStore.CreateEntity();
-            e.AddComponent(new TransformQvvs(position, Quaternion.Identity, scale));
-            e.AddComponent(new MeshInstance { BVHRootIndex = rootIndex, MaterialSlotOffset = materialSlotOffset });
-            Console.WriteLine($"SpawnEntity: id={e.Id} rootIndex={rootIndex} materialSlotOffset={materialSlotOffset} pos={position}");
+            e.AddComponent(new LocalTransform { Value = new TransformQvvs(position, Quaternion.Identity, scale) });
+            e.AddComponent(new WorldTransform());
+            e.AddComponent(new MeshInstance { BVHRootIndex = rootIndex });
+            if (!materialAssetGuid.IsEmpty)
+            {
+                e.AddComponent(new MeshMaterialBindings { MaterialAssetGuids = [materialAssetGuid] });
+            }
+            Console.WriteLine($"SpawnEntity: id={e.Id} rootIndex={rootIndex} pos={position}");
+        }
+
+        void SpawnStartupInstances(
+            GameWorld targetWorld,
+            uint rootIndex,
+            int instanceCount,
+            IReadOnlyList<AssetGuid> materialGuids
+        )
+        {
+            int columns = (int)MathF.Ceiling(MathF.Sqrt(instanceCount));
+            const float spacing = 1.5f;
+            const float planeZ = 65.0f;
+            const float scale = 0.6f;
+            float originX = -((columns - 1) * spacing) * 0.5f;
+            float originY = -((columns - 1) * spacing) * 0.5f;
+
+            for (int i = 0; i < instanceCount; i++)
+            {
+                int xIndex = i % columns;
+                int yIndex = i / columns;
+                var position = new Vector3(
+                    originX + xIndex * spacing,
+                    originY + yIndex * spacing,
+                    planeZ
+                );
+
+                var entity = targetWorld.EntityStore.CreateEntity();
+                entity.AddComponent(new LocalTransform
+                {
+                    Value = new TransformQvvs(position, Quaternion.Identity, scale),
+                });
+                entity.AddComponent(new WorldTransform());
+                entity.AddComponent(new MeshInstance { BVHRootIndex = rootIndex });
+
+                if (materialGuids.Count > 0)
+                {
+                    AssetGuid materialGuid = materialGuids[i % materialGuids.Count];
+                    entity.AddComponent(new MeshMaterialBindings { MaterialAssetGuids = [materialGuid] });
+                }
+
+                float tint = (i % columns) / MathF.Max(columns - 1, 1);
+                entity.AddComponent(new MaterialOverride
+                {
+                    BaseColorTint = new Vector4(0.55f + tint * 0.45f, 0.75f, 1.0f - tint * 0.35f, 1.0f),
+                });
+            }
+
+            spawnedEntityCount = Math.Max(spawnedEntityCount, instanceCount + 1);
+            Console.WriteLine(
+                $"Spawned {instanceCount} startup instances for profiling (rootIndex={rootIndex}, grid={columns}x{columns})."
+            );
+        }
+
+        ITexture? LoadGpuTexture(AssetGuid textureGuid)
+        {
+            if (textureGuid.IsEmpty || assetDb == null || context == null)
+            {
+                return null;
+            }
+
+            if (textureCache.TryGetValue(textureGuid, out ITexture? cached))
+            {
+                return cached;
+            }
+
+            TextureAsset? asset = assetDb.Load<TextureAsset>(textureGuid);
+            if (asset == null)
+            {
+                return null;
+            }
+
+            ITexture texture = CreateGpuTexture(context, asset, textureGuid.ToFlatString());
+            textureCache[textureGuid] = texture;
+            return texture;
+        }
+
+        static ITexture CreateGpuTexture(RenderContext renderContext, TextureAsset asset, string fallbackName)
+        {
+            TextureFileImage image = TextureFileLoader.Decode(asset, asset.Name ?? fallbackName);
+            GCHandle handle = GCHandle.Alloc(image.Pixels, GCHandleType.Pinned);
+            try
+            {
+                var texDesc = new TextureDesc
+                {
+                    Name = asset.Name ?? fallbackName,
+                    Type = ResourceDimension.Tex2d,
+                    Width = (uint)image.Width,
+                    Height = (uint)image.Height,
+                    Format = TextureFormat.RGBA8_UNorm,
+                    Usage = Usage.Immutable,
+                    BindFlags = BindFlags.ShaderResource,
+                };
+                var texData = new TextureData
+                {
+                    SubResources =
+                    [
+                        new TextureSubResData
+                        {
+                            Data = handle.AddrOfPinnedObject(),
+                            Stride = (uint)(image.Width * 4),
+                        },
+                    ],
+                };
+
+                ITexture texture = renderContext.Device!.CreateTexture(texDesc, texData)
+                    ?? throw new InvalidOperationException($"Failed to create texture '{texDesc.Name}'.");
+                renderContext.ImmediateContext!.TransitionResourceStates(
+                [
+                    new StateTransitionDesc
+                    {
+                        Resource = texture,
+                        OldState = ResourceState.Unknown,
+                        NewState = ResourceState.ShaderResource,
+                        Flags = StateTransitionFlags.UpdateState,
+                    },
+                ]);
+                return texture;
+            }
+            finally
+            {
+                handle.Free();
+            }
         }
 
         var camera = new FreeCamera(
@@ -395,67 +572,74 @@ class Program
             // 1. Init ECS & Systems
             world = new GameWorld();
             instanceDataManager = new InstanceDataManager();
-            transformSystem = new InstanceSyncSystem(instanceDataManager);
+            transformSystem = new InstanceSyncSystem(instanceDataManager, world.SystemContext);
             world.SystemRoot.Add(transformSystem);
 
             // 2. Init Cluster Manager
             resourceManager = new ClusterResourceManager(context);
 
             // 3. Init Pipeline
-            materialSystem = new MaterialSystem();
-            var psoCache = new GlobalPsoCache();
+            materialStore = new EntityStore();
+            renderWorld = new RenderWorld();
+            psoCache = new GlobalPsoCache();
 
             clusterPipeline = ClusterPipeline.Opaque(
-                context, resourceManager, instanceDataManager!, materialSystem, psoCache);
+                context, resourceManager, instanceDataManager!, psoCache, renderWorld);
             clusterPipeline.Initialize(context);
-
-            // ─── Create default textures + sampler ───
-            var defaultTex = ClusterMaterials.CreateDefault1x1Texture(context, "DefaultWhite", 0xFFFFFFFF);
-            var defaultNormalTex = ClusterMaterials.CreateDefault1x1Texture(context, "DefaultNormal", 0xFFFF8080);
-            var defaultArmTex = ClusterMaterials.CreateDefault1x1Texture(context, "DefaultARM", 0xFF00FF00);
-            var defaultSampler = context.Device!.CreateSampler(new Diligent.SamplerDesc
-            {
-                MinFilter = Diligent.FilterType.Linear,
-                MagFilter = Diligent.FilterType.Linear,
-                MipFilter = Diligent.FilterType.Linear,
-                AddressU = Diligent.TextureAddressMode.Wrap,
-                AddressV = Diligent.TextureAddressMode.Wrap,
-                AddressW = Diligent.TextureAddressMode.Wrap,
-            });
-
-            // ─── Initialize Asset Database ───
-            string projectRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../"));
-            assetDb = new global::SomeEngine.Assets.AssetDatabase(projectRoot);
+            // ─── Initialize CPU Asset Database ───
+            assetDb = global::SomeEngine.Assets.GeneratedAssetPipelineCatalog.CreateDatabase(projectRoot);
             ShaderAsset? LoadShader(AssetGuid guid) => assetDb.Load<ShaderAsset>(guid);
 
-            Diligent.ITextureView? LoadTexture(string path)
+            foreach (string materialPath in new[]
             {
-                return path switch
+                GltfImporterSettings.DefaultLitMaterialTemplate,
+                GltfImporterSettings.DefaultUnlitMaterialTemplate,
+            })
+            {
+                if (assetDb.Resolve(materialPath) == null
+                    && File.Exists(Path.Combine(projectRoot, materialPath.Replace('/', Path.DirectorySeparatorChar))))
                 {
-                    "default:white" => defaultTex.GetDefaultView(Diligent.TextureViewType.ShaderResource),
-                    "default:normal" => defaultNormalTex.GetDefaultView(Diligent.TextureViewType.ShaderResource),
-                    "default:arm" => defaultArmTex.GetDefaultView(Diligent.TextureViewType.ShaderResource),
-                    _ => null,
-                };
+                    assetDb.Import(materialPath);
+                }
             }
 
-            // ─── PBR material (via asset pipeline) ───
-            MaterialAsset? pbrAsset = assetDb.Load<MaterialAsset>("assets/Materials/DefaultPBR.material.asset");
-            if (pbrAsset == null) throw new Exception("DefaultPBR material asset not found! Run tools/GenerateDefaultAssets or the GenerateDefaultMaterials test.");
+            renderGraph = new RenderGraph();
+            renderGraph.Initialize(context.Device!);
 
-            var matPBR = SomeEngine.Render.Assets.MaterialAssetLoader.LoadFromAsset(
-                pbrAsset, materialSystem, LoadTexture, LoadShader);
-            matPBR.SetSampler("MaterialSampler", defaultSampler);
-            defaultPbrMaterial = matPBR;
+            Diligent.ITextureView? LoadTexture(AssetGuid textureGuid)
+            {
+                Diligent.ITexture? tex = LoadGpuTexture(textureGuid);
+                return tex?.GetDefaultView(Diligent.TextureViewType.ShaderResource);
+            }
 
-            // ─── Unlit material (via asset pipeline) ───
-            MaterialAsset? unlitAsset = assetDb.Load<MaterialAsset>("assets/Materials/TestUnlit_1.material.asset");
-            if (unlitAsset == null) throw new Exception("TestUnlit_1 material asset not found! Run tools/GenerateDefaultAssets or the GenerateDefaultMaterials test.");
+            resolveRuntimeMaterial = guid =>
+            {
+                if (guid.IsEmpty || assetDb == null || materialStore == null)
+                {
+                    return null;
+                }
 
-            var matUnlit = SomeEngine.Render.Assets.MaterialAssetLoader.LoadFromAsset(
-                unlitAsset, materialSystem, LoadTexture, LoadShader);
-            matUnlit.SetSampler("MaterialSampler", defaultSampler);
-            defaultUnlitMaterial = matUnlit;
+                if (materialCache.TryGetValue(guid, out Material? cachedMaterial))
+                {
+                    return cachedMaterial;
+                }
+
+                MaterialAsset? asset = assetDb.Load<MaterialAsset>(guid);
+                if (asset == null)
+                {
+                    return null;
+                }
+
+                Material material = SomeEngine.Render.Assets.MaterialAssetLoader.LoadFromAsset(
+                    asset,
+                    materialStore,
+                    LoadTexture,
+                    LoadShader);
+                materialCache[guid] = material;
+                return material;
+            };
+
+            RefreshAvailableMaterialGuids();
 
             // 4. Discover and optionally load mesh assets from samples/
             RefreshAvailableMeshes();
@@ -475,25 +659,12 @@ class Program
                             )
                             .First();
 
-                        uint pbrSlotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots([matPBR.Entity]);
-                        uint unlitSlotOffset = (uint)clusterPipeline.BinSpace.AllocateSlots([matUnlit.Entity]);
-
-                        // Spawn 3 instances with different MaterialOverrides to test per-instance data
-                        for (int i = -1; i <= 1; i++) 
-                        {
-                            var entity = world.EntityStore.CreateEntity();
-                            entity.AddComponent(
-                                new TransformQvvs(new Vector3(i * 2.0f, 0, 0), Quaternion.Identity, 1.0f)
-                            );
-                            
-                            uint slotOffsetToUse = (i == 1) ? unlitSlotOffset : pbrSlotOffset;
-                            entity.AddComponent(new MeshInstance { BVHRootIndex = firstLoaded.Value, MaterialSlotOffset = slotOffsetToUse });
-                            
-                            Vector4 color = i == -1 ? new Vector4(1, 0.5f, 0.5f, 1) : 
-                                            i == 0 ? new Vector4(0.5f, 1, 0.5f, 1) : 
-                                                     new Vector4(0.5f, 0.5f, 1, 1);
-                            entity.AddComponent(new MaterialOverride { BaseColorTint = color });
-                        }
+                        SpawnStartupInstances(
+                            world,
+                            firstLoaded.Value,
+                            startupInstanceCount,
+                            availableMaterialGuids
+                        );
                     }
                 }
                 else
@@ -505,8 +676,6 @@ class Program
             {
                 Console.WriteLine($"Warning: no .mesh files found in {samplesDirectory}");
             }
-
-            renderGraph = new RenderGraph();
 
             Console.WriteLine("Controls:");
             Console.WriteLine("  WASD + Space/Ctrl: Move");
@@ -549,15 +718,17 @@ class Program
             imguiInput?.Update((float)delta);
         };
 
+        bool logFrameProfile = Environment.GetEnvironmentVariable("SOMEENGINE_FRAME_PROFILE") == "1";
         int frameCount = 0;
 
         window.Render += (double delta) =>
         {
           try
           {
+            ClusterPipeline? activePipeline = clusterPipeline;
             if (
                 context == null
-                || clusterPipeline == null
+                || activePipeline == null
                 || world == null
                 || renderGraph == null
                 || resourceManager == null
@@ -567,6 +738,10 @@ class Program
             // Update Logic
             world.Update(delta);
             var _tUpdate = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
+            if (resolveRuntimeMaterial != null)
+            {
+                activePipeline.PrepareFrame(world.EntityStore, resolveRuntimeMaterial);
+            }
 
             float dt = (float)delta;
             float moveSpeed = 6.0f;
@@ -600,7 +775,7 @@ class Program
                 {
                     if (!_key1Pressed)
                     {
-                        clusterPipeline.OverdrawEnabled = !clusterPipeline.OverdrawEnabled;
+                        activePipeline.OverdrawEnabled = !activePipeline.OverdrawEnabled;
                         _key1Pressed = true;
                     }
                 }
@@ -613,7 +788,7 @@ class Program
                 {
                     if (!_key2Pressed)
                     {
-                        clusterPipeline.DebugSpheresEnabled = !clusterPipeline.DebugSpheresEnabled;
+                        activePipeline.DebugSpheresEnabled = !activePipeline.DebugSpheresEnabled;
                         _key2Pressed = true;
                     }
                 }
@@ -626,7 +801,7 @@ class Program
                 {
                     if (!_key3Pressed)
                     {
-                        clusterPipeline.WireframeEnabled = !clusterPipeline.WireframeEnabled;
+                        activePipeline.WireframeEnabled = !activePipeline.WireframeEnabled;
                         _key3Pressed = true;
                     }
                 }
@@ -639,7 +814,7 @@ class Program
                 {
                     if (!_key4Pressed)
                     {
-                        clusterPipeline.DebugClusterID = !clusterPipeline.DebugClusterID;
+                        activePipeline.DebugClusterID = !activePipeline.DebugClusterID;
                         _key4Pressed = true;
                     }
                 }
@@ -652,7 +827,7 @@ class Program
                 {
                     if (!_keyF5Pressed)
                     {
-                        clusterPipeline.DumpNextFrame = true;
+                        activePipeline.DumpNextFrame = true;
                         Console.WriteLine("[Debug] HiZ dump triggered for next frame...");
                         _keyF5Pressed = true;
                     }
@@ -710,47 +885,49 @@ class Program
                 {
                     if (ImGui.CollapsingHeader("Rendering", ImGuiTreeNodeFlags.DefaultOpen))
                     {
-                        bool overdraw = clusterPipeline.OverdrawEnabled;
+                        bool overdraw = activePipeline.OverdrawEnabled;
                         if (ImGui.Checkbox("Overdraw", ref overdraw))
-                            clusterPipeline.OverdrawEnabled = overdraw;
+                            activePipeline.OverdrawEnabled = overdraw;
 
-                        bool wireframe = clusterPipeline.WireframeEnabled;
+                        bool wireframe = activePipeline.WireframeEnabled;
                         if (ImGui.Checkbox("Wireframe", ref wireframe))
-                            clusterPipeline.WireframeEnabled = wireframe;
+                            activePipeline.WireframeEnabled = wireframe;
 
-                        bool debugSpheres = clusterPipeline.DebugSpheresEnabled;
+                        bool debugSpheres = activePipeline.DebugSpheresEnabled;
                         if (ImGui.Checkbox("Debug Spheres", ref debugSpheres))
-                            clusterPipeline.DebugSpheresEnabled = debugSpheres;
+                            activePipeline.DebugSpheresEnabled = debugSpheres;
 
-                        int debugModeIdx = Array.IndexOf(Enum.GetValues<ClusterDebugMode>(), clusterPipeline.DebugMode);
-                        string[] debugModeNames = Enum.GetNames(typeof(ClusterDebugMode));
+                        int debugModeIdx = Array.IndexOf(debugModeValues, activePipeline.DebugMode);
                         if (ImGui.Combo("Shade Debug", ref debugModeIdx, debugModeNames, debugModeNames.Length))
                         {
-                            clusterPipeline.DebugMode = Enum.GetValues<ClusterDebugMode>()[debugModeIdx];
+                            activePipeline.DebugMode = debugModeValues[debugModeIdx];
                         }
 
-                        int hizMode = (int)clusterPipeline.HiZMode;
-                        string[] hizModeNames = Enum.GetNames(typeof(HiZDebugMode));
+                        int hizMode = Array.IndexOf(hizModeValues, activePipeline.HiZMode);
                         if (ImGui.Combo("HiZ Mode", ref hizMode, hizModeNames, hizModeNames.Length))
                         {
-                            clusterPipeline.HiZMode = (HiZDebugMode)hizMode;
+                            activePipeline.HiZMode = hizModeValues[hizMode];
                         }
 
-                        bool freezeCull = clusterPipeline.FreezeCullingCamera;
+                        bool freezeCull = activePipeline.FreezeCullingCamera;
                         if (ImGui.Checkbox("Freeze Culling Camera", ref freezeCull))
-                            clusterPipeline.FreezeCullingCamera = freezeCull;
+                            activePipeline.FreezeCullingCamera = freezeCull;
 
-                        bool showAABBs = clusterPipeline.DebugShowHiZAABBs;
+                        bool showAABBs = activePipeline.DebugShowHiZAABBs;
                         if (ImGui.Checkbox("Debug HiZ AABBs", ref showAABBs))
-                            clusterPipeline.DebugShowHiZAABBs = showAABBs;
+                            activePipeline.DebugShowHiZAABBs = showAABBs;
 
                         ImGui.Separator();
                         if (ImGui.TreeNode("Culling Stats"))
                         {
-                            uint candidateCount = clusterPipeline.DebugCandidateCount;
-                            uint p1Visible = clusterPipeline.DebugDrawInstanceCount;
-                            uint p2Candidates = clusterPipeline.DebugPhase2Count;
-                            uint p2Visible = clusterPipeline.DebugPhase2DrawInstanceCount;
+                            uint candidateCount = activePipeline.DebugCandidateCount;
+                            uint p1SW = activePipeline.DebugDrawSWCount;
+                            uint p1HW = activePipeline.DebugDrawHWCount;
+                            uint p1Visible = activePipeline.DebugDrawInstanceCount;
+                            uint p2Candidates = activePipeline.DebugPhase2Count;
+                            uint p2SW = activePipeline.DebugPhase2DrawSWCount;
+                            uint p2HW = activePipeline.DebugPhase2DrawHWCount;
+                            uint p2Visible = activePipeline.DebugPhase2DrawInstanceCount;
                             uint lodRejected =
                                 candidateCount > (p1Visible + p2Candidates)
                                     ? candidateCount - (p1Visible + p2Candidates)
@@ -764,18 +941,20 @@ class Program
                             ImGui.Separator();
                             ImGui.Text($"Phase1 HiZ Cull: {p2Candidates}");
                             ImGui.Text($"Phase1 Drawn:    {p1Visible}");
+                            ImGui.Text($"  SW/HW:          {p1SW} / {p1HW}");
                             ImGui.Separator();
                             ImGui.Text($"Phase2 Input:    {p2Candidates}");
                             ImGui.Text($"Phase2 HiZ Cull: {p2Candidates - p2Visible}");
                             ImGui.Text($"Phase2 Drawn:    {p2Visible}");
+                            ImGui.Text($"  SW/HW:          {p2SW} / {p2HW}");
                             ImGui.Separator();
                             ImGui.TextColored(
                                 new System.Numerics.Vector4(0, 1, 0, 1),
                                 $"Total Drawn:     {totalDrawn}  (saved {candidateCount - totalDrawn - lodRejected})"
                             );
-                            ImGui.Text($"Dispatch: [{clusterPipeline.DebugCandidateArgsX}, ...]");
-                            ImGui.Text($"Page Faults: {clusterPipeline.LastPageFaultCount}");
-                            ImGui.Text($"Loaded Pages: {clusterPipeline.LastLoadedPageCount}");
+                            ImGui.Text($"Dispatch: [{activePipeline.DebugCandidateArgsX}, ...]");
+                            ImGui.Text($"Page Faults: {activePipeline.LastPageFaultCount}");
+                            ImGui.Text($"Loaded Pages: {activePipeline.LastLoadedPageCount}");
                             ImGui.Text(
                                 $"Resident Pages: {resourceManager.ResidentPageCount} / {resourceManager.PageCount}"
                             );
@@ -814,7 +993,7 @@ class Program
                             }
                             else
                             {
-                                ImGui.TextDisabled("HiZ not available (mode may be Legacy)");
+                                ImGui.TextDisabled("HiZ debug data is not available for the current frame");
                             }
                             ImGui.TreePop();
                         }
@@ -984,8 +1163,10 @@ class Program
                                 int spawnIndex = spawnedEntityCount++;
                                 float x = (spawnIndex % 5) * 2.5f;
                                 float z = (spawnIndex / 5) * 2.5f;
-                                uint matId = (uint)(spawnIndex % 2); // alternate material
-                                SpawnEntity(world, rootIndex, new Vector3(x, 0, z), 1.0f, matId);
+                                AssetGuid materialGuid = availableMaterialGuids.Count == 0
+                                    ? AssetGuid.Empty
+                                    : availableMaterialGuids[spawnIndex % availableMaterialGuids.Count];
+                                SpawnEntity(world, rootIndex, new Vector3(x, 0, z), 1.0f, materialGuid);
                             }
                         }
 
@@ -1008,8 +1189,10 @@ class Program
                                     float y = (random.NextSingle() - 0.5f) * 10.0f;
                                     float z = (random.NextSingle() - 0.5f) * 80.0f;
                                     float scale = 0.5f + random.NextSingle() * 2.0f;
-                                    uint matId = (uint)(i % 2); // alternate material
-                                    SpawnEntity(world, rootIndex, new Vector3(x, y, z), scale, matId);
+                                    AssetGuid materialGuid = availableMaterialGuids.Count == 0
+                                        ? AssetGuid.Empty
+                                        : availableMaterialGuids[i % availableMaterialGuids.Count];
+                                    SpawnEntity(world, rootIndex, new Vector3(x, y, z), scale, materialGuid);
                                 }
                             }
                         }
@@ -1018,16 +1201,16 @@ class Program
                         {
                             if (ImGui.TreeNode($"Entity {entity.Id}"))
                             {
-                                if (entity.HasComponent<TransformQvvs>())
+                                if (entity.HasComponent<LocalTransform>())
                                 {
-                                    ref var transform = ref entity.GetComponent<TransformQvvs>();
-                                    Vector3 pos = transform.Position;
+                                    ref var local = ref entity.GetComponent<LocalTransform>();
+                                    Vector3 pos = local.Value.Position;
                                     if (ImGui.DragFloat3("Position", ref pos, 0.1f))
-                                        transform.Position = pos;
+                                        local.Value.Position = pos;
 
-                                    float scale = transform.Scale;
+                                    float scale = local.Value.Scale;
                                     if (ImGui.DragFloat("Scale", ref scale, 0.05f))
-                                        transform.Scale = scale;
+                                        local.Value.Scale = scale;
                                 }
                                 ImGui.TreePop();
                             }
@@ -1047,14 +1230,31 @@ class Program
             var view = camera.GetViewMatrix();
             var proj = camera.GetProjectionMatrix(aspect);
             var lodScale = camera.GetLodScale(scDesc.Height);
-            clusterPipeline.SetCamera(view, proj, camera.Position, 1.0f, lodScale, debugLOD);
+            activePipeline.SetCamera(view, proj, camera.Position, 1.0f, lodScale, debugLOD);
 
             var pRTV = context.SwapChain!.GetCurrentBackBufferRTV();
 
             renderGraph.BeginFrame();
             var bbTex = pRTV.GetTexture();
-            var colorHandle = renderGraph.Import("ColorTarget", bbTex, ResourceState.Unknown);
-            var depthHandle = renderGraph.CreateTexture("DepthTarget", context.DepthBufferDesc);
+            frameTargets.BeginFrame(
+                renderGraph,
+                new FrameTargetContext(scDesc.Width, scDesc.Height, (ulong)frameCount)
+            );
+            frameTargets.ImportTexture(
+                StandardFrameTargets.SceneColor,
+                bbTex,
+                ResourceState.Unknown,
+                "SceneColor"
+            );
+            frameTargets.DeclareTexture(
+                StandardFrameTargets.SceneDepth,
+                _ => context.DepthBufferDesc with { Name = "SceneDepth" },
+                FrameTargetLifetime.FrameLocal,
+                ResourceState.Unknown,
+                "SceneDepth"
+            );
+            var colorHandle = frameTargets.ResolveTexture(StandardFrameTargets.SceneColor);
+            var depthHandle = frameTargets.ResolveTexture(StandardFrameTargets.SceneDepth);
 
             renderGraph.AddPass<object>(
                 "Clear Main RT",
@@ -1090,7 +1290,7 @@ class Program
             );
 
             var _tSetup = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
-            clusterPipeline.AddPasses(renderGraph);
+            activePipeline.AddPasses(renderGraph, frameTargets);
             var _tAddPasses = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
 
             if (imguiRenderer != null && imguiRenderer.FontTexture != null)
@@ -1163,9 +1363,9 @@ class Program
             var _tExecute = _sw.Elapsed.TotalMilliseconds; _sw.Restart();
 
             // Resolve HiZ texture after execute for ImGui visualization
-            if (clusterPipeline.LastHiZTextureHandle.IsValid && imguiRenderer != null)
+            if (activePipeline.LastHiZTextureHandle.IsValid && imguiRenderer != null)
             {
-                var hizTex = renderGraph.GetPhysicalTexture(clusterPipeline.LastHiZTextureHandle);
+                var hizTex = renderGraph.GetPhysicalTexture(activePipeline.LastHiZTextureHandle);
                 if (hizTex != null && hizTex != lastHiZTexture)
                 {
                     // Texture changed — unregister old SRVs
@@ -1208,7 +1408,7 @@ class Program
             context.Present();
             var _tPresent = _sw.Elapsed.TotalMilliseconds;
 
-            if (frameCount % 120 == 0)
+            if (logFrameProfile && frameCount % 120 == 0)
                 Console.WriteLine($"[Profile] Update={_tUpdate:F1} ImGui={_tImGui:F1} Setup={_tSetup:F1} AddPass={_tAddPasses:F1} Compile={_tCompile:F1} Execute={_tExecute:F1} Present={_tPresent:F1}ms");
           }
           catch (Exception ex)
@@ -1230,8 +1430,15 @@ class Program
             imguiRenderer?.Dispose();
             simplePass?.Dispose();
             clusterPipeline?.Dispose();
+            psoCache?.Dispose();
             renderGraph?.Dispose();
             resourceManager?.Dispose();
+            foreach (ITexture texture in textureCache.Values)
+            {
+                texture.Dispose();
+            }
+            textureCache.Clear();
+            assetDb?.Dispose();
             context?.Dispose();
         };
 

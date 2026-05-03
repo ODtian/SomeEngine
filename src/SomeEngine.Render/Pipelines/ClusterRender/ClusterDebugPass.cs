@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Collections.Concurrent;
 using System.Threading;
 using Diligent;
 using SomeEngine.Assets.Importers;
@@ -11,101 +10,113 @@ using SomeEngine.Render.Systems;
 
 namespace SomeEngine.Render.Pipelines;
 
-internal static class ClusterDebugPSOs
+public class ClusterDebugPass : IDisposable
 {
-    internal static IPipelineState? CopyPSO;
-    internal static IPipelineState? SpherePSO;
-
-    internal static readonly ConcurrentBag<IShaderResourceBinding> CopySRBPool = [];
-    internal static readonly ConcurrentBag<IShaderResourceBinding> SphereSRBPool = [];
-
-    private static bool s_initialized;
-    private static readonly Lock s_initLock = new();
-
-    internal static void EnsureInitialized(RenderContext context)
+    public sealed class Resources : IDisposable
     {
-        if (s_initialized) return;
-        lock (s_initLock)
+        internal const string CopyShaderFile = "debug_args_copy.cs.hlsl";
+        internal const string CopyEntryPoint = "main";
+        internal const string SphereShaderFile = "debug_sphere.hlsl";
+        internal const string SphereVertexEntryPoint = "VSMain";
+        internal const string SpherePixelEntryPoint = "PSMain";
+
+        internal IPipelineState? CopyPSO;
+        internal IPipelineState? SpherePSO;
+        internal ShaderAsset? CopyShaderAsset;
+        internal ShaderAsset? SphereShaderAsset;
+
+        internal readonly SRBPool CopyPool = new();
+        internal readonly SRBPool SpherePool = new();
+
+        private bool _initialized;
+        private readonly Lock _initLock = new();
+
+        internal void EnsureInitialized(RenderContext context)
         {
-            if (s_initialized) return;
-            var device = context.Device;
-            if (device == null) return;
-
-            // Copy PSO
-            string copyPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/debug_args_copy.cs.hlsl"));
-            var copyAsset = SlangShaderImporter.Import(copyPath);
-            using var cs = copyAsset.CreateShader(context, "main");
-            
-            CopyPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
+            if (_initialized) return;
+            lock (_initLock)
             {
-                PSODesc = new PipelineStateDesc
+                if (_initialized) return;
+
+                var device = context.Device;
+                if (device == null) return;
+
+                string copyPath = ClusterStageUtils.ShaderPath(CopyShaderFile);
+                var copyAsset = SlangShaderImporter.Import(copyPath);
+                CopyShaderAsset = copyAsset;
+                var cs = copyAsset.CreateShader(context, CopyEntryPoint);
+
+                CopyPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
                 {
-                    Name = "Debug Copy PSO",
-                    PipelineType = PipelineType.Compute,
-                    ResourceLayout = new PipelineResourceLayoutDesc { DefaultVariableType = ShaderResourceVariableType.Dynamic },
-                },
-                Cs = cs,
-            });
+                    PSODesc = new PipelineStateDesc
+                    {
+                        Name = "Debug Copy PSO",
+                        PipelineType = PipelineType.Compute,
+                        ResourceLayout = new PipelineResourceLayoutDesc { DefaultVariableType = ShaderResourceVariableType.Dynamic },
+                    },
+                    Cs = cs,
+                });
 
-            // Sphere PSO
-            string spherePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/debug_sphere.hlsl"));
-            var sphereAsset = SlangShaderImporter.Import(spherePath);
-            using var vs = sphereAsset.CreateShader(context, "VSMain");
-            using var ps = sphereAsset.CreateShader(context, "PSMain");
+                string spherePath = ClusterStageUtils.ShaderPath(SphereShaderFile);
+                var sphereAsset = SlangShaderImporter.Import(spherePath);
+                SphereShaderAsset = sphereAsset;
+                var vs = sphereAsset.CreateShader(context, SphereVertexEntryPoint);
+                var ps = sphereAsset.CreateShader(context, SpherePixelEntryPoint);
 
-            var graphicsCi = new GraphicsPipelineStateCreateInfo
-            {
-                PSODesc = new PipelineStateDesc
+                var graphicsCi = new GraphicsPipelineStateCreateInfo
                 {
-                    Name = "Debug Sphere PSO",
-                    PipelineType = PipelineType.Graphics,
-                    ResourceLayout = new PipelineResourceLayoutDesc { DefaultVariableType = ShaderResourceVariableType.Dynamic },
-                },
-                GraphicsPipeline = new GraphicsPipelineDesc
-                {
-                    NumRenderTargets = 1,
-                    RTVFormats = [TextureFormat.RGBA8_UNorm],
-                    DSVFormat = TextureFormat.D32_Float,
-                    InputLayout = new InputLayoutDesc { LayoutElements = Array.Empty<LayoutElement>() },
-                    PrimitiveTopology = PrimitiveTopology.TriangleList,
-                    RasterizerDesc = new RasterizerStateDesc { FillMode = FillMode.Wireframe, CullMode = CullMode.None },
-                    DepthStencilDesc = new DepthStencilStateDesc { DepthEnable = true, DepthWriteEnable = false },
-                },
-                Vs = vs,
-                Ps = ps,
-            };
-            graphicsCi.GraphicsPipeline.BlendDesc.RenderTargets[0].BlendEnable = true;
-            graphicsCi.GraphicsPipeline.BlendDesc.RenderTargets[0].SrcBlend = BlendFactor.SrcAlpha;
-            graphicsCi.GraphicsPipeline.BlendDesc.RenderTargets[0].DestBlend = BlendFactor.InvSrcAlpha;
+                    PSODesc = new PipelineStateDesc
+                    {
+                        Name = "Debug Sphere PSO",
+                        PipelineType = PipelineType.Graphics,
+                        ResourceLayout = new PipelineResourceLayoutDesc { DefaultVariableType = ShaderResourceVariableType.Dynamic },
+                    },
+                    GraphicsPipeline = new GraphicsPipelineDesc
+                    {
+                        NumRenderTargets = 1,
+                        RTVFormats = [TextureFormat.RGBA8_UNorm],
+                        DSVFormat = TextureFormat.D32_Float,
+                        InputLayout = new InputLayoutDesc { LayoutElements = Array.Empty<LayoutElement>() },
+                        PrimitiveTopology = PrimitiveTopology.TriangleList,
+                        RasterizerDesc = new RasterizerStateDesc { FillMode = FillMode.Wireframe, CullMode = CullMode.None },
+                        DepthStencilDesc = new DepthStencilStateDesc { DepthEnable = true, DepthWriteEnable = false },
+                    },
+                    Vs = vs,
+                    Ps = ps,
+                };
+                graphicsCi.GraphicsPipeline.BlendDesc.RenderTargets[0].BlendEnable = true;
+                graphicsCi.GraphicsPipeline.BlendDesc.RenderTargets[0].SrcBlend = BlendFactor.SrcAlpha;
+                graphicsCi.GraphicsPipeline.BlendDesc.RenderTargets[0].DestBlend = BlendFactor.InvSrcAlpha;
 
-            SpherePSO = device.CreateGraphicsPipelineState(graphicsCi);
+                SpherePSO = device.CreateGraphicsPipelineState(graphicsCi);
+                _initialized = true;
+            }
+        }
 
-            s_initialized = true;
+        public void Dispose()
+        {
+            CopyPool.Dispose();
+            SpherePool.Dispose();
+            CopyPSO?.Dispose();
+            SpherePSO?.Dispose();
         }
     }
 
-    internal static IShaderResourceBinding RentSRB(IPipelineState pso, ConcurrentBag<IShaderResourceBinding> pool)
-        => pool.TryTake(out var srb) ? srb : pso.CreateShaderResourceBinding(false);
-
-    internal static void ReturnSRB(IShaderResourceBinding srb, ConcurrentBag<IShaderResourceBinding> pool)
-        => pool.Add(srb);
-}
-
-public class ClusterDebugPass : IDisposable
-{
     private readonly RenderContext _context;
+    private readonly Resources _resources;
 
-    public ClusterDebugPass(RenderContext context)
+    public ClusterDebugPass(RenderContext context, Resources resources)
     {
         _context = context;
-        ClusterDebugPSOs.EnsureInitialized(context);
+        _resources = resources;
+        _resources.EnsureInitialized(context);
     }
 
-    public void Init() => ClusterDebugPSOs.EnsureInitialized(_context);
+    public void Init() => _resources.EnsureInitialized(_context);
 
     public void SetupSphereCopy(RenderGraphBuilder builder, RenderGraphHandle hIndirectDrawArgs, RenderGraphHandle hDebugIndirectArgs, RenderGraphHandle hCopyUB)
     {
-        builder.Read(hIndirectDrawArgs, ResourceState.UnorderedAccess); // Still read/write? Actually it's written in this pass logic but setup says Read. Let's use Write if we modify it.
+        builder.Read(hIndirectDrawArgs, ResourceState.UnorderedAccess);
         builder.Write(hDebugIndirectArgs, ResourceState.UnorderedAccess);
         builder.Read(hCopyUB, ResourceState.ConstantBuffer);
     }
@@ -113,24 +124,24 @@ public class ClusterDebugPass : IDisposable
     public void ExecuteSphereCopy(RenderContext context, RenderGraphContext rgCtx, RenderGraphHandle hIndirectDrawArgs, RenderGraphHandle hDebugIndirectArgs, RenderGraphHandle hCopyUB)
     {
         var ctx = context.ImmediateContext;
-        if (ctx == null || ClusterDebugPSOs.CopyPSO == null) return;
+        if (ctx == null || _resources.CopyPSO == null) return;
 
         var drawArgs = rgCtx.GetBuffer(hIndirectDrawArgs);
         var debugIndirectArgs = rgCtx.GetBuffer(hDebugIndirectArgs);
         var copyUniformBuffer = rgCtx.GetBuffer(hCopyUB);
         if (drawArgs == null || debugIndirectArgs == null || copyUniformBuffer == null) return;
 
-        var srb = ClusterDebugPSOs.RentSRB(ClusterDebugPSOs.CopyPSO, ClusterDebugPSOs.CopySRBPool);
+        var srb = _resources.CopyPool.Rent(_resources.CopyPSO);
 
-        srb.GetVariableByName(ShaderType.Compute, "CopyUniforms")?.Set(copyUniformBuffer, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "IndirectArgs")?.Set(drawArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "DebugArgs")?.Set(debugIndirectArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(context, _resources.CopyShaderAsset, ShaderType.Compute, "CopyUniforms")?.Set(copyUniformBuffer, SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(context, _resources.CopyShaderAsset, ShaderType.Compute, "IndirectArgs")?.Set(drawArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(context, _resources.CopyShaderAsset, ShaderType.Compute, "DebugArgs")?.Set(debugIndirectArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
-        ctx.SetPipelineState(ClusterDebugPSOs.CopyPSO);
+        ctx.SetPipelineState(_resources.CopyPSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
 
-        ClusterDebugPSOs.ReturnSRB(srb, ClusterDebugPSOs.CopySRBPool);
+        _resources.CopyPool.Return(srb);
     }
 
     public void SetupSphereDraw(RenderGraphBuilder builder, RenderGraphHandle hVisibleClusters, RenderGraphHandle hDebugIndirectArgs, RenderGraphHandle hDrawUB, RenderGraphHandle hPageHeap, RenderGraphHandle hColor, RenderGraphHandle hDepth)
@@ -146,7 +157,7 @@ public class ClusterDebugPass : IDisposable
     public void ExecuteSphereDraw(RenderContext context, RenderGraphContext rgCtx, RenderGraphHandle hVisibleClusters, RenderGraphHandle hDebugIndirectArgs, RenderGraphHandle hPageHeap, RenderGraphHandle hDrawUB)
     {
         var ctx = context.ImmediateContext;
-        if (ctx == null || ClusterDebugPSOs.SpherePSO == null) return;
+        if (ctx == null || _resources.SpherePSO == null) return;
 
         var visible = rgCtx.GetBuffer(hVisibleClusters);
         var debugIndirectArgs = rgCtx.GetBuffer(hDebugIndirectArgs);
@@ -155,13 +166,13 @@ public class ClusterDebugPass : IDisposable
 
         if (visible == null || debugIndirectArgs == null || pageHeap == null || drawUniformBuffer == null) return;
 
-        var srb = ClusterDebugPSOs.RentSRB(ClusterDebugPSOs.SpherePSO, ClusterDebugPSOs.SphereSRBPool);
+        var srb = _resources.SpherePool.Rent(_resources.SpherePSO);
 
-        srb.GetVariableByName(ShaderType.Vertex, "DrawUniforms")?.Set(drawUniformBuffer, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Vertex, "RequestBuffer")?.Set(visible.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Vertex, "PageHeap")?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(context, _resources.SphereShaderAsset, ShaderType.Vertex, "DrawUniforms")?.Set(drawUniformBuffer, SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(context, _resources.SphereShaderAsset, ShaderType.Vertex, "RequestBuffer")?.Set(visible.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(context, _resources.SphereShaderAsset, ShaderType.Vertex, "PageHeap")?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
 
-        ctx.SetPipelineState(ClusterDebugPSOs.SpherePSO);
+        ctx.SetPipelineState(_resources.SpherePSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DrawIndirect(new DrawIndirectAttribs
         {
@@ -172,7 +183,7 @@ public class ClusterDebugPass : IDisposable
             Flags = DrawFlags.None,
         });
 
-        ClusterDebugPSOs.ReturnSRB(srb, ClusterDebugPSOs.SphereSRBPool);
+        _resources.SpherePool.Return(srb);
     }
 
     public void Dispose() { }

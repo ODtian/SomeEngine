@@ -9,6 +9,9 @@ namespace SomeEngine.Render.Pipelines;
 /// </summary>
 public static class ClusterStageUtils
 {
+    public static string ShaderPath(string fileName)
+        => Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders", fileName));
+
     public static RenderGraphHandle AddDynamicUniformPass<T>(RenderGraph graph, string name, T data) where T : unmanaged
     {
         var handle = graph.CreateBuffer(name, new BufferDesc

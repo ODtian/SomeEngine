@@ -1,7 +1,7 @@
 using System;
-using System.Collections.Concurrent;
 using Diligent;
 using SomeEngine.Assets.Importers;
+using SomeEngine.Assets.Schema;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
 
@@ -11,37 +11,34 @@ namespace SomeEngine.Render.Pipelines;
 /// Merges SW raster depth (R32_UINT DepthUAV) into the HW depth target (D32_Float DSV).
 /// Renders a fullscreen triangle that reads SW depth and outputs SV_Depth.
 /// </summary>
-public static class DepthMergePSOs
+public static partial class ClusterHiZ
 {
-    internal static IPipelineState? MergePSO;
-    internal static readonly ConcurrentBag<IShaderResourceBinding> SRBPool = [];
+internal sealed class DepthMergeResources : IDisposable
+{
+    internal const string ShaderFile = "depth_merge.slang";
+    internal const string VertexEntryPoint = "VSFullscreen";
+    internal const string PixelEntryPoint = "PSDepthMerge";
 
-    private static bool s_initialized;
-    private static readonly Lock s_initLock = new();
+    internal IPipelineState? MergePSO;
+    internal ShaderAsset? ShaderAsset;
+    internal readonly SRBPool Pool = new();
 
-    internal static IShaderResourceBinding RentSRB()
-        => SRBPool.TryTake(out var srb) ? srb : MergePSO!.CreateShaderResourceBinding(false);
-
-    internal static void ReturnSRB(IShaderResourceBinding srb) => SRBPool.Add(srb);
-
-    internal static void EnsureInitialized(RenderContext context)
+    private bool _initialized;
+    private readonly Lock _initLock = new();
+internal void EnsureInitialized(RenderContext context)
     {
-        if (s_initialized) return;
-        lock (s_initLock)
+        if (_initialized) return;
+        lock (_initLock)
         {
-            if (s_initialized) return;
+            if (_initialized) return;
             var device = context.Device;
             if (device == null) return;
 
-            string path = Path.GetFullPath(
-                Path.Combine(
-                    AppContext.BaseDirectory,
-                    "../../../../../../assets/Shaders/depth_merge.slang"
-                )
-            );
+            string path = ClusterStageUtils.ShaderPath(ShaderFile);
             var shaderAsset = SlangShaderImporter.Import(path);
-            using var vs = shaderAsset.CreateShader(context, "VSFullscreen");
-            using var ps = shaderAsset.CreateShader(context, "PSDepthMerge");
+            ShaderAsset = shaderAsset;
+            var vs = shaderAsset.CreateShader(context, VertexEntryPoint);
+            var ps = shaderAsset.CreateShader(context, PixelEntryPoint);
 
             MergePSO = device.CreateGraphicsPipelineState(new GraphicsPipelineStateCreateInfo
             {
@@ -68,28 +65,35 @@ public static class DepthMergePSOs
                     {
                         DepthEnable = true,
                         DepthWriteEnable = true,
-                        // ALWAYS: unconditionally write SW depth into the HW buffer.
-                        // The PS outputs SV_Depth with the converted SW depth value,
-                        // and discards pixels with no SW depth (swDepthBits == 0).
-                        DepthFunc = ComparisonFunction.Always,
+                        // Merge SW depth only when it is closer than the depth already
+                        // produced by HW draws. Phase2 reuses the Phase1 SW depth UAV,
+                        // so Always would replay stale SW depths over nearer HW occluders.
+                        DepthFunc = ComparisonFunction.Less,
                     },
                 },
                 Vs = vs,
                 Ps = ps,
             });
-
-            s_initialized = true;
+            _initialized = true;
         }
     }
+
+    public void Dispose()
+    {
+        Pool.Dispose();
+        MergePSO?.Dispose();
+    }
+}
 }
 
 /// <summary>
 /// RenderGraph pass: fullscreen depth merge (SW → HW depth).
-/// Clears depthTarget to 1.0 (far plane), then draws a fullscreen triangle
-/// that reads SW DepthUAV and outputs SV_Depth for SW-drawn pixels.
+/// Draws a fullscreen triangle that reads SW DepthUAV and writes closer SW
+/// depths into the HW depth target.
 /// </summary>
-public class DepthMergePass(
+internal class DepthMergePass(
     RenderContext context,
+    ClusterHiZ.DepthMergeResources resources,
     string passName = "DepthMerge"
 ) : IRenderGraphPass
 {
@@ -98,7 +102,7 @@ public class DepthMergePass(
     public RenderGraphHandle HSWDepthUAV = RenderGraphHandle.Invalid;
     public RenderGraphHandle HDepthTarget = RenderGraphHandle.Invalid;
 
-    public void Init() => DepthMergePSOs.EnsureInitialized(context);
+    public void Init() => resources.EnsureInitialized(context);
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -108,8 +112,8 @@ public class DepthMergePass(
 
     public void Execute(RenderGraphContext rgCtx)
     {
-        DepthMergePSOs.EnsureInitialized(context);
-        var pso = DepthMergePSOs.MergePSO;
+        resources.EnsureInitialized(context);
+        var pso = resources.MergePSO;
         if (pso == null) return;
 
         var ctx = context.ImmediateContext;
@@ -124,9 +128,9 @@ public class DepthMergePass(
         ctx.SetRenderTargets([], dsv, ResourceStateTransitionMode.None);
 
         // 2. Draw fullscreen triangle to inject SW depths
-        var srb = DepthMergePSOs.RentSRB();
+        var srb = resources.Pool.Rent(resources.MergePSO!);
 
-        srb.GetVariableByName(ShaderType.Pixel, "SWDepthUAV")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Pixel, "SWDepthUAV")
             ?.Set(swDepthSRV, SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(pso);
@@ -139,6 +143,6 @@ public class DepthMergePass(
             Flags = DrawFlags.VerifyAll,
         });
 
-        DepthMergePSOs.ReturnSRB(srb);
+        resources.Pool.Return(srb);
     }
 }

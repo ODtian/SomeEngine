@@ -5,14 +5,16 @@ using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Pipelines;
 
-public static class ClusterDeformBinStage
+public static partial class ClusterDeformBinStage
 {
     public static ClusterDeformBinOutput AddPasses(
         RenderGraph graph,
         RenderContext context,
+        Resources resources,
         in ClusterCullOutput cull,
         RenderGraphHandle hInstanceHeaders,
         RenderGraphHandle hDrawArgs,
+        RenderGraphHandle hReadOffsetArgs,
         RenderGraphHandle hMaterialSlotBuffer,
         RenderGraphHandle hPageHeap,
         uint slotCapacity,
@@ -21,14 +23,14 @@ public static class ClusterDeformBinStage
         string? tag = null
     )
     {
-        ClusterDeformBinPSOs.EnsureInitialized(context);
+        resources.EnsureInitialized(context);
 
         string prefix = tag != null ? $"{tag}_" : "";
         uint maxBins = totalBins > 0 ? totalBins : 1;
 
         var hDeformBinMeta = graph.CreateBuffer($"{prefix}DeformBinMeta", new BufferDesc
         {
-            Size = maxBins * 16, // BinCount, Cursor, ClusterOffset, Padding
+            Size = maxBins * 16,
             BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
             Mode = BufferMode.Structured,
             ElementByteStride = 16,
@@ -36,13 +38,12 @@ public static class ClusterDeformBinStage
 
         var hDeformBinnedClusterIndex = graph.CreateBuffer($"{prefix}DeformBinnedClusterIndexBuffer", new BufferDesc
         {
-            Size = (ulong)(ClusterLimits.MaxDraws * 8 * 3), // uint2 per entry, max ~3 ranges fast path per cluster
+            Size = ClusterLimits.MaxDraws * ClusterLimits.MaxBinnedEntriesPerCluster * 8UL,
             BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
             Mode = BufferMode.Structured,
             ElementByteStride = 8,
         });
 
-        // Used by count/scatter to loop over visible clusters
         var hDeformBinningDispatchArgs = graph.CreateBuffer($"{prefix}DeformBinningDispatchArgs", new BufferDesc
         {
             Size = 12,
@@ -51,13 +52,19 @@ public static class ClusterDeformBinStage
             ElementByteStride = 4,
         });
 
-        // The actual dispatch args for the final PreDeform passes (one ThreadGroup(X, 1, 1) per bin entry)
         var hPreDeformDispatchArgs = graph.CreateBuffer($"{prefix}PreDeformDispatchArgs", new BufferDesc
         {
-            Size = maxBins * 12, // 3 uints per bin
-            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource | BindFlags.IndirectDrawArgs,
+            Size = maxBins * 12,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs,
+            Mode = BufferMode.Raw,
+            ElementByteStride = 4,
+        });
+        var hReserveCounters = graph.CreateBuffer($"{prefix}DeformBinReserveCounters", new BufferDesc
+        {
+            Size = 4,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
             Mode = BufferMode.Structured,
-            ElementByteStride = 12,
+            ElementByteStride = 4,
         });
 
         var hBinningUniforms = graph.CreateBuffer($"{prefix}DeformBinningUniforms", new BufferDesc
@@ -92,41 +99,45 @@ public static class ClusterDeformBinStage
             }
         );
 
-        graph.AddPass(new ClusterDeformBinInitPass(context)
+        graph.AddPass(new ClusterDeformBinInitPass(context, resources)
         {
             HBinningUniforms = hBinningUniforms,
             HDrawArgs = hDrawArgs,
             HDeformBinningDispatchArgs = hDeformBinningDispatchArgs,
             HDeformBinMeta = hDeformBinMeta,
             MaxBins = maxBins,
+            HReserveCounters = hReserveCounters,
         });
 
-        graph.AddPass(new ClusterDeformBinCountPass(context)
+        graph.AddPass(new ClusterDeformBinCountPass(context, resources)
         {
             HBinningUniforms = hBinningUniforms,
             HVisibleClusters = cull.VisibleClusters,
             HInstanceHeaders = hInstanceHeaders,
             HDrawArgs = hDrawArgs,
+            HReadOffsetArgs = hReadOffsetArgs,
             HDeformBinningDispatchArgs = hDeformBinningDispatchArgs,
             HDeformBinMeta = hDeformBinMeta,
             HMaterialSlotBuffer = hMaterialSlotBuffer,
             HPageHeap = hPageHeap,
         });
 
-        graph.AddPass(new ClusterDeformBinReservePass(context)
+        graph.AddPass(new ClusterDeformBinReservePass(context, resources)
         {
             HBinningUniforms = hBinningUniforms,
             HDeformBinMeta = hDeformBinMeta,
-            HDeformBinningDispatchArgs = hPreDeformDispatchArgs, // Reserve writes the final pre-deform dispatch args here
+            HDeformBinningDispatchArgs = hPreDeformDispatchArgs,
+            HReserveCounters = hReserveCounters,
             MaxBins = maxBins,
         });
 
-        graph.AddPass(new ClusterDeformBinScatterPass(context)
+        graph.AddPass(new ClusterDeformBinScatterPass(context, resources)
         {
             HBinningUniforms = hBinningUniforms,
             HVisibleClusters = cull.VisibleClusters,
             HInstanceHeaders = hInstanceHeaders,
             HDrawArgs = hDrawArgs,
+            HReadOffsetArgs = hReadOffsetArgs,
             HDeformBinningDispatchArgs = hDeformBinningDispatchArgs,
             HDeformBinMeta = hDeformBinMeta,
             HDeformBinnedClusterBuffer = hDeformBinnedClusterIndex,

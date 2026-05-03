@@ -1,8 +1,6 @@
 using System;
-using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using Diligent;
-using SomeEngine.Assets.Importers;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
 
@@ -12,7 +10,7 @@ namespace SomeEngine.Render.Pipelines;
 [StructLayout(LayoutKind.Sequential)]
 public struct SWRasterUniforms
 {
-    // float4x4 ViewProj (row-major → column-major transpose before upload)
+    // float4x4 ViewProj (row-major �?column-major transpose before upload)
     public System.Numerics.Matrix4x4 ViewProj;
     public System.Numerics.Vector3 QuantOrigin;
     public float QuantStep;
@@ -27,77 +25,6 @@ public struct SWRasterUniforms
 }
 
 // ─── Static PSO/SRB cache ───
-public static class ClusterSWRasterPSOs
-{
-    internal static IPipelineState? SWRasterPSO;
-    internal static IPipelineState? SWRasterCachedPSO;
-    internal static readonly ConcurrentBag<IShaderResourceBinding> SRBPool = [];
-    internal static readonly ConcurrentBag<IShaderResourceBinding> CachedSRBPool = [];
-
-    private static bool s_initialized;
-    private static readonly Lock s_initLock = new();
-
-    internal static IShaderResourceBinding RentSRB(bool cached)
-    {
-        var pool = cached ? CachedSRBPool : SRBPool;
-        var pso = cached ? SWRasterCachedPSO! : SWRasterPSO!;
-        return pool.TryTake(out var srb) ? srb : pso.CreateShaderResourceBinding(false);
-    }
-
-    internal static void ReturnSRB(IShaderResourceBinding srb, bool cached)
-        => (cached ? CachedSRBPool : SRBPool).Add(srb);
-
-    internal static void EnsureInitialized(RenderContext context)
-    {
-        if (s_initialized) return;
-        lock (s_initLock)
-        {
-            if (s_initialized) return;
-            var device = context.Device;
-            if (device == null) return;
-
-            string path = Path.GetFullPath(
-                Path.Combine(
-                    AppContext.BaseDirectory,
-                    "../../../../../../assets/Shaders/sw_raster.slang"
-                )
-            );
-            var shaderAsset = SlangShaderImporter.Import(path);
-
-            var psoLayout = new PipelineResourceLayoutDesc
-            {
-                DefaultVariableType = ShaderResourceVariableType.Dynamic,
-            };
-
-            using var cs = shaderAsset.CreateShader(context, "CSSWRaster");
-            SWRasterPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
-            {
-                PSODesc = new PipelineStateDesc
-                {
-                    Name = "CSSWRaster",
-                    PipelineType = PipelineType.Compute,
-                    ResourceLayout = psoLayout,
-                },
-                Cs = cs,
-            });
-
-            using var csCached = shaderAsset.CreateShader(context, "CSSWRasterCached");
-            SWRasterCachedPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
-            {
-                PSODesc = new PipelineStateDesc
-                {
-                    Name = "CSSWRasterCached",
-                    PipelineType = PipelineType.Compute,
-                    ResourceLayout = psoLayout,
-                },
-                Cs = csCached,
-            });
-
-            s_initialized = true;
-        }
-    }
-}
-
 // ─── RenderGraph Pass (per-frame lightweight instance) ───
 public class ClusterSWRasterPass(
     RenderContext context,
@@ -115,12 +42,13 @@ public class ClusterSWRasterPass(
     public RenderGraphHandle HPageHeap = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinnedSWDispatchArgs = RenderGraphHandle.Invalid;
 
-    // ─── DeformCache handles (optional — validity = enabled) ───
+    // ─── DeformCache handles (optional �?validity = enabled) ───
     public RenderGraphHandle HDeformCache = RenderGraphHandle.Invalid;
     public RenderGraphHandle HCacheOffsets = RenderGraphHandle.Invalid;
 
     // ─── Output handles (set by caller) ───
     public RenderGraphHandle HVisBuffer = RenderGraphHandle.Invalid;
+    public RenderGraphHandle HDepthTarget = RenderGraphHandle.Invalid;
     public RenderGraphHandle HDepthUAV = RenderGraphHandle.Invalid;
     public RenderGraphHandle HDebugSWOutput = RenderGraphHandle.Invalid;
 
@@ -128,7 +56,7 @@ public class ClusterSWRasterPass(
     public SWRasterUniforms SWRasterUniformData;
 
     // ─── PSO Groups (from material pipeline) ───
-    public ShadePSOGroup[]? PSOGroups;
+    public MaterialPSOGroup[]? PSOGroups;
     public uint TotalBinCount { get; set; } = 1;
 
     public void Init() { }
@@ -147,6 +75,7 @@ public class ClusterSWRasterPass(
             builder.Read(HDeformCache, ResourceState.ShaderResource);
             builder.Read(HCacheOffsets, ResourceState.ShaderResource);
         }
+        builder.Read(HDepthTarget, ResourceState.ShaderResource);
         builder.Write(HVisBuffer, ResourceState.UnorderedAccess);
         builder.Write(HDepthUAV, ResourceState.UnorderedAccess);
         if (HDebugSWOutput.IsValid)
@@ -170,36 +99,41 @@ public class ClusterSWRasterPass(
         var globalTransformView = rgCtx.GetBufferView(HGlobalTransformBuffer, BufferViewType.ShaderResource);
 
         var visBufferUAV = rgCtx.GetTextureView(HVisBuffer, TextureViewType.UnorderedAccess);
+        var depthTargetSRV = rgCtx.GetTextureView(HDepthTarget, TextureViewType.ShaderResource);
         var depthUAV     = rgCtx.GetTextureView(HDepthUAV, TextureViewType.UnorderedAccess);
-        if (visBufferUAV == null || depthUAV == null) return;
+        if (visBufferUAV == null || depthTargetSRV == null || depthUAV == null) return;
 
         bool cached = HDeformCache.IsValid;
         var uniformData = SWRasterUniformData;
 
         foreach (var group in PSOGroups)
         {
-            if (group.PSO == null) continue;
+            if (group.PSO == null || group.SRB == null) continue;
+            var shaderAsset = group.ComputeVariant.Shader;
+            if (shaderAsset == null) continue;
 
-            var srb = group.PSO.CreateShaderResourceBinding(false);
+            var srb = group.SRB;
 
-            srb.GetVariableByName(ShaderType.Compute, "Uniforms")
+            srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "Uniforms")
                 ?.Set(uniformBuf, SetShaderResourceFlags.None);
-            srb.GetVariableByName(ShaderType.Compute, "VisibleClusters")
+            srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "VisibleClusters")
                 ?.Set(visibleBuf.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-            srb.GetVariableByName(ShaderType.Compute, "BinnedClusterIndexBuffer")
+            srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "BinnedClusterIndexBuffer")
                 ?.Set(binnedBuf.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-            srb.GetVariableByName(ShaderType.Compute, "RasterBinMeta")
+            srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "RasterBinMeta")
                 ?.Set(metaBuf.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-            srb.GetVariableByName(ShaderType.Compute, "PageHeap")
+            srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "PageHeap")
                 ?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+            srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "DepthTarget")
+                ?.Set(depthTargetSRV, SetShaderResourceFlags.None);
             if (globalTransformView != null)
             {
-                srb.GetVariableByName(ShaderType.Compute, "Instances")
+                srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "Instances")
                     ?.Set(globalTransformView, SetShaderResourceFlags.None);
             }
-            srb.GetVariableByName(ShaderType.Compute, "VisBuffer")
+            srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "VisBuffer")
                 ?.Set(visBufferUAV, SetShaderResourceFlags.None);
-            srb.GetVariableByName(ShaderType.Compute, "DepthUAV")
+            srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "DepthUAV")
                 ?.Set(depthUAV, SetShaderResourceFlags.None);
 
             if (cached)
@@ -207,17 +141,17 @@ public class ClusterSWRasterPass(
                 var cacheBuf = rgCtx.GetBuffer(HDeformCache);
                 var offsetsBuf = rgCtx.GetBuffer(HCacheOffsets);
                 if (cacheBuf != null)
-                    srb.GetVariableByName(ShaderType.Compute, "DeformCache")
+                    srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "DeformCache")
                         ?.Set(cacheBuf.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
                 if (offsetsBuf != null)
-                    srb.GetVariableByName(ShaderType.Compute, "CacheOffsets")
+                    srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "CacheOffsets")
                         ?.Set(offsetsBuf.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
             }
 
             if (HDebugSWOutput.IsValid)
             {
                 var debugBuf = rgCtx.GetBuffer(HDebugSWOutput);
-                var debugVar = srb.GetVariableByName(ShaderType.Compute, "DebugSWOutput");
+                var debugVar = srb.GetVariableByReflectedBinding(context, shaderAsset, ShaderType.Compute, "DebugSWOutput");
                 if (debugBuf != null && debugVar != null)
                     debugVar.Set(debugBuf.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
             }
@@ -227,7 +161,9 @@ public class ClusterSWRasterPass(
 
             for (int i = 0; i < group.BinCount; i++)
             {
-                int bin = group.BinStart + i;
+                int bin = group.ArgsBins != null && i < group.ArgsBins.Length
+                    ? group.ArgsBins[i]
+                    : group.BinStart + i;
                 uniformData.CurrentBin = (uint)bin;
                 var mapped = ctx.MapBuffer<SWRasterUniforms>(uniformBuf, MapType.Write, MapFlags.Discard);
                 mapped[0] = uniformData;

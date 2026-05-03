@@ -1,37 +1,41 @@
 {
-  "asset_guid": "66229235-4b5b-4537-b112-7862440fa4c4",
+  "asset_guid": "77261b58-8f75-5ad6-8fee-d7490a8cf873",
   "source_guid": "7842851d-de0f-4d7d-8386-12b37a99d845",
   "sub_asset_key": "shader:main",
-  "content_fingerprint": "6b1790ff005b0362026e4e390c416960b229605edaf4baee2446502735792e5b",
+  "content_fingerprint": "cc0c1c24bd41df65205b596bbdf2985427aa4cd7f9399ef385268434e1c26c43",
   "dependencies": [
     {
       "path": "assets/Shaders/cluster_common.slang",
-      "hash": "06307188f979e6288200add78b76f6699651a20a0905cb93fee75403a715d594"
+      "hash": "386666769386237c388c623c611341170505536c8d5d32d94acca68d212d8d9c"
     },
     {
       "path": "assets/Shaders/cluster_shade_pipeline.slang",
-      "hash": "d4858b710fa15f1210ed443e23b9c676b3440593db6683c80f7b5774f5405fd5"
+      "hash": "047d57c31054ffefdd3618ca5247c68b6882e75f78a18c8a95fb83d72e6e4c7c"
     },
     {
       "path": "assets/Shaders/cluster_shade_unlit.slang",
-      "hash": "f73f8e1dd2e247dc262fe25229e16643f73a7b257333e5956840e50c109f73b4"
+      "hash": "4770e9189a6b1f09c1b1e38648c240e7942c0e3cddd4028c23719652abac8e3f"
     },
     {
       "path": "assets/Shaders/cluster_structures.slang",
-      "hash": "5bd548eb0e471af3befa58d629b0fb1c752eaab40d77c80eb2359fd097fdd2c8"
+      "hash": "9b2a65aacbb7ac8400d74cd1f74b24b0e904a3c38d2a884d9b83c6c1710426e4"
     },
     {
       "path": "assets/Shaders/common.slang",
-      "hash": "647dfc235a333f99ae539ceb4bbeba07a2d396cc0e374d0e9ab8a9e05af278f4"
+      "hash": "8d6c13488dec6ded178f1c73f93ddf8de3124d808426e7974f3fdeae0112a625"
+    },
+    {
+      "path": "assets/Shaders/generated/instance_header_layout.slang",
+      "hash": "2c118aca994b1a69f4d81a89838f156e5639b6989414cba21bba2c00b219e8d0"
     },
     {
       "path": "assets/Shaders/material_interfaces.slang",
-      "hash": "7dc76c690e25f8710633791e13423c8aef2a0f39346c0f908f432b28c88ab76e"
+      "hash": "f46904c7ab6788a34a9111a17996b7933a4546b2fcf4fd40640f05d707f77e57"
     },
     {
       "path": "assets/Shaders/vertex_evaluate.slang",
-      "hash": "9e56559ba9a9ef3579b37427686aa83e6ac303e379cbac75f326f067779041c4"
+      "hash": "611b83635d80a3d3ae8d364dcd02db1bdcfe5a9480d66c170f8413bacf7648f5"
     }
   ],
-  "importer_version": 2
+  "importer_version": 6
 }

@@ -28,4 +28,42 @@ interface ISurfaceEvaluate
     void evaluateSurface(PixelContext ctx, RWTexture2D<float4> outputColor);
 };
 
+static const uint MATERIAL_SCALAR_HEADER_BYTES = 16;
+
+ByteAddressBuffer MaterialScalarRegion;
+
+uint GetMaterialScalarPayloadByteSize()
+{
+    return MaterialScalarRegion.Load(0);
+}
+
+uint LoadMaterialScalarLayoutHash()
+{
+    return MaterialScalarRegion.Load(4);
+}
+
+uint4 LoadMaterialScalarBytesRaw(uint byteOffset, uint4 defaultValue)
+{
+    if (byteOffset + 16 > GetMaterialScalarPayloadByteSize())
+        return defaultValue;
+
+    return MaterialScalarRegion.Load4(MATERIAL_SCALAR_HEADER_BYTES + byteOffset);
+}
+
+T LoadMaterialScalarBytes<T>(uint byteOffset, T defaultValue)
+{
+    if (byteOffset + sizeof(T) > GetMaterialScalarPayloadByteSize())
+        return defaultValue;
+
+    return MaterialScalarRegion.Load<T>(MATERIAL_SCALAR_HEADER_BYTES + byteOffset);
+}
+
+T LoadMaterialScalars<T>(T defaultValue)
+{
+    if (GetMaterialScalarPayloadByteSize() < sizeof(T))
+        return defaultValue;
+
+    return MaterialScalarRegion.Load<T>(MATERIAL_SCALAR_HEADER_BYTES);
+}
+
 #endif

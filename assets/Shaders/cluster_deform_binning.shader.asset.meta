@@ -1,0 +1,29 @@
+{
+  "asset_guid": "ba251014-195c-5593-b76c-5654dd5909bf",
+  "source_guid": "bd2cc95f-3e09-4108-b30a-fde100d66802",
+  "sub_asset_key": "shader:main",
+  "content_fingerprint": "7c66c1b8ec6c51b61db4730bf04fe5d4ba9073577bc9e527a2c8b60644925338",
+  "dependencies": [
+    {
+      "path": "assets/Shaders/cluster_common.slang",
+      "hash": "386666769386237c388c623c611341170505536c8d5d32d94acca68d212d8d9c"
+    },
+    {
+      "path": "assets/Shaders/cluster_deform_binning.slang",
+      "hash": "2a4cf15477acc05658ab70d264b9bdf90596d53bb16f91701b22569018a1abbf"
+    },
+    {
+      "path": "assets/Shaders/cluster_structures.slang",
+      "hash": "9b2a65aacbb7ac8400d74cd1f74b24b0e904a3c38d2a884d9b83c6c1710426e4"
+    },
+    {
+      "path": "assets/Shaders/common.slang",
+      "hash": "8d6c13488dec6ded178f1c73f93ddf8de3124d808426e7974f3fdeae0112a625"
+    },
+    {
+      "path": "assets/Shaders/generated/instance_header_layout.slang",
+      "hash": "2c118aca994b1a69f4d81a89838f156e5639b6989414cba21bba2c00b219e8d0"
+    }
+  ],
+  "importer_version": 6
+}

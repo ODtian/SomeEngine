@@ -9,4 +9,9 @@ public struct ClusterRaster : IComponent
     public ShaderVariantRef HWVSInline;
     public ShaderVariantRef HWVSCached;
     public ShaderVariantRef HWPS;
+
+    public static void CopyValue(in ClusterRaster source, ref ClusterRaster target, in CopyContext context)
+    {
+        target = source;
+    }
 }

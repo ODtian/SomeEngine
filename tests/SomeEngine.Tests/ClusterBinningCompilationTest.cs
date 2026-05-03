@@ -9,15 +9,48 @@ public class ClusterBinningCompilationTest
     [Fact]
     public void ClusterBinning_CompilesSuccessfully()
     {
-        string source = """
-            #include "cluster_binning.slang"
+        CompileIncludeAndAssert(
+            "cluster_binning.slang",
+            "_test_cluster_binning.slang",
+            ["CSBinningClear", "CSBinningPrepare", "CSBinningCount", "CSBinningReserve", "CSBinningScatter"]);
+    }
+
+    [Fact]
+    public void ClusterShadeBinning_CompilesSuccessfully()
+    {
+        CompileIncludeAndAssert(
+            "cluster_shade_binning.slang",
+            "_test_cluster_shade_binning.slang",
+            ["CSBinCount", "CSBinReserve", "CSBinScatter"]);
+    }
+
+    [Fact]
+    public void ClusterDeformBinning_CompilesSuccessfully()
+    {
+        CompileIncludeAndAssert(
+            "cluster_deform_binning.slang",
+            "_test_cluster_deform_binning.slang",
+            [
+                "CSDeformBinClear",
+                "CSDeformBinPrepare",
+                "CSDeformBinCount",
+                "CSDeformBinReserve",
+                "CSDeformBinReserveDispatchWrite",
+                "CSDeformBinScatter",
+            ]);
+    }
+
+    private static void CompileIncludeAndAssert(string includeFile, string tempFileName, string[] entryPoints)
+    {
+        string source = $"""
+            #include "{includeFile}"
         """;
 
         string shaderDir = Path.GetFullPath(Path.Combine(
             AppContext.BaseDirectory,
             "..", "..", "..", "..", "..", "..", "assets", "Shaders"));
 
-        string slangFile = Path.Combine(shaderDir, "_test_cluster_binning.slang");
+        string slangFile = Path.Combine(shaderDir, tempFileName);
         File.WriteAllText(slangFile, source);
 
         try
@@ -28,7 +61,6 @@ public class ClusterBinningCompilationTest
             Assert.NotNull(asset.Variants);
             Assert.NotEmpty(asset.Variants!);
 
-            string[] entryPoints = ["CSBinningClear", "CSBinningPrepare", "CSBinningCount", "CSBinningReserve", "CSBinningScatter"];
             foreach (string entryPoint in entryPoints)
             {
                 var spirv = asset.Variants!.FirstOrDefault(v => v.EntryPoint == entryPoint && v.Backend == "spirv");

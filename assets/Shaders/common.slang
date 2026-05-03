@@ -1,6 +1,15 @@
 #ifndef COMMON_SLANG
 #define COMMON_SLANG
 
+[__AttributeUsage(_AttributeTargets.Function)]
+struct ClusterShadeAttribute {};
+
+[__AttributeUsage(_AttributeTargets.Function)]
+struct ClusterRasterAttribute { string variant; };
+
+[__AttributeUsage(_AttributeTargets.Function)]
+struct ClusterDeformAttribute {};
+
 struct GpuTransform
 {
     float4 Rotation;

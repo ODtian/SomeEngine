@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
@@ -15,15 +14,22 @@ namespace SomeEngine.Render.Pipelines;
 
 internal static class ClusterBVHTraversePSOs
 {
+    internal const string ShaderFile = "cluster_bvh_traverse.slang";
+    internal const string TraverseEntryPoint = "main";
+    internal const string UpdateArgsEntryPoint = "UpdateArgs";
+    internal const string InitArgsEntryPoint = "InitArgs";
+    internal const string InitQueueEntryPoint = "InitQueue";
+
     internal static IPipelineState? TraversePSO;
     internal static IPipelineState? UpdateArgsPSO;
-    internal static IPipelineState? ClearArgsPSO;
+    internal static IPipelineState? InitArgsPSO;
     internal static IPipelineState? InitQueuePSO;
+    internal static ShaderAsset? ShaderAsset;
 
-    internal static readonly ConcurrentBag<IShaderResourceBinding> TraverseSRBPool = [];
-    internal static readonly ConcurrentBag<IShaderResourceBinding> UpdateArgsSRBPool = [];
-    internal static readonly ConcurrentBag<IShaderResourceBinding> ClearArgsSRBPool = [];
-    internal static readonly ConcurrentBag<IShaderResourceBinding> InitQueueSRBPool = [];
+    internal static IShaderResourceBinding? TraverseSRB;
+    internal static IShaderResourceBinding? UpdateArgsSRB;
+    internal static IShaderResourceBinding? InitArgsSRB;
+    internal static IShaderResourceBinding? InitQueueSRB;
 
     private static bool s_initialized;
     private static readonly Lock s_initLock = new();
@@ -34,14 +40,15 @@ internal static class ClusterBVHTraversePSOs
         lock (s_initLock)
         {
             if (s_initialized) return;
+
             var device = context.Device;
             if (device == null) return;
 
-            string shaderPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
-                "../../../../../../assets/Shaders/cluster_bvh_traverse.slang"));
+            string shaderPath = ClusterStageUtils.ShaderPath(ShaderFile);
             var shaderAsset = SlangShaderImporter.Import(shaderPath);
+            ShaderAsset = shaderAsset;
 
-            using var csTraverse = shaderAsset.CreateShader(context, "main");
+            var csTraverse = shaderAsset.CreateShader(context, TraverseEntryPoint);
             TraversePSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
                 PSODesc = new PipelineStateDesc
@@ -65,7 +72,7 @@ internal static class ClusterBVHTraversePSOs
                 Cs = csTraverse,
             });
 
-            using var csUpdateArgs = shaderAsset.CreateShader(context, "UpdateArgs");
+            var csUpdateArgs = shaderAsset.CreateShader(context, UpdateArgsEntryPoint);
             UpdateArgsPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
                 PSODesc = new PipelineStateDesc
@@ -77,19 +84,19 @@ internal static class ClusterBVHTraversePSOs
                 Cs = csUpdateArgs,
             });
 
-            using var csClearArgs = shaderAsset.CreateShader(context, "ClearArgs");
-            ClearArgsPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
+            var csInitArgs = shaderAsset.CreateShader(context, InitArgsEntryPoint);
+            InitArgsPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
                 PSODesc = new PipelineStateDesc
                 {
-                    Name = "BVH Clear Args PSO",
+                    Name = "BVH Init Args PSO",
                     PipelineType = PipelineType.Compute,
                     ResourceLayout = new PipelineResourceLayoutDesc { DefaultVariableType = ShaderResourceVariableType.Dynamic },
                 },
-                Cs = csClearArgs,
+                Cs = csInitArgs,
             });
 
-            using var csInitQueue = shaderAsset.CreateShader(context, "InitQueue");
+            var csInitQueue = shaderAsset.CreateShader(context, InitQueueEntryPoint);
             InitQueuePSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
                 PSODesc = new PipelineStateDesc
@@ -101,15 +108,14 @@ internal static class ClusterBVHTraversePSOs
                 Cs = csInitQueue,
             });
 
+            TraverseSRB = TraversePSO?.CreateShaderResourceBinding(false);
+            UpdateArgsSRB = UpdateArgsPSO?.CreateShaderResourceBinding(false);
+            InitArgsSRB = InitArgsPSO?.CreateShaderResourceBinding(false);
+            InitQueueSRB = InitQueuePSO?.CreateShaderResourceBinding(false);
+
             s_initialized = true;
         }
     }
-
-    internal static IShaderResourceBinding RentSRB(IPipelineState pso, ConcurrentBag<IShaderResourceBinding> pool)
-        => pool.TryTake(out var srb) ? srb : pso.CreateShaderResourceBinding(true); // Must be true for Traverse/Update/Clear/Init ? Wait, original code used 'true' (initStaticResources)
-
-    internal static void ReturnSRB(IShaderResourceBinding srb, ConcurrentBag<IShaderResourceBinding> pool)
-        => pool.Add(srb);
 }
 
 public class ClusterBVHTraversePass(
@@ -151,6 +157,8 @@ public class ClusterBVHTraversePass(
     private Matrix4x4 _prevViewProjT = Matrix4x4.Identity;
     private uint _hizMipCount;
     private Vector2 _hizInvSize = Vector2.Zero;
+    private int _instanceCount;
+    private int _maxDepth;
 
     public void SetFrameData(
         Matrix4x4 view, Matrix4x4 proj, Vector3 camPos, float lodThreshold, float lodScale,
@@ -165,18 +173,170 @@ public class ClusterBVHTraversePass(
 
     public void Init() => ClusterBVHTraversePSOs.EnsureInitialized(context);
 
-    public void Setup(RenderGraphBuilder builder) { }
-
-    public void Execute(RenderGraphContext rgCtx) { }
-
-    public void SetupReadbackPass(RenderGraphBuilder builder)
+    public void SetExecutionConfig(int instanceCount, int maxDepth)
     {
-        builder.ReadWrite(HReadbackBuffer, ResourceState.CopyDest);
-        builder.Read(HCandidateCount, ResourceState.CopySource);
-        builder.Read(HArgsA, ResourceState.CopySource);
-        builder.Read(HArgsB, ResourceState.CopySource);
+        _instanceCount = instanceCount;
+        _maxDepth = maxDepth;
+    }
+
+    public void Setup(RenderGraphBuilder builder)
+    {
+        bool hasInstances = _instanceCount > 0;
+        var argsExitState = hasInstances ? ResourceState.CopySource : ResourceState.UnorderedAccess;
+
+        builder.Use(
+            HArgsA,
+            ResourceState.UnorderedAccess,
+            argsExitState,
+            RenderGraphAccess.ReadWrite);
+        builder.Use(
+            HArgsB,
+            ResourceState.UnorderedAccess,
+            argsExitState,
+            RenderGraphAccess.ReadWrite);
+
+        if (!hasInstances)
+            return;
+
+        builder.Use(
+            HQueueA,
+            ResourceState.UnorderedAccess,
+            ResourceState.UnorderedAccess,
+            RenderGraphAccess.ReadWrite);
+        builder.Use(
+            HQueueB,
+            ResourceState.UnorderedAccess,
+            ResourceState.UnorderedAccess,
+            RenderGraphAccess.ReadWrite);
+        builder.Use(
+            HCandidateClusters,
+            ResourceState.UnorderedAccess,
+            ResourceState.UnorderedAccess,
+            RenderGraphAccess.Write);
+        builder.Use(
+            HCandidateCount,
+            ResourceState.UnorderedAccess,
+            ResourceState.CopySource,
+            RenderGraphAccess.ReadWrite);
+        builder.Use(
+            HPageFaultBuffer,
+            ResourceState.UnorderedAccess,
+            ResourceState.UnorderedAccess,
+            RenderGraphAccess.Write);
+
+        builder.Read(HCullingUniforms, ResourceState.ConstantBuffer);
+        builder.Read(HGlobalTransformBuffer, ResourceState.ShaderResource);
+        builder.Read(HGlobalInstanceHeaderBuffer, ResourceState.ShaderResource);
+        builder.Read(HGlobalBVHBuffer, ResourceState.ShaderResource);
+        builder.Read(HPageHeap, ResourceState.ShaderResource);
+
+        builder.Write(HReadbackBuffer, ResourceState.CopyDest);
         if (HPageFaultReadbackBuffer.IsValid)
             builder.ReadWrite(HPageFaultReadbackBuffer, ResourceState.CopyDest);
+    }
+
+    public void Execute(RenderGraphContext rgCtx)
+    {
+        var renderContext = rgCtx.RenderContext;
+
+        ResourceState queueAState = ResourceState.UnorderedAccess;
+        ResourceState queueBState = ResourceState.UnorderedAccess;
+        ResourceState argsAState = ResourceState.UnorderedAccess;
+        ResourceState argsBState = ResourceState.UnorderedAccess;
+        ResourceState candidateClustersState = ResourceState.UnorderedAccess;
+        ResourceState candidateCountState = ResourceState.UnorderedAccess;
+        ResourceState pageFaultState = ResourceState.UnorderedAccess;
+
+        void QueueTransition(
+            RenderGraphHandle handle,
+            ref ResourceState currentState,
+            ResourceState nextState)
+        {
+            rgCtx.QueueTransition(handle, currentState, nextState);
+            currentState = nextState;
+        }
+
+        void QueueUav(RenderGraphHandle handle, ref ResourceState currentState)
+        {
+            if (currentState != ResourceState.UnorderedAccess)
+            {
+                QueueTransition(handle, ref currentState, ResourceState.UnorderedAccess);
+                return;
+            }
+
+            rgCtx.QueueUavBarrier(handle);
+        }
+
+        QueueUav(HArgsA, ref argsAState);
+        QueueUav(HArgsB, ref argsBState);
+        rgCtx.FlushTransitions();
+        ExecuteInitArgsPass(renderContext, rgCtx);
+
+        if (_instanceCount <= 0)
+            return;
+
+        if (!BindFrameResources(rgCtx))
+            return;
+
+        QueueUav(HArgsA, ref argsAState);
+        rgCtx.FlushTransitions();
+        ExecuteInitQueuePass(renderContext, rgCtx);
+
+        QueueUav(HArgsA, ref argsAState);
+        QueueUav(HArgsB, ref argsBState);
+        rgCtx.FlushTransitions();
+        ExecuteUpdateArgsPass(renderContext, rgCtx, targetIsA: true, clearIsA: false);
+
+        bool currentIsA = true;
+        for (int depth = 0; depth < _maxDepth; depth++)
+        {
+            bool nextIsA = !currentIsA;
+
+            var currentQueue = currentIsA ? HQueueA : HQueueB;
+            var nextQueue = currentIsA ? HQueueB : HQueueA;
+            var currentArgs = currentIsA ? HArgsA : HArgsB;
+            var nextArgs = currentIsA ? HArgsB : HArgsA;
+
+            ref ResourceState currentQueueState = ref currentIsA ? ref queueAState : ref queueBState;
+            ref ResourceState nextQueueState = ref currentIsA ? ref queueBState : ref queueAState;
+            ref ResourceState currentArgsState = ref currentIsA ? ref argsAState : ref argsBState;
+            ref ResourceState nextArgsState = ref currentIsA ? ref argsBState : ref argsAState;
+
+            QueueTransition(currentQueue, ref currentQueueState, ResourceState.ShaderResource);
+            QueueTransition(
+                currentArgs,
+                ref currentArgsState,
+                ResourceState.ShaderResource | ResourceState.IndirectArgument);
+            QueueUav(nextQueue, ref nextQueueState);
+            QueueUav(nextArgs, ref nextArgsState);
+            QueueUav(HCandidateClusters, ref candidateClustersState);
+            QueueUav(HCandidateCount, ref candidateCountState);
+            QueueUav(HPageFaultBuffer, ref pageFaultState);
+            rgCtx.FlushTransitions();
+
+            ExecuteTraversePass(renderContext, rgCtx, currentIsA, depth);
+
+            QueueUav(nextArgs, ref nextArgsState);
+            QueueTransition(currentArgs, ref currentArgsState, ResourceState.UnorderedAccess);
+            rgCtx.FlushTransitions();
+            ExecuteUpdateArgsPass(
+                renderContext,
+                rgCtx,
+                targetIsA: nextIsA,
+                clearIsA: currentIsA);
+
+            currentIsA = nextIsA;
+        }
+
+        QueueTransition(
+            HCandidateCount,
+            ref candidateCountState,
+            ResourceState.CopySource);
+        QueueTransition(HArgsA, ref argsAState, ResourceState.CopySource);
+        QueueTransition(HArgsB, ref argsBState, ResourceState.CopySource);
+        rgCtx.FlushTransitions();
+
+        ExecuteReadbackPass(renderContext, rgCtx);
     }
 
     public void ExecuteReadbackPass(RenderContext renderContext, RenderGraphContext rgCtx)
@@ -201,93 +361,101 @@ public class ClusterBVHTraversePass(
         ctx.CopyBuffer(argsB, 0, ResourceStateTransitionMode.None, readback, 20, 16, ResourceStateTransitionMode.None);
     }
 
-    public void SetupClearArgsPass(RenderGraphBuilder builder, bool clearArgsA)
-    {
-        builder.Write(clearArgsA ? HArgsA : HArgsB, ResourceState.UnorderedAccess);
-    }
-
-    public void ExecuteClearArgsPass(RenderContext renderContext, RenderGraphContext rgCtx, bool clearArgsA)
+    public void ExecuteInitArgsPass(RenderContext renderContext, RenderGraphContext rgCtx)
     {
         var ctx = renderContext.ImmediateContext;
-        if (ctx == null || ClusterBVHTraversePSOs.ClearArgsPSO == null) return;
+        var srb = ClusterBVHTraversePSOs.InitArgsSRB;
+        if (ctx == null || ClusterBVHTraversePSOs.InitArgsPSO == null || srb == null) return;
 
-        var args = rgCtx.GetBuffer(clearArgsA ? HArgsA : HArgsB);
-        if (args == null) return;
+        var argsA = rgCtx.GetBuffer(HArgsA);
+        var argsB = rgCtx.GetBuffer(HArgsB);
+        if (argsA == null || argsB == null) return;
 
-        var srb = ClusterBVHTraversePSOs.RentSRB(ClusterBVHTraversePSOs.ClearArgsPSO, ClusterBVHTraversePSOs.ClearArgsSRBPool);
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "NextDispatchArgs")
+            ?.Set(argsA.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "ClearDispatchArgs")
+            ?.Set(argsB.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
-        srb.GetVariableByName(ShaderType.Compute, "NextDispatchArgs")
-            ?.Set(args.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-
-        ctx.SetPipelineState(ClusterBVHTraversePSOs.ClearArgsPSO);
+        ctx.SetPipelineState(ClusterBVHTraversePSOs.InitArgsPSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
-
-        ClusterBVHTraversePSOs.ReturnSRB(srb, ClusterBVHTraversePSOs.ClearArgsSRBPool);
     }
 
-    public void SetupInitQueuePass(RenderGraphBuilder builder)
+    public bool BindFrameResources(RenderGraphContext rgCtx)
     {
-        builder.Read(HCullingUniforms, ResourceState.ConstantBuffer);
-        builder.Read(HGlobalInstanceHeaderBuffer, ResourceState.ShaderResource);
-        builder.Write(HQueueA, ResourceState.UnorderedAccess);
-        builder.Write(HArgsA, ResourceState.UnorderedAccess);
+        var cullingUB = rgCtx.GetBuffer(HCullingUniforms);
+        var globalBVH = rgCtx.GetBuffer(HGlobalBVHBuffer);
+        var pageHeap = rgCtx.GetBuffer(HPageHeap);
+        var instances = rgCtx.GetBuffer(HGlobalTransformBuffer);
+        var headers = rgCtx.GetBuffer(HGlobalInstanceHeaderBuffer);
+        var candidates = rgCtx.GetBuffer(HCandidateClusters);
+        var candidateCount = rgCtx.GetBuffer(HCandidateCount);
+        var pageFault = rgCtx.GetBuffer(HPageFaultBuffer);
+
+        if (cullingUB == null || globalBVH == null || pageHeap == null || instances == null || headers == null ||
+            candidates == null || candidateCount == null || pageFault == null)
+            return false;
+
+        ClusterBVHTraversePSOs.InitQueueSRB?.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "Uniforms")
+            ?.Set(cullingUB, SetShaderResourceFlags.None);
+        ClusterBVHTraversePSOs.InitQueueSRB?.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "InstanceHeaders")
+            ?.Set(headers.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+
+        ClusterBVHTraversePSOs.UpdateArgsSRB?.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "Uniforms")
+            ?.Set(cullingUB, SetShaderResourceFlags.None);
+
+        var traverse = ClusterBVHTraversePSOs.TraverseSRB;
+        if (traverse == null)
+            return false;
+
+        traverse.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "GlobalBVH")
+            ?.Set(globalBVH.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        traverse.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "PageHeap")
+            ?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        traverse.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "Uniforms")
+            ?.Set(cullingUB, SetShaderResourceFlags.None);
+        traverse.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "CandidateClusters")
+            ?.Set(candidates.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        traverse.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "CandidateCount")
+            ?.Set(candidateCount.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        traverse.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "PageFaultBuffer")
+            ?.Set(pageFault.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        traverse.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "Instances")
+            ?.Set(instances.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        traverse.GetVariableByReflectedBinding(context, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "InstanceHeaders")
+            ?.Set(headers.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        return true;
     }
 
     public void ExecuteInitQueuePass(RenderContext renderContext, RenderGraphContext rgCtx)
     {
-        if (transformSystem.Count == 0 || ClusterBVHTraversePSOs.InitQueuePSO == null) return;
+        var srb = ClusterBVHTraversePSOs.InitQueueSRB;
+        if (transformSystem.Count == 0 || ClusterBVHTraversePSOs.InitQueuePSO == null || srb == null) return;
 
         var ctx = renderContext.ImmediateContext;
         if (ctx == null) return;
 
         var queueA = rgCtx.GetBuffer(HQueueA);
         var argsA = rgCtx.GetBuffer(HArgsA);
-        var cullingUB = rgCtx.GetBuffer(HCullingUniforms);
-        var headers = rgCtx.GetBuffer(HGlobalInstanceHeaderBuffer);
 
-        if (queueA == null || argsA == null || cullingUB == null || headers == null) return;
+        if (queueA == null || argsA == null) return;
 
         uint groups = ((uint)transformSystem.Count + 63) / 64;
-        var srb = ClusterBVHTraversePSOs.RentSRB(ClusterBVHTraversePSOs.InitQueuePSO, ClusterBVHTraversePSOs.InitQueueSRBPool);
 
-        srb.GetVariableByName(ShaderType.Compute, "Uniforms")?.Set(cullingUB, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "InstanceHeaders")?.Set(headers.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "Queue_Next")?.Set(queueA.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "NextDispatchArgs")?.Set(argsA.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "Queue_Next")
+            ?.Set(queueA.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "NextDispatchArgs")
+            ?.Set(argsA.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(ClusterBVHTraversePSOs.InitQueuePSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = groups, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
-
-        ClusterBVHTraversePSOs.ReturnSRB(srb, ClusterBVHTraversePSOs.InitQueueSRBPool);
-    }
-
-    public void SetupTraversePass(RenderGraphBuilder builder, bool currentIsA)
-    {
-        RenderGraphHandle currentQueue = currentIsA ? HQueueA : HQueueB;
-        RenderGraphHandle nextQueue = currentIsA ? HQueueB : HQueueA;
-        RenderGraphHandle currentArgs = currentIsA ? HArgsA : HArgsB;
-        RenderGraphHandle nextArgs = currentIsA ? HArgsB : HArgsA;
-
-        builder.Read(currentQueue, ResourceState.ShaderResource);
-        builder.Read(currentArgs, ResourceState.ShaderResource | ResourceState.IndirectArgument);
-        builder.Write(nextQueue, ResourceState.UnorderedAccess);
-        builder.Write(nextArgs, ResourceState.UnorderedAccess);
-        builder.Write(HCandidateClusters, ResourceState.UnorderedAccess);
-        builder.Write(HCandidateCount, ResourceState.UnorderedAccess);
-        builder.Write(HPageFaultBuffer, ResourceState.UnorderedAccess);
-
-        builder.Read(HCullingUniforms, ResourceState.ConstantBuffer);
-        builder.Read(HGlobalTransformBuffer, ResourceState.ShaderResource);
-        builder.Read(HGlobalInstanceHeaderBuffer, ResourceState.ShaderResource);
-        builder.Read(HGlobalBVHBuffer, ResourceState.ShaderResource);
-        builder.Read(HPageHeap, ResourceState.ShaderResource);
     }
 
     public void ExecuteTraversePass(RenderContext renderContext, RenderGraphContext rgCtx, bool currentIsA, int depth)
     {
-        if (ClusterBVHTraversePSOs.TraversePSO == null) return;
+        var srb = ClusterBVHTraversePSOs.TraverseSRB;
+        if (ClusterBVHTraversePSOs.TraversePSO == null || srb == null) return;
         var ctx = renderContext.ImmediateContext;
         if (ctx == null) return;
 
@@ -296,30 +464,22 @@ public class ClusterBVHTraversePass(
         var currentArgs = rgCtx.GetBuffer(currentIsA ? HArgsA : HArgsB);
         var nextArgs = rgCtx.GetBuffer(currentIsA ? HArgsB : HArgsA);
 
-        var candidates = rgCtx.GetBuffer(HCandidateClusters);
-        var candidateCount = rgCtx.GetBuffer(HCandidateCount);
-        var pageFault = rgCtx.GetBuffer(HPageFaultBuffer);
+        if (currentQueue == null || nextQueue == null || currentArgs == null || nextArgs == null) return;
 
-        var cullingUB = rgCtx.GetBuffer(HCullingUniforms);
-        var globalBVH = rgCtx.GetBuffer(HGlobalBVHBuffer);
-        var pageHeap = rgCtx.GetBuffer(HPageHeap);
-        var instances = rgCtx.GetBuffer(HGlobalTransformBuffer);
-        var headers = rgCtx.GetBuffer(HGlobalInstanceHeaderBuffer);
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "Queue_Current")
+            ?.Set(currentQueue.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "Queue_Next")
+            ?.Set(nextQueue.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "CurrentDispatchArgs")
+            ?.Set(currentArgs.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "NextDispatchArgs")
+            ?.Set(nextArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
-        if (currentQueue == null || nextQueue == null || currentArgs == null || nextArgs == null || candidates == null ||
-            candidateCount == null || pageFault == null || cullingUB == null || globalBVH == null || pageHeap == null ||
-            instances == null || headers == null) return;
-
-        var srb = ClusterBVHTraversePSOs.RentSRB(ClusterBVHTraversePSOs.TraversePSO, ClusterBVHTraversePSOs.TraverseSRBPool);
-
-        BindTransientResources(srb, cullingUB, globalBVH, pageHeap, instances, headers, candidates,
-            candidateCount, pageFault, currentQueue, nextQueue, currentArgs, nextArgs);
-
-        var depthVar = srb.GetVariableByName(ShaderType.Compute, "DepthIndexCB");
         unsafe
         {
             uint d = (uint)depth;
-            depthVar?.SetInlineConstants(new IntPtr(&d), 0, 1);
+            srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "DepthIndexCB")
+                ?.SetInlineConstants(new IntPtr(&d), 0, 1);
         }
 
         ctx.SetPipelineState(ClusterBVHTraversePSOs.TraversePSO);
@@ -329,34 +489,27 @@ public class ClusterBVHTraversePass(
             AttribsBuffer = currentArgs,
             AttribsBufferStateTransitionMode = ResourceStateTransitionMode.None,
         });
-
-        ClusterBVHTraversePSOs.ReturnSRB(srb, ClusterBVHTraversePSOs.TraverseSRBPool);
     }
 
-    public void SetupUpdateArgsPass(RenderGraphBuilder builder, bool targetIsA)
+    public void ExecuteUpdateArgsPass(RenderContext renderContext, RenderGraphContext rgCtx, bool targetIsA, bool clearIsA)
     {
-        builder.Write(targetIsA ? HArgsA : HArgsB, ResourceState.UnorderedAccess);
-    }
-
-    public void ExecuteUpdateArgsPass(RenderContext renderContext, RenderGraphContext rgCtx, bool targetIsA)
-    {
-        if (ClusterBVHTraversePSOs.UpdateArgsPSO == null) return;
+        var srb = ClusterBVHTraversePSOs.UpdateArgsSRB;
+        if (ClusterBVHTraversePSOs.UpdateArgsPSO == null || srb == null) return;
         var ctx = renderContext.ImmediateContext;
         if (ctx == null) return;
 
         var targetArgs = rgCtx.GetBuffer(targetIsA ? HArgsA : HArgsB);
-        if (targetArgs == null) return;
+        var clearArgs = rgCtx.GetBuffer(clearIsA ? HArgsA : HArgsB);
+        if (targetArgs == null || clearArgs == null) return;
 
-        var srb = ClusterBVHTraversePSOs.RentSRB(ClusterBVHTraversePSOs.UpdateArgsPSO, ClusterBVHTraversePSOs.UpdateArgsSRBPool);
-
-        srb.GetVariableByName(ShaderType.Compute, "NextDispatchArgs")
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "NextDispatchArgs")
             ?.Set(targetArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(renderContext, ClusterBVHTraversePSOs.ShaderAsset, ShaderType.Compute, "ClearDispatchArgs")
+            ?.Set(clearArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(ClusterBVHTraversePSOs.UpdateArgsPSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs { ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1 });
-
-        ClusterBVHTraversePSOs.ReturnSRB(srb, ClusterBVHTraversePSOs.UpdateArgsSRBPool);
     }
 
     public void SetupPageFaultCopyPass(RenderGraphBuilder builder, RenderGraphHandle hPageFaultReadback)
@@ -411,25 +564,6 @@ public class ClusterBVHTraversePass(
         }
 
         onPageFaultReadback?.Invoke(faults);
-    }
-
-    private void BindTransientResources(
-        IShaderResourceBinding srb, IBuffer cullingUB, IBuffer globalBVH, IBuffer pageHeap, IBuffer instances,
-        IBuffer headers, IBuffer candidates, IBuffer candCount, IBuffer pageFaultBuffer, IBuffer queueCurrent,
-        IBuffer queueNext, IBuffer argsCurrent, IBuffer argsNext)
-    {
-        srb.GetVariableByName(ShaderType.Compute, "GlobalBVH")?.Set(globalBVH.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "PageHeap")?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "Uniforms")?.Set(cullingUB, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "CandidateClusters")?.Set(candidates.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "CandidateCount")?.Set(candCount.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "PageFaultBuffer")?.Set(pageFaultBuffer.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "Queue_Current")?.Set(queueCurrent.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "Queue_Next")?.Set(queueNext.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "CurrentDispatchArgs")?.Set(argsCurrent.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "NextDispatchArgs")?.Set(argsNext.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "Instances")?.Set(instances.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "InstanceHeaders")?.Set(headers.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
     }
 
     private void ProcessReadbacks(IDeviceContext ctx, IBuffer? readbackBuffer)

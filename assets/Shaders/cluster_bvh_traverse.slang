@@ -1,5 +1,6 @@
 #include "cluster_structures.slang"
 #include "common.slang"
+#include "generated/instance_header_layout.slang"
 
 struct CullingUniforms
 {
@@ -46,7 +47,7 @@ ConstantBuffer<CullingUniforms> Uniforms;
 StructuredBuffer<ClusterBVHNode> GlobalBVH;
 ByteAddressBuffer PageHeap;
 StructuredBuffer<GpuTransform> Instances;
-StructuredBuffer<GpuInstanceHeader> InstanceHeaders;
+ByteAddressBuffer InstanceHeaders;
 
 cbuffer DepthIndexCB
 {
@@ -60,16 +61,31 @@ StructuredBuffer<uint2> Queue_Current;
 ByteAddressBuffer CurrentDispatchArgs;       // IndirectArgs: must stay raw
 RWStructuredBuffer<uint2> Queue_Next;
 RWByteAddressBuffer NextDispatchArgs;        // IndirectArgs: must stay raw
+RWByteAddressBuffer ClearDispatchArgs;       // IndirectArgs: must stay raw
 RWStructuredBuffer<uint> CandidateCount;
 RWStructuredBuffer<uint3> CandidateClusters;
 RWByteAddressBuffer PageFaultBuffer;
 
 static const uint MaxPageFaults = 4096;
 
-bool IsNodeOutsideFrustum(ClusterBVHNode node, GpuTransform t)
+float LocalExpansionForWorldRadius(GpuTransform t, float worldExpansion)
+{
+    if (worldExpansion <= 0.0)
+        return 0.0;
+
+    float3 axisScale = abs(t.Stretch) * abs(t.Scale);
+    float minAxisScale = max(min(min(axisScale.x, axisScale.y), axisScale.z), 1e-6);
+    return worldExpansion / minAxisScale;
+}
+
+bool IsNodeOutsideFrustum(ClusterBVHNode node, GpuTransform t, float boundsExpansion)
 {
     float3 localMin = node.BoundMin.xyz;
     float3 localMax = node.BoundMax.xyz;
+    float localExpansion = LocalExpansionForWorldRadius(t, boundsExpansion);
+    float3 localExpansion3 = float3(localExpansion, localExpansion, localExpansion);
+    localMin -= localExpansion3;
+    localMax += localExpansion3;
 
     float3 corners[8];
     corners[0] = float3(localMin.x, localMin.y, localMin.z);
@@ -131,11 +147,12 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
     }
 
     GpuTransform t = Instances[instanceID];
+    float boundsExpansion = max(0.0, LoadInstanceBoundsExpansionWorld(InstanceHeaders, instanceID));
 
     bool culled = false;
     if (Uniforms.DebugMode == 0)
     {
-        if (IsNodeOutsideFrustum(node, t))
+        if (IsNodeOutsideFrustum(node, t, boundsExpansion))
         {
             culled = true;
         }
@@ -198,15 +215,17 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
 [numthreads(1, 1, 1)]
 void UpdateArgs(uint3 id: SV_DispatchThreadID)
 {
-    uint count = NextDispatchArgs.Load<BVHDispatchArgs>(0).NodeCount;
+    uint count = min(NextDispatchArgs.Load<BVHDispatchArgs>(0).NodeCount, Uniforms.MaxQueueNodes);
     uint groups = (count + 63) / 64;
     NextDispatchArgs.Store<BVHDispatchArgs>(0, BVHDispatchArgs(groups, 1, 1, count));
+    ClearDispatchArgs.Store<BVHDispatchArgs>(0, BVHDispatchArgs(0, 1, 1, 0));
 }
 
 [numthreads(1, 1, 1)]
-void ClearArgs(uint3 id: SV_DispatchThreadID)
+void InitArgs(uint3 id: SV_DispatchThreadID)
 {
     NextDispatchArgs.Store<BVHDispatchArgs>(0, BVHDispatchArgs(0, 1, 1, 0));
+    ClearDispatchArgs.Store<BVHDispatchArgs>(0, BVHDispatchArgs(0, 1, 1, 0));
 }
 
 [numthreads(64, 1, 1)]
@@ -217,14 +236,14 @@ void InitQueue(uint3 dispatchThreadID: SV_DispatchThreadID)
     if (instanceID >= Uniforms.InstanceCount)
         return;
 
-    GpuInstanceHeader header = InstanceHeaders[instanceID];
-    if (header.BVHRootIndex == 0xFFFFFFFF)
+    uint bvhRootIndex = LoadInstanceBVHRootIndex(InstanceHeaders, instanceID);
+    if (bvhRootIndex == 0xFFFFFFFF)
         return;
 
     uint outIndex;
     NextDispatchArgs.InterlockedAdd(12, 1, outIndex);
     if (outIndex < Uniforms.MaxQueueNodes)
     {
-        Queue_Next[outIndex] = uint2(header.BVHRootIndex, instanceID);
+        Queue_Next[outIndex] = uint2(bvhRootIndex, instanceID);
     }
 }

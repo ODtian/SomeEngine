@@ -1,42 +1,43 @@
 using System;
 using System.IO;
-using System.Collections.Concurrent;
 using System.Threading;
 using Diligent;
 using SomeEngine.Assets.Importers;
+using SomeEngine.Assets.Schema;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Pipelines;
 
-/// <summary>
-/// Draws 2D screen-space rectangles for each cluster's HiZ projection.
-/// Red = visible (not occluded), Green = occluded/culled.
-/// Reads UV bounds directly from DebugHiZOutput buffer.
-/// </summary>
-internal static class ClusterDebugAABBPSOs
+internal sealed class ClusterDebugAABBResources : IDisposable
 {
-    internal static IPipelineState? PSO;
-    internal static readonly ConcurrentBag<IShaderResourceBinding> SRBPool = [];
-    private static bool s_initialized;
-    private static readonly Lock s_initLock = new();
+    internal const string ShaderFile = "debug_aabb.slang";
+    internal const string VertexEntryPoint = "VSMain";
+    internal const string PixelEntryPoint = "PSMain";
 
-    internal static void EnsureInitialized(RenderContext context)
+    internal IPipelineState? PSO;
+    internal ShaderAsset? ShaderAsset;
+    internal readonly SRBPool Pool = new();
+
+    private bool _initialized;
+    private readonly Lock _initLock = new();
+
+    internal void EnsureInitialized(RenderContext context)
     {
-        if (s_initialized) return;
-        lock (s_initLock)
+        if (_initialized) return;
+        lock (_initLock)
         {
-            if (s_initialized) return;
+            if (_initialized) return;
+
             var device = context.Device;
             if (device == null) return;
 
-            string shaderPath = Path.GetFullPath(
-                Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/debug_aabb.slang")
-            );
+            string shaderPath = ClusterStageUtils.ShaderPath(ShaderFile);
             var shaderAsset = SlangShaderImporter.Import(shaderPath);
+            ShaderAsset = shaderAsset;
 
-            using var vs = shaderAsset.CreateShader(context, "VSMain");
-            using var ps = shaderAsset.CreateShader(context, "PSMain");
+            var vs = shaderAsset.CreateShader(context, VertexEntryPoint);
+            var ps = shaderAsset.CreateShader(context, PixelEntryPoint);
 
             PSO = device.CreateGraphicsPipelineState(new GraphicsPipelineStateCreateInfo()
             {
@@ -63,29 +64,32 @@ internal static class ClusterDebugAABBPSOs
                 Ps = ps,
             });
 
-            s_initialized = true;
+            _initialized = true;
         }
     }
 
-    internal static IShaderResourceBinding RentSRB()
+    public void Dispose()
     {
-        if (PSO == null) throw new InvalidOperationException("PSO is not initialized.");
-        return SRBPool.TryTake(out var srb) ? srb : PSO.CreateShaderResourceBinding(false);
+        Pool.Dispose();
+        PSO?.Dispose();
     }
-
-    internal static void ReturnSRB(IShaderResourceBinding srb) => SRBPool.Add(srb);
 }
 
 internal sealed class ClusterDebugAABBPass : IRenderGraphPass, IDisposable
 {
+    private readonly RenderContext _context;
+    private readonly ClusterDebugAABBResources _resources;
+
     public RenderGraphHandle HDebugHiZOutput = RenderGraphHandle.Invalid;
     public RenderGraphHandle HColorTarget = RenderGraphHandle.Invalid;
 
     public string Name => "Debug 2D Projections";
 
-    public ClusterDebugAABBPass(RenderContext context)
+    public ClusterDebugAABBPass(RenderContext context, ClusterDebugAABBResources resources)
     {
-        ClusterDebugAABBPSOs.EnsureInitialized(context);
+        _context = context;
+        _resources = resources;
+        _resources.EnsureInitialized(context);
     }
 
     public void Setup(RenderGraphBuilder builder)
@@ -96,7 +100,8 @@ internal sealed class ClusterDebugAABBPass : IRenderGraphPass, IDisposable
 
     public void Execute(RenderGraphContext graphContext)
     {
-        if (ClusterDebugAABBPSOs.PSO == null) return;
+        _resources.EnsureInitialized(_context);
+        if (_resources.PSO == null) return;
 
         var ctx = graphContext.RenderContext.ImmediateContext;
         if (ctx == null) return;
@@ -111,17 +116,16 @@ internal sealed class ClusterDebugAABBPass : IRenderGraphPass, IDisposable
         if (colorRtv == null) return;
 
         var srv = debugBuf.GetDefaultView(BufferViewType.ShaderResource);
-        var srb = ClusterDebugAABBPSOs.RentSRB();
-        srb.GetVariableByName(ShaderType.Vertex, "DebugHiZInput")?.Set(srv, SetShaderResourceFlags.None);
+        var srb = _resources.Pool.Rent(_resources.PSO);
+        srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Vertex, "DebugHiZInput")
+            ?.Set(srv, SetShaderResourceFlags.None);
 
         ctx.SetRenderTargets([colorRtv], null, ResourceStateTransitionMode.None);
-        ctx.SetPipelineState(ClusterDebugAABBPSOs.PSO);
+        ctx.SetPipelineState(_resources.PSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
-
-        // 4096 max entries × 8 vertices per rect (4 edges × 2 endpoints)
         ctx.Draw(new DrawAttribs { NumVertices = 4096 * 8, Flags = DrawFlags.VerifyAll });
 
-        ClusterDebugAABBPSOs.ReturnSRB(srb);
+        _resources.Pool.Return(srb);
     }
 
     public void Dispose() { }

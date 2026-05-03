@@ -1,6 +1,8 @@
 #ifndef CLUSTER_STRUCTURES_SLANG
 #define CLUSTER_STRUCTURES_SLANG
 
+static const uint GPU_CLUSTER_STRIDE_BYTES = 88;
+
 struct GPUPageHeader
 {
     uint ClusterCount;        //  0
@@ -32,7 +34,9 @@ struct GPUCluster
     uint PackedRanges;          // 52 — [range0End:8][range1End:8][Pad:16]
     uint MaterialTableOffset;   // 56 — slow path external table byte offset (0xFFFFFFFF = fast path)
     uint VRBBatchInfo;          // 60 — VRB batch encoding (fast: ≤5 batches packed)
-    //  Total: 64 bytes
+    float3 BoundMin;            // 64 — object-space cluster AABB min
+    float3 BoundMax;            // 76 — object-space cluster AABB max
+    //  Total: 88 bytes
 };
 
 // Decode helpers
@@ -72,24 +76,6 @@ int DecodeGroupId(GPUCluster c)
     // Sign-extend from 16-bit
     int raw = int(c.PackedTStartGroup >> 16);
     return (raw << 16) >> 16;
-}
-
-uint GetLocalMaterialIndex(GPUCluster c, uint triIdx)
-{
-    uint range0End = c.PackedRanges & 0xFF;
-    uint range1End = (c.PackedRanges >> 8) & 0xFF;
-    
-    if (triIdx < range0End)
-        return c.PackedMaterials & 0xFF;
-    else if (triIdx < range1End)
-        return (c.PackedMaterials >> 8) & 0xFF;
-    else
-        return (c.PackedMaterials >> 16) & 0xFF;
-}
-
-bool IsMaterialSlowPath(GPUCluster c)
-{
-    return (c.PackedMaterials >> 24) == 0xFF;
 }
 
 // ─── VRB Batch Decode ───
@@ -154,21 +140,6 @@ uint GetSlotField(StructuredBuffer<uint> slotBuffer, uint slotOffset, uint field
     return (slotOffset % 2 == 0) ? (packed & 0xFFFF) : (packed >> 16);
 }
 
-struct GpuInstanceHeader
-{
-    uint BVHRootIndex;
-    uint MaterialSlotOffset; // Index into MaterialSlotBuffer
-    uint MetadataOffset;
-    uint MetadataCount;
-
-    float BoundsExpansion;  // Conservative AABB expansion (world space)
-    uint Pad1;
-    uint Pad2;
-    uint Pad3;
-};
-
-
-
 struct AABB
 {
     float3 Min;
@@ -194,10 +165,11 @@ struct DrawInstancedArgs
     uint StartInstance;
 };
 
-// Cull output draw args: [0]=pad, [1]=swCount, [2]=hwCount
+// Cull output draw args: [0]=vertex count per cluster, [1]=swCount, [2]=hwCount.
+// The raw buffer slot at byte 12 is used as an internal total reservation counter.
 struct CullDrawArgs
 {
-    uint Pad0;
+    uint VertexCountPerCluster;
     uint SWCount;
     uint HWCount;
 };
@@ -221,6 +193,16 @@ struct RasterBinEntry
     uint SWCursor;
     uint HWCursor;
     uint SWOffset;     // Exclusive prefix sum of SW clusters only across bins
+    uint Pad;
+};
+
+// Deform Bin metadata (16B = 4xuint). Deform cache dispatch is keyed by VertexEval,
+// not RasterBin, so keep this layout independent of RasterBinEntry.
+struct DeformBinEntry
+{
+    uint ClusterOffset;
+    uint BinCount;
+    uint Cursor;
     uint Pad;
 };
 

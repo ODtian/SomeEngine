@@ -5,6 +5,9 @@ namespace SomeEngine.Render.Pipelines;
 /// </summary>
 public static class DeformDispatchCalc
 {
+    public const uint VisibleThreadsPerGroup = 64;
+    public const uint CacheOffsetOverflow = 0xFFFFFFFDu;
+
     /// <summary>
     /// 镜像 CSDeformPrepareVisibleArgs：从 SW+HW 可见数量计算 dispatch 参数。
     /// <para>
@@ -14,9 +17,19 @@ public static class DeformDispatchCalc
     public static (uint DispatchX, uint DispatchY) ComputeVisibleArgs(uint swCount, uint hwCount)
     {
         uint total = swCount + hwCount;
-        uint dispatchX = Math.Min(total, 65535u);
-        uint dispatchY = total > 0 ? (total + 65534u) / 65535u : 0u;
+        if (total == 0)
+            return (0, 0);
+
+        uint groupCount = (total + VisibleThreadsPerGroup - 1u) / VisibleThreadsPerGroup;
+        var (dispatchX, dispatchY, _) = ComputeIndirectDispatchArgs(groupCount);
         return (dispatchX, dispatchY);
+    }
+
+    public static (uint DispatchX, uint DispatchY, uint DispatchZ) ComputeIndirectDispatchArgs(uint groupCount)
+    {
+        uint dispatchX = Math.Min(groupCount, 65535u);
+        uint dispatchY = Math.Max(1u, (groupCount + 65534u) / 65535u);
+        return (dispatchX, dispatchY, 1u);
     }
 
     /// <summary>
@@ -52,13 +65,14 @@ public static class DeformDispatchCalc
     /// 镜像 CSDeformInitVisible 中的 CacheAllocCounter.InterlockedAdd + CacheOffsets 写回。
     /// 返回总分配顶点数。
     /// </summary>
-    public static uint AllocateCacheOffsets(
+    public static uint AllocateCacheByteOffsets(
         ReadOnlySpan<uint> visibleIndices,
         ReadOnlySpan<uint> vertexCounts,
+        ReadOnlySpan<uint> strides,
         Span<uint> cacheOffsets)
     {
-        if (visibleIndices.Length != vertexCounts.Length)
-            throw new ArgumentException("visibleIndices and vertexCounts must have the same length.");
+        if (visibleIndices.Length != vertexCounts.Length || visibleIndices.Length != strides.Length)
+            throw new ArgumentException("visibleIndices, vertexCounts and strides must have the same length.");
 
         uint allocCounter = 0;
         for (int i = 0; i < visibleIndices.Length; i++)
@@ -68,7 +82,7 @@ public static class DeformDispatchCalc
                 throw new ArgumentOutOfRangeException(nameof(visibleIndices), "visibleIndex exceeds cacheOffsets length.");
 
             cacheOffsets[(int)visibleIndex] = allocCounter;
-            allocCounter += vertexCounts[i];
+            allocCounter = checked(allocCounter + vertexCounts[i] * strides[i]);
         }
 
         return allocCounter;
@@ -78,17 +92,21 @@ public static class DeformDispatchCalc
     /// 镜像 shader 中的容量边界：如果 cacheBaseVert + vertexCount 超过 MaxDeformVertices，
     /// 则 cached path 不可用，应回退到 inline path。
     /// </summary>
-    public static bool CanUseCachedPath(uint cacheBaseVert, uint vertexCount, uint maxDeformVertices)
+    public static bool CanUseCachedPath(uint cacheBaseByte, uint vertexCount, uint stride, uint maxDeformCacheBytes)
     {
-        return cacheBaseVert + vertexCount <= maxDeformVertices;
+        if (cacheBaseByte >= CacheOffsetOverflow)
+            return false;
+
+        ulong byteEnd = (ulong)cacheBaseByte + (ulong)vertexCount * stride;
+        return byteEnd <= maxDeformCacheBytes;
     }
 
     /// <summary>
     /// 镜像 cached path 的字节寻址：byteAddr = (cacheBaseVert + localVertIdx) * stride。
     /// </summary>
-    public static uint ComputeCacheByteAddress(uint cacheBaseVert, uint localVertIdx, uint stride)
+    public static uint ComputeCacheByteAddress(uint cacheBaseByte, uint localVertIdx, uint stride)
     {
-        return (cacheBaseVert + localVertIdx) * stride;
+        return cacheBaseByte + localVertIdx * stride;
     }
 
     /// <summary>

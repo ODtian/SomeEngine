@@ -7,7 +7,7 @@ using SomeEngine.Render.RHI;
 namespace SomeEngine.Render.Pipelines;
 
 /// <summary>
-/// Stateless SW raster stage â€” mirrors ClusterDraw.AddPasses but dispatches
+/// Stateless SW raster stage â€?mirrors ClusterDraw.AddPasses but dispatches
 /// CSSWRaster compute instead of DrawIndirect.
 /// </summary>
 public static class ClusterSWDraw
@@ -59,7 +59,7 @@ public static class ClusterSWDraw
         string tag = "SW_",
         bool debugSWHWView = false,
         uint rasterBinCount = 1,
-        ShadePSOGroup[]? swRasterPSOGroups = null,
+        MaterialPSOGroup[]? swRasterPSOGroups = null,
         RenderGraphHandle hDeformCache = default,
         RenderGraphHandle hCacheOffsets = default
     )
@@ -146,7 +146,7 @@ public static class ClusterSWDraw
             CPUAccessFlags = CpuAccessFlags.Write,
         });
 
-        // Don't consume the flag here â€” let the caller reset it after all phases
+        // Don't consume the flag here â€?let the caller reset it after all phases
         bool doDump = DebugDumpNextFrame;
 
         var uniforms = new SWRasterUniforms
@@ -210,6 +210,7 @@ public static class ClusterSWDraw
             HGlobalTransformBuffer = globals.GlobalTransform,
             HPageHeap = globals.PageHeap,
             HVisBuffer = hVisBuffer,
+            HDepthTarget = depthTarget,
             HDepthUAV = hDepthUAV,
             HDebugSWOutput = hDebugBuf,
             HBinnedSWDispatchArgs = rasterBin.BinnedSWDispatchArgs,

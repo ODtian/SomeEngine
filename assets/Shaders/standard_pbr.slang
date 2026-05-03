@@ -5,6 +5,27 @@
 #include "brdf.slang"
 #include "cluster_shade_pipeline.slang"
 
+// C# imports this marked struct through Slang reflection and writes the material
+// scalar payload using Slang's own field offsets and type size.
+[MaterialScalars]
+struct StandardPBRScalars
+{
+    float4 BaseColorTint;
+    float MetallicFactor;
+    float Roughness;
+    float3 EmissiveFactor;
+};
+
+StandardPBRScalars GetDefaultStandardPBRScalars()
+{
+    StandardPBRScalars scalars;
+    scalars.BaseColorTint = float4(1.0);
+    scalars.MetallicFactor = 1.0;
+    scalars.Roughness = 1.0;
+    scalars.EmissiveFactor = float3(0.0);
+    return scalars;
+}
+
 /// Standard PBR Material (MVP).
 /// Implements ISurfaceEvaluate using Cook-Torrance BRDF.
 /// Lighting is read from the global ShadeUniforms constant buffer.
@@ -22,6 +43,8 @@ struct StandardPBRMaterial : ISurfaceEvaluate
         float4 albedoSample = AlbedoMap.SampleLevel(MaterialSampler, ctx.uv0, 0.0);
         float3 armSample    = ARMMap.SampleLevel(MaterialSampler, ctx.uv0, 0.0).rgb;
         float3 normalTS     = NormalMap.SampleLevel(MaterialSampler, ctx.uv0, 0.0).rgb * 2.0 - 1.0;
+        StandardPBRScalars scalars = LoadMaterialScalars<StandardPBRScalars>(
+            GetDefaultStandardPBRScalars());
 
         // TBN matrix: transform normal from tangent space to world space
         float3 N_geom = normalize(ctx.worldNormal);
@@ -29,11 +52,12 @@ struct StandardPBRMaterial : ISurfaceEvaluate
         float3 B = cross(N_geom, T) * ctx.worldTangent.w; // handedness
         float3 mappedNormal = normalize(T * normalTS.x + B * normalTS.y + N_geom * normalTS.z);
 
-        float4 tint = getInstancePropertyFloat4(ctx.instanceID, 0, float4(1.0));
+        float4 instanceTint = getInstancePropertyFloat4(ctx.instanceID, 0, float4(1.0));
+        float4 tint = scalars.BaseColorTint * instanceTint;
         float3 baseColor = albedoSample.rgb * tint.rgb;
         float  ao        = armSample.r;
-        float  roughness = armSample.g;
-        float  metallic  = armSample.b;
+        float  roughness = clamp(armSample.g * scalars.Roughness, 0.0, 1.0);
+        float  metallic  = clamp(armSample.b * scalars.MetallicFactor, 0.0, 1.0);
 
         float3 N = mappedNormal;
         float3 V = normalize(Uniforms.CameraPos - ctx.worldPos);
@@ -59,7 +83,8 @@ struct StandardPBRMaterial : ISurfaceEvaluate
         float  skyBlend    = N.y * 0.5 + 0.5;
         float3 ambient     = lerp(groundColor, skyColor, skyBlend) * baseColor * ao;
 
-        float3 finalColor = directColor + ambient;
+        float3 emissive = scalars.EmissiveFactor;
+        float3 finalColor = directColor + ambient + emissive;
 
         outputColor[ctx.pixelCoord] = float4(finalColor, 1.0);
     }

@@ -1,163 +1,160 @@
 #include "cluster_common.slang"
-#include "cluster_cull_structures.slang"
 
-// ─── Definitions ───
-struct DeformBinMeta
-{
-    uint BinCount;       // Number of material ranges in this bin
-    uint Cursor;         // Counter during scatter
-    uint ClusterOffset;  // Global offset in index buffer (prefix sum of BinCount)
-    uint Padding;
-};
-
-// [0] = ThreadGroupCountX, [1] = Y, [2] = Z (DispatchComputeIndirect args)
-struct DispatchIndirectArgs
-{
-    uint X;
-    uint Y;
-    uint Z;
-}
-
-// ─── Uniforms (reusing BinningUniforms struct) ───
 struct BinningUniforms
 {
     uint MaxBins;
-    uint SlotCapacity;         // MaterialSlotBuffer capacity
-    uint BinFieldIndex;        // VertexEval field index
+    uint SlotCapacity;
+    uint BinFieldIndex;
     uint MaxVisibleClusters;
 };
 
-// ─── Bindings ───
-[[vk::binding(0, 0)]] ConstantBuffer<BinningUniforms> Uniforms;
+ConstantBuffer<BinningUniforms> Uniforms;
 
-[[vk::binding(1, 0)]] StructuredBuffer<uint4> VisibleClusters;
+StructuredBuffer<uint4> VisibleClusters;
+ByteAddressBuffer ReadOffsetArgs;
+ByteAddressBuffer DrawArgs;
 
-[[vk::binding(3, 0)]] ByteAddressBuffer DrawArgs; 
+RWByteAddressBuffer DeformBinningDispatchArgs;
+RWStructuredBuffer<DeformBinEntry> DeformBinMeta;
+RWStructuredBuffer<uint2> BinnedClusterIndexBuffer;
+StructuredBuffer<uint> MaterialSlotBuffer;
+ByteAddressBuffer PageHeap;
+RWStructuredBuffer<uint> ReserveCounters;
 
-// [BinCount] x 3 uints for DispatchComputeIndirect
-[[vk::binding(4, 0)]] RWStructuredBuffer<DispatchIndirectArgs> DeformBinningDispatchArgs;
-
-[[vk::binding(5, 0)]] RWStructuredBuffer<DeformBinMeta> RasterBinMeta; // Reusing name for convenience, actually DeformBinMeta
-
-[[vk::binding(6, 0)]] RWStructuredBuffer<uint2> BinnedClusterIndexBuffer; // (visibleIndex, rangeStart<<16 | rangeEnd)
-[[vk::binding(7, 0)]] StructuredBuffer<uint> MaterialSlotBuffer;
-[[vk::binding(8, 0)]] ByteAddressBuffer PageHeap;
-
-// ─── Helper: get deform bin key for a specific material range ───
-uint ReadDeformMaterialBinKey(uint4 entry, uint localMatIdx, uint instanceID)
+DispatchArgs MakeIndirectDispatchArgs(uint groupCount)
 {
-    GpuInstanceHeader header = InstanceHeaders[instanceID];
-    uint slotOffset = header.MaterialSlotOffset + localMatIdx;
+    uint dispatchX = min(groupCount, 65535u);
+    uint dispatchY = max(1u, (groupCount + 65534u) / 65535u);
+    return DispatchArgs(dispatchX, dispatchY, 1);
+}
+
+void DecodeVisibleIndex(uint logicalIdx, out uint visibleIndex, out bool isSW)
+{
+    CullDrawArgs args = DrawArgs.Load<CullDrawArgs>(0);
+    CullDrawArgs readOffset = ReadOffsetArgs.Load<CullDrawArgs>(0);
+    uint swCount = args.SWCount;
+    uint hwCount = args.HWCount;
+    uint swBase = readOffset.SWCount;
+    uint hwBase = Uniforms.MaxVisibleClusters - readOffset.HWCount - hwCount;
+
+    isSW = logicalIdx < swCount;
+    visibleIndex = isSW ? (swBase + logicalIdx) : (hwBase + logicalIdx - swCount);
+}
+
+struct VRBDecoded
+{
+    uint batchCount;
+    uint triCounts[5];
+    uint fastTriTotal;
+    uint totalEntries;
+};
+
+VRBDecoded DecodeVRB(uint vrbInfo, uint triangleCount)
+{
+    VRBDecoded d;
+    d.batchCount = min(((vrbInfo >> 25) & 0x7) + 1, 5u);
+    d.fastTriTotal = 0;
+
+    for (uint i = 0; i < 5; i++)
+    {
+        if (i < d.batchCount)
+        {
+            d.triCounts[i] = ((vrbInfo >> (i * 5)) & 0x1F) + 1;
+            d.fastTriTotal += d.triCounts[i];
+        }
+        else
+        {
+            d.triCounts[i] = 0;
+        }
+    }
+    d.fastTriTotal = min(d.fastTriTotal, triangleCount);
+
+    uint slowTris = (triangleCount > d.fastTriTotal) ? (triangleCount - d.fastTriTotal) : 0;
+    uint slowBatches = (slowTris + 31) / 32;
+
+    d.totalEntries = d.batchCount + slowBatches;
+    return d;
+}
+
+void ReadClusterVRB(uint4 entry, out uint vrbInfo, out uint triangleCount)
+{
+    uint pageOffset = entry.x;
+    uint clusterID = entry.y;
+    uint clustersOff = PageHeap.Load(pageOffset + 16);
+    uint packedCounts = PageHeap.Load(pageOffset + clustersOff + clusterID * GPU_CLUSTER_STRIDE_BYTES + 44);
+    triangleCount = (packedCounts >> 8) & 0xFF;
+    vrbInfo = PageHeap.Load(pageOffset + clustersOff + clusterID * GPU_CLUSTER_STRIDE_BYTES + 60);
+}
+
+uint ReadDeformBinKey(uint instanceID)
+{
+    uint slotOffset = GetInstanceMaterialSlotOffset(instanceID);
     return GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
 }
 
-// ─── Pass 0: Clear ───
 [numthreads(64, 1, 1)]
 void CSDeformBinClear(uint3 dtid : SV_DispatchThreadID)
 {
     uint tid = dtid.x;
     if (tid >= Uniforms.MaxBins) return;
-    RasterBinMeta[tid].BinCount = 0;
-    RasterBinMeta[tid].Cursor = 0;
-    RasterBinMeta[tid].ClusterOffset = 0;
-    RasterBinMeta[tid].Padding = 0;
+
+    DeformBinMeta[tid].ClusterOffset = 0;
+    DeformBinMeta[tid].BinCount = 0;
+    DeformBinMeta[tid].Cursor = 0;
+    DeformBinMeta[tid].Pad = 0;
 }
 
-// ─── Pass 1: Prepare ───
 [numthreads(1, 1, 1)]
 void CSDeformBinPrepare(uint3 dtid : SV_DispatchThreadID)
 {
     CullDrawArgs args = DrawArgs.Load<CullDrawArgs>(0);
     uint totalVisible = args.SWCount + args.HWCount;
-    DeformBinningDispatchArgs[0].X = (totalVisible + 63) / 64;
-    DeformBinningDispatchArgs[0].Y = 1;
-    DeformBinningDispatchArgs[0].Z = 1;
+    DeformBinningDispatchArgs.Store<DispatchArgs>(0, DispatchArgs((totalVisible + 63) / 64, 1, 1));
 }
 
-// ─── Logic: Emit Ranges ───
+void EmitDeformBinEntry(uint binKey, uint visibleIndex, uint triStart, uint triEnd, bool doScatter)
+{
+    if (binKey >= Uniforms.MaxBins) binKey = 0;
+
+    if (!doScatter)
+    {
+        uint unused;
+        InterlockedAdd(DeformBinMeta[binKey].BinCount, 1, unused);
+        return;
+    }
+
+    uint offset = DeformBinMeta[binKey].ClusterOffset;
+    uint localIdx;
+    InterlockedAdd(DeformBinMeta[binKey].Cursor, 1, localIdx);
+    BinnedClusterIndexBuffer[offset + localIdx] = uint2(visibleIndex, (triStart << 16) | triEnd);
+}
+
 void ProcessClusterRanges(uint visibleIndex, bool doScatter)
 {
     uint4 entry = VisibleClusters[visibleIndex];
-    uint pageOffset = entry.x;
-    uint clusterID = entry.y;
-    uint realInstanceID = entry.z;
-    
-    uint clustersOff = PageHeap.Load(pageOffset + 16);
-    uint clusterOffset = pageOffset + clustersOff + clusterID * 64;
 
-    uint packedMaterials = PageHeap.Load(clusterOffset + 48);
-    uint packedRanges = PageHeap.Load(clusterOffset + 52);
-    
-    uint packedCounts = PageHeap.Load(clusterOffset + 44);
-    uint triCount = (packedCounts >> 8) & 0xFF;
+    uint vrbInfo, triangleCount;
+    ReadClusterVRB(entry, vrbInfo, triangleCount);
+    VRBDecoded vrb = DecodeVRB(vrbInfo, triangleCount);
 
-    bool isSlowPath = ((packedMaterials >> 24) & 0xFF) == 0xFF;
-    
-    if (isSlowPath)
+    uint triStart = 0;
+    for (uint b = 0; b < vrb.batchCount; b++)
     {
-        uint materialTableOffset = PageHeap.Load(clusterOffset + 56);
-        // TODO: enumerate ranges from external table
-        // Fallback for now: treat entire cluster as single range with mat 0
-        uint binKey = ReadDeformMaterialBinKey(entry, 0, realInstanceID);
-        if (binKey >= Uniforms.MaxBins) binKey = 0;
-        
-        if (!doScatter)
-        {
-            uint unused;
-            InterlockedAdd(RasterBinMeta[binKey].BinCount, 1, unused);
-        }
-        else
-        {
-            uint offset = RasterBinMeta[binKey].ClusterOffset;
-            uint localIdx;
-            InterlockedAdd(RasterBinMeta[binKey].Cursor, 1, localIdx);
-            BinnedClusterIndexBuffer[offset + localIdx] = uint2(visibleIndex, (0 << 16) | triCount);
-        }
+        uint triEnd = min(triStart + vrb.triCounts[b], triangleCount);
+        uint binKey = ReadDeformBinKey(entry.z);
+        EmitDeformBinEntry(binKey, visibleIndex, triStart, triEnd, doScatter);
+        triStart = triEnd;
     }
-    else
+
+    while (triStart < triangleCount)
     {
-        // Fast path: up to 3 ranges
-        uint range0End = packedRanges & 0xFF;
-        uint range1End = (packedRanges >> 8) & 0xFF;
-        
-        uint ends[3];
-        ends[0] = range0End;
-        ends[1] = range1End;
-        ends[2] = triCount;
-        
-        uint matIdx[3];
-        matIdx[0] = packedMaterials & 0xFF;
-        matIdx[1] = (packedMaterials >> 8) & 0xFF;
-        matIdx[2] = (packedMaterials >> 16) & 0xFF;
-        
-        uint start = 0;
-        for (int i = 0; i < 3; i++)
-        {
-            uint end = min(ends[i], triCount);
-            if (end > start)
-            {
-                uint binKey = ReadDeformMaterialBinKey(entry, matIdx[i], realInstanceID);
-                if (binKey >= Uniforms.MaxBins) binKey = 0;
-                
-                if (!doScatter)
-                {
-                    uint unused;
-                    InterlockedAdd(RasterBinMeta[binKey].BinCount, 1, unused);
-                }
-                else
-                {
-                    uint offset = RasterBinMeta[binKey].ClusterOffset;
-                    uint localIdx;
-                    InterlockedAdd(RasterBinMeta[binKey].Cursor, 1, localIdx);
-                    BinnedClusterIndexBuffer[offset + localIdx] = uint2(visibleIndex, (start << 16) | end);
-                }
-            }
-            start = end;
-        }
+        uint triEnd = min(triStart + 32, triangleCount);
+        uint binKey = ReadDeformBinKey(entry.z);
+        EmitDeformBinEntry(binKey, visibleIndex, triStart, triEnd, doScatter);
+        triStart = triEnd;
     }
 }
 
-// ─── Pass 2: Count ───
 [numthreads(64, 1, 1)]
 void CSDeformBinCount(uint3 dtid : SV_DispatchThreadID)
 {
@@ -165,57 +162,49 @@ void CSDeformBinCount(uint3 dtid : SV_DispatchThreadID)
     uint totalVisible = args.SWCount + args.HWCount;
     uint idx = dtid.x;
     if (idx >= totalVisible) return;
-    
+
     uint visibleIndex;
     bool isSW;
     DecodeVisibleIndex(idx, visibleIndex, isSW);
-    
+
     ProcessClusterRanges(visibleIndex, false);
 }
 
-// ─── Pass 3: Reserve ───
-// Prefix sum implementation for DeformBinMeta.ClusterOffset
-#define MAX_BINS 256
-groupshared uint sPrefixTotal[MAX_BINS];
+#define DEFORM_BIN_RESERVE_BLOCK_SIZE 128
 
-[numthreads(MAX_BINS, 1, 1)]
-void CSDeformBinReserve(uint3 dtid : SV_DispatchThreadID)
+groupshared uint DeformReservePrefix[DEFORM_BIN_RESERVE_BLOCK_SIZE];
+groupshared uint DeformReserveBlockBase;
+
+[numthreads(DEFORM_BIN_RESERVE_BLOCK_SIZE, 1, 1)]
+void CSDeformBinReserve(uint3 dtid : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
 {
-    uint tid = dtid.x;
-    
-    uint count = (tid < Uniforms.MaxBins) ? RasterBinMeta[tid].BinCount : 0;
-    sPrefixTotal[tid] = count;
+    uint bin = dtid.x;
+    uint count = bin < Uniforms.MaxBins ? DeformBinMeta[bin].BinCount : 0;
+
+    DeformReservePrefix[groupIndex] = count;
     GroupMemoryBarrierWithGroupSync();
-    
-    [unroll] for (uint s = 1; s < MAX_BINS; s <<= 1)
+
+    for (uint scanOffset = 1; scanOffset < DEFORM_BIN_RESERVE_BLOCK_SIZE; scanOffset <<= 1)
     {
+        uint addend = groupIndex >= scanOffset ? DeformReservePrefix[groupIndex - scanOffset] : 0;
         GroupMemoryBarrierWithGroupSync();
-        uint valTotal = 0;
-        if (tid >= s)
-        {
-            valTotal = sPrefixTotal[tid - s];
-        }
+        DeformReservePrefix[groupIndex] += addend;
         GroupMemoryBarrierWithGroupSync();
-        
-        if (tid >= s)
-        {
-            sPrefixTotal[tid] += valTotal;
-        }
+    }
+
+    uint inclusiveOffset = DeformReservePrefix[groupIndex];
+    uint blockSum = DeformReservePrefix[DEFORM_BIN_RESERVE_BLOCK_SIZE - 1];
+
+    if (groupIndex == 0)
+    {
+        InterlockedAdd(ReserveCounters[0], blockSum, DeformReserveBlockBase);
     }
     GroupMemoryBarrierWithGroupSync();
-    
-    uint exclusiveSumTotal = sPrefixTotal[tid] - count;
-    
-    if (tid >= Uniforms.MaxBins) return;
-    
-    RasterBinMeta[tid].ClusterOffset = exclusiveSumTotal;
-    RasterBinMeta[tid].Cursor = 0; // reset for scatter
-    
-    // Write DispatchComputeIndirect args: 1 thread group per material range entry
-    // Each group will process up to 128 vertices (the whole material range)
-    // DeformBinningDispatchArgs follows BinnedDrawArgs convention: indexed by BinKey.
-    // Note: the dispatch buffer offset is +1 from the base if we used it with offset, 
-    // but here we just write an array of DispatchIndirectArgs.
+
+    if (bin >= Uniforms.MaxBins) return;
+
+    DeformBinMeta[bin].ClusterOffset = DeformReserveBlockBase + inclusiveOffset - count;
+    DeformBinMeta[bin].Cursor = 0;
 }
 
 [numthreads(64, 1, 1)]
@@ -223,14 +212,11 @@ void CSDeformBinReserveDispatchWrite(uint3 dtid : SV_DispatchThreadID)
 {
     uint tid = dtid.x;
     if (tid >= Uniforms.MaxBins) return;
-    
-    uint count = RasterBinMeta[tid].BinCount;
-    DeformBinningDispatchArgs[tid].X = count; // 1 group per entry
-    DeformBinningDispatchArgs[tid].Y = 1;
-    DeformBinningDispatchArgs[tid].Z = 1;
+
+    uint count = DeformBinMeta[tid].BinCount;
+    DeformBinningDispatchArgs.Store<DispatchArgs>(tid * 12, MakeIndirectDispatchArgs(count));
 }
 
-// ─── Pass 4: Scatter ───
 [numthreads(64, 1, 1)]
 void CSDeformBinScatter(uint3 dtid : SV_DispatchThreadID)
 {
@@ -238,10 +224,10 @@ void CSDeformBinScatter(uint3 dtid : SV_DispatchThreadID)
     uint totalVisible = args.SWCount + args.HWCount;
     uint idx = dtid.x;
     if (idx >= totalVisible) return;
-    
+
     uint visibleIndex;
     bool isSW;
     DecodeVisibleIndex(idx, visibleIndex, isSW);
-    
+
     ProcessClusterRanges(visibleIndex, true);
 }

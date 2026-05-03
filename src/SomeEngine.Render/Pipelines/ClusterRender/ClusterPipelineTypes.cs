@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Diligent;
+using NetEscapades.EnumGenerators;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.Systems;
@@ -11,23 +12,23 @@ namespace SomeEngine.Render.Pipelines;
 //  Enums (原 ClusterRenderFeature.cs)
 // ────────────────────────────────────────────────────────────
 
+[EnumExtensions]
 public enum ClusterDebugMode
 {
     None = 0,
     ClusterID = 1,
     LODLevel = 2,
-    MaterialID = 7,
+    SWHWView = 3,
+    ShadingBin = 7,
     Barycentric = 8,
     Normal = 9,
     UV = 10,
-    SWHWView = 11,
 }
 
+[EnumExtensions]
 public enum HiZDebugMode
 {
-    Legacy,
     Phase1Only,
-    Phase1OnlyPassAll,
     Phase1ThenHiZ,
     Full2Phase,
 }
@@ -49,11 +50,11 @@ public struct CullingUniforms
     public int ForcedLODLevel;
     public uint InstanceCount;
     public uint DebugMode;
-    public uint Pad3;
-    public uint DumpHiZData;
+    public uint VisualiseBVH;
+    public int DebugBVHDepth;
     public uint CurrentDepth;
+    public uint DumpHiZData;
     public uint Pad5;
-    public uint Pad6;
 
     public Matrix4x4 PrevViewProj;
     public uint HasPrevHistory;
@@ -63,7 +64,8 @@ public struct CullingUniforms
     public Matrix4x4 View;
     public float P00;
     public float P11;
-    public Vector2 Pad7;
+    public uint ScreenWidth;
+    public uint ScreenHeight;
 
     public Vector3 QuantOrigin;
     public float QuantStep;
@@ -92,8 +94,8 @@ public struct CullingUniforms
         ForcedLODLevel = forcedLODLevel,
         InstanceCount = instanceCount,
         DebugMode = bypassCulling ? 1u : 0u,
-        DumpHiZData = dumpHiZData ? 1u : 0u,
         CurrentDepth = 0,
+        DumpHiZData = dumpHiZData ? 1u : 0u,
         Pad5 = debugShowHiZAABBs ? 1u : 0u,
         PrevViewProj = Matrix4x4.Transpose(Matrix4x4.Transpose(prevViewProjT)),
         HasPrevHistory = hasPrevHistory ? 1u : 0u,
@@ -102,6 +104,8 @@ public struct CullingUniforms
         View = Matrix4x4.Transpose(view),
         P00 = proj.M11,
         P11 = proj.M22,
+        ScreenWidth = screenWidth,
+        ScreenHeight = screenHeight,
         QuantOrigin = quantOrigin,
         QuantStep = quantStep,
         PrevView = Matrix4x4.Transpose(prevView),
@@ -121,6 +125,15 @@ public struct DrawUniforms
     public uint ScreenHeight;
     public Vector3 QuantOrigin;
     public float QuantStep;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct DrawDispatchUniforms
+{
+    public uint DrawArgsByteOffset;
+    public uint Pad0;
+    public uint Pad1;
+    public uint Pad2;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -220,15 +233,15 @@ public readonly record struct ClusterRasterBinOutput(
     RenderGraphHandle BinnedSWDispatchArgs
 );
 
-/// <summary>
-/// Deform Binning Stage 产出：按 VertexEvalKey 分组的 Cluster/Range 索引。
-/// </summary>
 public readonly record struct ClusterDeformBinOutput(
     RenderGraphHandle DeformBinnedClusterIndex,
     RenderGraphHandle DeformBinMeta,
     RenderGraphHandle PreDeformDispatchArgs
 );
 
+/// <summary>
+/// Deform Binning Stage 产出：按 VertexEvalKey 分组的 Cluster/Range 索引。
+/// </summary>
 /// <summary>
 /// Draw/Rasterize Stage 产出：VisBuffer 和深度。
 /// </summary>
@@ -239,7 +252,7 @@ public readonly record struct ClusterRasterOutput(
 );
 
 /// <summary>
-/// Shade Binning Stage 产出：按 MaterialID 分组的像素坐标。
+/// Shade Binning Stage 产出：按 shading bin 分组的像素坐标。
 /// </summary>
 public readonly record struct ClusterShadeBinOutput(
     RenderGraphHandle PixelCoordBuffer,

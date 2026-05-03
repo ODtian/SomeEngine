@@ -47,8 +47,10 @@ public static class BinSpaceExtensions
                     {
                         if (slotBuffer.TryGetDirtyRange(i, out int min, out int max))
                         {
-                            int count = max - min + 1;
-                            int offsetInUshorts = i * slotBuffer.Capacity + min;
+                            int alignedMin = min & ~1;
+                            int alignedMax = Math.Min(slotBuffer.Capacity - 1, max | 1);
+                            int count = alignedMax - alignedMin + 1;
+                            int offsetInUshorts = i * slotBuffer.Capacity + alignedMin;
                             var dirtySpan = slotData.Slice(offsetInUshorts, count);
                             ctx.UpdateBuffer(buf, (ulong)(offsetInUshorts * sizeof(ushort)), (ReadOnlySpan<ushort>)dirtySpan, ResourceStateTransitionMode.None);
                         }

@@ -38,6 +38,7 @@ StructuredBuffer<uint4> VisibleClusters;
 StructuredBuffer<uint2> BinnedClusterIndexBuffer; // .x = visibleClusterIndex, .y = rangeStart<<16 | rangeEnd
 StructuredBuffer<RasterBinEntry> RasterBinMeta;
 
+Texture2D<float> DepthTarget;
 RWTexture2D<uint> VisBuffer;    // packed: (depth_high24 << 8) | unused for now; shade uses vis encoding
 RWTexture2D<uint> DepthUAV;
 
@@ -174,7 +175,7 @@ void LoadClusterGeometry(uint pageOffset, uint clusterID,
     attrOffset = header1.z;
     idxOffset = header1.w;
 
-    uint clusterOffset = pageOffset + clustersOff + clusterID * 64;
+    uint clusterOffset = pageOffset + clustersOff + clusterID * GPU_CLUSTER_STRIDE_BYTES;
 
     intBase.x = asint(PageHeap.Load(clusterOffset + 0));
     intBase.y = asint(PageHeap.Load(clusterOffset + 4));
@@ -197,35 +198,6 @@ uint FetchVertexIndex(uint pageOffset, uint idxOffset, uint tStart, uint triIdx,
     uint aligned = byteAddr & ~3u;
     uint shift = (byteAddr & 3u) * 8u;
     return (PageHeap.Load(aligned) >> shift) & 0xFFu;
-}
-
-// [DEPRECATED] Legacy vertex fetch — use IVertexSource.fetchClipPosition instead.
-float4 FetchAndTransformVertex(uint pageOffset, uint posOffset, uint vStart,
-                                int3 intBase, uint localVertIdx, GpuTransform t)
-{
-    uint byteAddr = pageOffset + posOffset + (vStart + localVertIdx) * 6;
-    uint aligned = byteAddr & ~3u;
-    uint offset = byteAddr & 3u;
-    uint2 raw = PageHeap.Load2(aligned);
-
-    uint p0, p1, p2;
-    if (offset == 0)
-    {
-        p0 = raw.x & 0xFFFF;
-        p1 = (raw.x >> 16) & 0xFFFF;
-        p2 = raw.y & 0xFFFF;
-    }
-    else // offset == 2
-    {
-        p0 = (raw.x >> 16) & 0xFFFF;
-        p1 = raw.y & 0xFFFF;
-        p2 = (raw.y >> 16) & 0xFFFF;
-    }
-
-    int3 globalIntPos = int3(int(p0), int(p1), int(p2)) + intBase;
-    float3 localPos = float3(globalIntPos) * Uniforms.QuantStep + Uniforms.QuantOrigin;
-    float3 worldPos = ApplyTransform(localPos, t);
-    return mul(float4(worldPos, 1.0), Uniforms.ViewProj);
 }
 
 // ─── Triangle Setup ───
@@ -322,6 +294,10 @@ FRasterTri SetupTriangle(float4 clipVerts[3], int4 scissorRect)
 // ─── WritePixel helper ───
 void WritePixel(int2 pixel, float depth, uint visData)
 {
+    float sceneDepth = DepthTarget.Load(int3(pixel, 0));
+    if (depth >= sceneDepth)
+        return;
+
     // Normal-Z depth (near=0, far=1) flipped to reversed-Z for InterlockedMax + clear-to-0.
     float depthReversed = 1.0 - depth;
     uint depthBits = asuint(depthReversed);
@@ -386,6 +362,11 @@ struct PixelRasterTask : IWaveTask
         int py = srcTri.MinPixel.y + ry;
         float depth = srcTri.DepthPlane.x + srcTri.DepthPlane.y * cx1 + srcTri.DepthPlane.z * cx2;
         depth = saturate(depth);
+
+        float sceneDepth = DepthTarget.Load(int3(px, py, 0));
+        if (depth >= sceneDepth)
+            return;
+
         float depthReversed = 1.0 - depth;
         uint depthBits = asuint(depthReversed);
         uint oldDepth;
@@ -471,9 +452,7 @@ void SWRasterKernel<VS : IVertexSource>(
     uint packedRange = binEntry.y;
     uint rangeStart = (packedRange >> 16) & 0xFFFF;
     uint rangeEnd = packedRange & 0xFFFF;
-    // rangeEnd == 0 means "entire cluster" (legacy fallback)
-    if (rangeEnd == 0) rangeEnd = triangleCount;
-    uint batchTriCount = rangeEnd - rangeStart;
+    uint batchTriCount = rangeEnd > rangeStart ? rangeEnd - rangeStart : 0;
 
     {
         uint localTriIdx = rangeStart + groupThreadIndex;
@@ -577,11 +556,12 @@ void SWRasterKernel<VS : IVertexSource>(
 
 // ─── Default Entry Point (Static mesh, inline vertex eval) ───
 
+[ClusterRaster("sw_inline")]
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void CSSWRaster(uint3 groupID : SV_GroupID, uint groupThreadIndex : SV_GroupThreadID)
 {
-    InlineSource<WaveVertexEval> source;
+    InlineSource<StaticVertexEval> source;
     SWRasterKernel(source, groupID, groupThreadIndex);
 }
 
@@ -589,11 +569,12 @@ void CSSWRaster(uint3 groupID : SV_GroupID, uint groupThreadIndex : SV_GroupThre
 ByteAddressBuffer DeformCache;
 StructuredBuffer<uint> CacheOffsets;
 
+[ClusterRaster("sw_cached")]
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void CSSWRasterCached(uint3 groupID : SV_GroupID, uint groupThreadIndex : SV_GroupThreadID)
 {
-    CachedSource<WaveVertexEval> source;
+    CachedSource<StaticVertexEval> source;
     source.deformCache = DeformCache;
     source.cacheOffsets = CacheOffsets;
     SWRasterKernel(source, groupID, groupThreadIndex);

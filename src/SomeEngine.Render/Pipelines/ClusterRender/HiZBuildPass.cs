@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.IO;
 using Diligent;
 using SomeEngine.Assets.Importers;
@@ -12,37 +11,44 @@ namespace SomeEngine.Render.Pipelines;
 /// <summary>
 /// Static PSO 缓存：HiZ 构建的 2 个 PSO + SRB pool。
 /// </summary>
-internal static class HiZBuildPSOs
+public static partial class ClusterHiZ
 {
-    internal static IPipelineState? BuildMip0PSO;
-    internal static IPipelineState? DownsamplePSO;
+internal sealed class HiZBuildResources : IDisposable
+{
+    internal const string ShaderFile = "hiz_build.slang";
+    internal const string BuildMip0EntryPoint = "BuildMip0";
+    internal const string DownsampleEntryPoint = "DownsampleMip";
 
-    internal static readonly ConcurrentBag<IShaderResourceBinding> BuildMip0SRBPool = [];
-    internal static readonly ConcurrentBag<IShaderResourceBinding> DownsampleSRBPool = [];
+    internal IPipelineState? BuildMip0PSO;
+    internal IPipelineState? DownsamplePSO;
+    internal ShaderAsset? ShaderAsset;
 
-    private static bool s_initialized;
-    private static readonly Lock s_initLock = new();
+    internal readonly SRBPool BuildMip0Pool = new();
+    internal readonly SRBPool DownsamplePool = new();
 
-    internal static void EnsureInitialized(RenderContext context)
+    private bool _initialized;
+    private readonly Lock _initLock = new();
+
+    internal void EnsureInitialized(RenderContext context)
     {
-        if (s_initialized) return;
-        lock (s_initLock)
+        if (_initialized) return;
+        lock (_initLock)
         {
-            if (s_initialized) return;
+            if (_initialized) return;
+
             var device = context.Device;
             if (device == null) return;
 
-            string shaderPath = Path.GetFullPath(
-                Path.Combine(AppContext.BaseDirectory,
-                    "../../../../../../assets/Shaders/hiz_build.slang"));
+            string shaderPath = ClusterStageUtils.ShaderPath(ShaderFile);
             var shaderAsset = SlangShaderImporter.Import(shaderPath);
+            ShaderAsset = shaderAsset;
 
             var layoutDesc = new PipelineResourceLayoutDesc
             {
                 DefaultVariableType = ShaderResourceVariableType.Dynamic,
             };
 
-            using var csMip0 = shaderAsset.CreateShader(context, "BuildMip0");
+            var csMip0 = shaderAsset.CreateShader(context, BuildMip0EntryPoint);
             BuildMip0PSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
                 PSODesc = new PipelineStateDesc
@@ -54,7 +60,7 @@ internal static class HiZBuildPSOs
                 Cs = csMip0,
             });
 
-            using var csDown = shaderAsset.CreateShader(context, "DownsampleMip");
+            var csDown = shaderAsset.CreateShader(context, DownsampleEntryPoint);
             DownsamplePSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
                 PSODesc = new PipelineStateDesc
@@ -65,25 +71,27 @@ internal static class HiZBuildPSOs
                 },
                 Cs = csDown,
             });
-
-            s_initialized = true;
+            _initialized = true;
         }
     }
+internal static uint DispatchCount(uint size) => (size + 7) / 8;
 
-    internal static IShaderResourceBinding RentSRB(IPipelineState pso, ConcurrentBag<IShaderResourceBinding> pool)
-        => pool.TryTake(out var srb) ? srb : pso.CreateShaderResourceBinding(false);
-
-    internal static void ReturnSRB(IShaderResourceBinding srb, ConcurrentBag<IShaderResourceBinding> pool)
-        => pool.Add(srb);
-
-    internal static uint DispatchCount(uint size) => (size + 7) / 8;
+    public void Dispose()
+    {
+        BuildMip0Pool.Dispose();
+        DownsamplePool.Dispose();
+        BuildMip0PSO?.Dispose();
+        DownsamplePSO?.Dispose();
+    }
+}
 }
 
 /// <summary>
 /// RG Pass: HiZ Mip0 from depth target. Lightweight — PSO from static cache.
 /// </summary>
-internal sealed class HiZMip0Pass(RenderContext context, RenderGraphHandle hDepth, RenderGraphHandle hHiZ) : IRenderGraphPass
+internal sealed class HiZMip0Pass(RenderContext context, ClusterHiZ.HiZBuildResources resources, RenderGraphHandle hDepth, RenderGraphHandle hHiZ) : IRenderGraphPass
 {
+    private static readonly bool LogMip0 = Environment.GetEnvironmentVariable("SOMEENGINE_HIZ_MIP0_LOG") == "1";
     private static int _debugFrameCount;
 
     public string Name => "HiZ Mip0";
@@ -96,8 +104,8 @@ internal sealed class HiZMip0Pass(RenderContext context, RenderGraphHandle hDept
 
     public void Execute(RenderGraphContext rgCtx)
     {
-        HiZBuildPSOs.EnsureInitialized(context);
-        if (HiZBuildPSOs.BuildMip0PSO == null) { Console.WriteLine("[HiZ Mip0] PSO is null!"); return; }
+        resources.EnsureInitialized(context);
+        if (resources.BuildMip0PSO == null) { Console.WriteLine("[HiZ Mip0] PSO is null!"); return; }
 
         var hiZTexture = rgCtx.GetTexture(hHiZ);
         if (hiZTexture == null) { Console.WriteLine("[HiZ Mip0] HiZ texture is null!"); return; }
@@ -117,43 +125,43 @@ internal sealed class HiZMip0Pass(RenderContext context, RenderGraphHandle hDept
             NumSlices = hiZDesc.ArraySizeOrDepth,
         });
 
-        if (_debugFrameCount++ % 120 == 0)
+        if (LogMip0 && _debugFrameCount++ % 120 == 0)
         {
             var depthDesc = depthTex?.GetDesc();
             Console.WriteLine($"[HiZ Mip0] depthTex={depthTex != null} fmt={depthDesc?.Format} " +
                 $"size={depthDesc?.Width}x{depthDesc?.Height} " +
                 $"depthSRV={depthSRV != null} hiZUAV0={hiZUAV0 != null} " +
                 $"hiZ={hiZDesc.Width}x{hiZDesc.Height} mips={hiZDesc.MipLevels} " +
-                $"dispatch={HiZBuildPSOs.DispatchCount(hiZDesc.Width)}x{HiZBuildPSOs.DispatchCount(hiZDesc.Height)}");
+                $"dispatch={ClusterHiZ.HiZBuildResources.DispatchCount(hiZDesc.Width)}x{ClusterHiZ.HiZBuildResources.DispatchCount(hiZDesc.Height)}");
         }
 
         if (depthSRV == null || hiZUAV0 == null) return;
 
         var ctx = rgCtx.CommandList;
-        var srb = HiZBuildPSOs.RentSRB(HiZBuildPSOs.BuildMip0PSO, HiZBuildPSOs.BuildMip0SRBPool);
+        var srb = resources.BuildMip0Pool.Rent(resources.BuildMip0PSO);
 
-        srb.GetVariableByName(ShaderType.Compute, "DepthTexture")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "DepthTexture")
             ?.Set(depthSRV, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "HiZMip0")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "HiZMip0")
             ?.Set(hiZUAV0, SetShaderResourceFlags.None);
 
-        ctx.SetPipelineState(HiZBuildPSOs.BuildMip0PSO);
+        ctx.SetPipelineState(resources.BuildMip0PSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
-            ThreadGroupCountX = HiZBuildPSOs.DispatchCount(hiZDesc.Width),
-            ThreadGroupCountY = HiZBuildPSOs.DispatchCount(hiZDesc.Height),
+            ThreadGroupCountX = ClusterHiZ.HiZBuildResources.DispatchCount(hiZDesc.Width),
+            ThreadGroupCountY = ClusterHiZ.HiZBuildResources.DispatchCount(hiZDesc.Height),
             ThreadGroupCountZ = 1,
         });
 
-        HiZBuildPSOs.ReturnSRB(srb, HiZBuildPSOs.BuildMip0SRBPool);
+        resources.BuildMip0Pool.Return(srb);
     }
 }
 
 /// <summary>
 /// RG Pass: HiZ Downsample one mip level. Lightweight — PSO from static cache.
 /// </summary>
-internal sealed class HiZDownsamplePass(RenderContext context, RenderGraphHandle hHiZ, uint mip) : IRenderGraphPass
+internal sealed class HiZDownsamplePass(RenderContext context, ClusterHiZ.HiZBuildResources resources, RenderGraphHandle hHiZ, uint mip) : IRenderGraphPass
 {
     public string Name => $"HiZ Downsample Mip{mip}";
 
@@ -165,8 +173,8 @@ internal sealed class HiZDownsamplePass(RenderContext context, RenderGraphHandle
 
     public void Execute(RenderGraphContext rgCtx)
     {
-        HiZBuildPSOs.EnsureInitialized(context);
-        if (HiZBuildPSOs.DownsamplePSO == null) return;
+        resources.EnsureInitialized(context);
+        if (resources.DownsamplePSO == null) return;
 
         var hiZTexture = rgCtx.GetTexture(hHiZ);
         if (hiZTexture == null) return;
@@ -200,22 +208,22 @@ internal sealed class HiZDownsamplePass(RenderContext context, RenderGraphHandle
         uint mipWidth = Math.Max(1u, hiZDesc.Width >> (int)mip);
         uint mipHeight = Math.Max(1u, hiZDesc.Height >> (int)mip);
 
-        var srb = HiZBuildPSOs.RentSRB(HiZBuildPSOs.DownsamplePSO, HiZBuildPSOs.DownsampleSRBPool);
+        var srb = resources.DownsamplePool.Rent(resources.DownsamplePSO);
 
-        srb.GetVariableByName(ShaderType.Compute, "SrcMip")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "SrcMip")
             ?.Set(srcMipView, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "DstMip")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "DstMip")
             ?.Set(dstMipView, SetShaderResourceFlags.None);
 
-        ctx.SetPipelineState(HiZBuildPSOs.DownsamplePSO);
+        ctx.SetPipelineState(resources.DownsamplePSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
-            ThreadGroupCountX = HiZBuildPSOs.DispatchCount(mipWidth),
-            ThreadGroupCountY = HiZBuildPSOs.DispatchCount(mipHeight),
+            ThreadGroupCountX = ClusterHiZ.HiZBuildResources.DispatchCount(mipWidth),
+            ThreadGroupCountY = ClusterHiZ.HiZBuildResources.DispatchCount(mipHeight),
             ThreadGroupCountZ = 1,
         });
 
-        HiZBuildPSOs.ReturnSRB(srb, HiZBuildPSOs.DownsampleSRBPool);
+        resources.DownsamplePool.Return(srb);
     }
 }

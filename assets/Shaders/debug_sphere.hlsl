@@ -89,8 +89,7 @@ PSInput VSMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID)
     // Header: 16 bytes offset to ClustersOffset
     uint clustersStartOffset = PageHeap.Load(pageOffset + 16);
     
-    // GPUCluster stride is 52 bytes
-    uint clusterStride = 52;
+    uint clusterStride = GPU_CLUSTER_STRIDE_BYTES;
     uint clusterOffset = pageOffset + clustersStartOffset + clusterID * clusterStride; 
 
     // Load LOD Center/Radius (Offset 16)

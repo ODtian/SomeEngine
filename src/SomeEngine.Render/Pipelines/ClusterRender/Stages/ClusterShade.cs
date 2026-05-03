@@ -11,108 +11,95 @@ namespace SomeEngine.Render.Pipelines;
 
 /// <summary>
 /// Level 1 Stage: Shade — stateless static orchestrator.
-/// Owns Sig0/PerPassSRB statics, PSO build logic, and pass composition.
+/// Owns PSO build logic and pass composition. Uses all-Dynamic resource binding.
 /// </summary>
-public static class ClusterShade
+public static partial class ClusterShade
 {
     // ─── Binning / Resolve resources ───
-    private static ClusterShadeBinningResources? s_shadeBinRes;
-    private static ClusterResolvePass? s_resolveProto;
-
-    // ─── Dual-Signature statics ───
-    private static IPipelineResourceSignature? s_sig0;
-    private static IShaderResourceBinding? s_perPassSRB;
-
-    private static bool s_initialized;
-    private static readonly Lock s_initLock = new();
-
-    /// <summary>Per-pass SRB (Sig0). Used by ClusterMaterialShadePass.Execute().</summary>
-    internal static IShaderResourceBinding? PerPassSRB => s_perPassSRB;
-
-    /// <summary>Sig0 accessor for PSO creation.</summary>
-    internal static IPipelineResourceSignature? Sig0 => s_sig0;
-
-    private static void EnsureInitialized(RenderContext context)
+    public sealed class Resources : IDisposable
     {
-        if (s_initialized) return;
-        lock (s_initLock)
+        internal readonly ClusterShadeBinningResources ShadeBin = new();
+        internal readonly ResolveResources Resolve = new();
+        internal readonly MaterialFallbackResources MaterialFallbacks = new();
+        private bool _initialized;
+
+        internal void EnsureInitialized(RenderContext context)
         {
-            if (s_initialized) return;
-            s_shadeBinRes = new ClusterShadeBinningResources();
-            s_shadeBinRes.Init(context);
-            s_resolveProto = new ClusterResolvePass(context);
-            s_resolveProto.Init();
+            if (_initialized) return;
+            ShadeBin.Init(context);
+            Resolve.EnsureInitialized(context);
+            MaterialFallbacks.EnsureInitialized(context);
+            _initialized = true;
+        }
 
-            // Create Sig0 + PerPassSRB
-            var device = context.Device!;
-            s_sig0 = device.CreatePipelineResourceSignature(new PipelineResourceSignatureDesc
-            {
-                Name = "ShadeSignature_PerPass",
-                BindingIndex = 0,
-                Resources =
-                [
-                    Res("VisBuffer",        ShaderResourceType.TextureSrv),
-                    Res("VisibleClusters",  ShaderResourceType.BufferSrv),
-                    Res("PageHeap",         ShaderResourceType.BufferSrv),
-                    Res("Instances",        ShaderResourceType.BufferSrv),
-                    Res("InstanceHeaders",  ShaderResourceType.BufferSrv),
-                    Res("InstanceDataHeap", ShaderResourceType.BufferSrv),
-                    Res("PixelCoordBuffer", ShaderResourceType.BufferSrv),
-                    Res("BinOffsets",       ShaderResourceType.BufferSrv),
-                    Res("BinCounts",        ShaderResourceType.BufferSrv),
-                    Res("OutputColor",      ShaderResourceType.TextureUav),
-                    Res("DeformCache",      ShaderResourceType.BufferSrv),
-                    Res("CacheOffsets",     ShaderResourceType.BufferSrv),
-                ],
-            });
-            s_perPassSRB = s_sig0.CreateShaderResourceBinding(false);
-
-            s_initialized = true;
+        public void Dispose()
+        {
+            ShadeBin.Dispose();
+            Resolve.Dispose();
+            MaterialFallbacks.Dispose();
         }
     }
+
+    /// <summary>Standard linear-wrap sampler desc used as immutable sampler for MaterialSampler.</summary>
+    private static readonly SamplerDesc s_linearWrapSamplerDesc = new()
+    {
+        MinFilter = FilterType.Linear,
+        MagFilter = FilterType.Linear,
+        MipFilter = FilterType.Linear,
+        AddressU = TextureAddressMode.Wrap,
+        AddressV = TextureAddressMode.Wrap,
+        AddressW = TextureAddressMode.Wrap,
+    };
 
     // ════════════════════════════════════════════════
     //  PSO Group Build (replaces ShadePSOBuilder)
     // ════════════════════════════════════════════════
 
-    internal static ShadePSOGroup[] BuildPSOGroups(
+    internal static MaterialPSOGroup[] BuildPSOGroups(
         BinSpace binSpace, int fieldIndex,
         GlobalPsoCache psoCache, RenderContext context)
     {
-        EnsureInitialized(context);
+        var device = context.Device;
+        if (device == null) return [];
 
-        var shaderGroups = ShadePSOGroup.ComputeShaderGroups(
+        var shaderGroups = MaterialPSOGroup.ComputeShaderGroups(
             binSpace,
             fieldIndex,
             static entity => entity.GetComponent<ClusterShadeComponent>().Default);
         if (shaderGroups.Count == 0)
             return [];
 
-        var groups = new ShadePSOGroup[shaderGroups.Count];
+        var deviceType = device.GetDeviceInfo().Type;
+        string backend = deviceType == RenderDeviceType.D3D12 ? "dxil" : "spirv";
+        var layout = new PipelineResourceLayoutDesc
+        {
+            DefaultVariableType = ShaderResourceVariableType.Dynamic,
+            ImmutableSamplers =
+            [
+                new ImmutableSamplerDesc
+                {
+                    ShaderStages = ShaderType.Compute,
+                    SamplerOrTextureName = "MaterialSampler",
+                    Desc = s_linearWrapSamplerDesc,
+                },
+            ],
+        };
+
+        var groups = new MaterialPSOGroup[shaderGroups.Count];
         for (int g = 0; g < shaderGroups.Count; g++)
         {
             var sg = shaderGroups[g];
-            var representativeEntity = sg.Entities[0];
-            var sig1 = CreateSig1(context.Device!, representativeEntity, sg.VariantRef);
-            var pso = FindOrCreatePSO(sg.VariantRef, psoCache, context, sig1);
-            var srbs = new IShaderResourceBinding[sg.BinCount];
+            var pso = FindOrCreateComputePSO(sg.VariantRef, psoCache, context, backend, layout);
+            var srb = pso.CreateShaderResourceBinding(false);
             var argsBins = new int[sg.BinCount];
-
             for (int i = 0; i < sg.BinCount; i++)
-            {
-                srbs[i] = sig1.CreateShaderResourceBinding(false);
-                if (MaterialEntityUtility.TryGetMaterial(sg.Entities[i], out var material))
-                {
-                    material.Params.ApplyTo(srbs[i]);
-                }
-
                 argsBins[i] = binSpace.GetArgsBin(fieldIndex, sg.BinStart + i);
-            }
 
-            groups[g] = new ShadePSOGroup
+            groups[g] = new MaterialPSOGroup
             {
                 PSO = pso,
-                SRBs = srbs,
+                SRB = srb,
+                ComputeVariant = sg.VariantRef,
                 Entities = sg.Entities,
                 ArgsBins = argsBins,
                 BinStart = sg.BinStart,
@@ -123,61 +110,17 @@ public static class ClusterShade
         return groups;
     }
 
-    internal static ulong ComputeSig1CacheKey(Entity entity, ShaderVariantRef variantRef)
-    {
-        return MaterialEntityUtility.ComputeResolvedResourceLayoutHash(entity, variantRef);
-    }
-
-    internal static PipelineResourceDesc[] BuildSig1Resources(Entity entity, ShaderVariantRef variantRef)
-    {
-        var resources = new List<PipelineResourceDesc>
-        {
-            new()
-            {
-                Name = "Uniforms",
-                ShaderStages = ShaderType.Compute,
-                ResourceType = ShaderResourceType.ConstantBuffer,
-                VarType = ShaderResourceVariableType.Dynamic,
-            },
-        };
-
-        foreach (var (name, type) in MaterialEntityUtility.EnumerateResolvedResources(entity, variantRef))
-        {
-            resources.Add(new PipelineResourceDesc
-            {
-                Name = name,
-                ShaderStages = ShaderType.Compute,
-                ResourceType = type,
-                VarType = ShaderResourceVariableType.Mutable,
-            });
-        }
-
-        return resources.ToArray();
-    }
-
-    private static IPipelineResourceSignature CreateSig1(IRenderDevice device, Entity entity, ShaderVariantRef variantRef)
-    {
-        ulong sigHash = ComputeSig1CacheKey(entity, variantRef);
-        return device.CreatePipelineResourceSignature(new PipelineResourceSignatureDesc
-        {
-            Name = $"ShadeSignature_Material_{sigHash:X16}",
-            BindingIndex = 1,
-            Resources = BuildSig1Resources(entity, variantRef),
-        });
-    }
-
-    private static IPipelineState FindOrCreatePSO(
+    private static IPipelineState FindOrCreateComputePSO(
         ShaderVariantRef variantRef,
         GlobalPsoCache psoCache,
         RenderContext context,
-        IPipelineResourceSignature sig1)
+        string backend,
+        PipelineResourceLayoutDesc layout)
     {
         var shader = variantRef.Shader;
         if (shader == null || context.Device == null)
             throw new InvalidOperationException("ShaderVariantRef must have a non-null ShaderAsset.");
 
-        var deviceType = context.Device.GetDeviceInfo().Type;
-        string backend = deviceType == RenderDeviceType.D3D12 ? "dxil" : "spirv";
         var computeVariant = shader.Variants?.FirstOrDefault(v =>
             v.Backend == backend
             && v.Stage == SomeEngine.Assets.Schema.ShaderStage.Compute
@@ -193,9 +136,9 @@ public static class ClusterShade
             {
                 Name = $"Shade PSO ({shader.Name})",
                 PipelineType = PipelineType.Compute,
+                ResourceLayout = layout,
             },
             Cs = cs,
-            ResourceSignatures = [s_sig0!, sig1],
         };
 
         return psoCache.GetOrCreateComputePSO(context.Device, ci);
@@ -208,12 +151,13 @@ public static class ClusterShade
     public static (ClusterShadeBinOutput ShadeBin, ClusterShadeOutput Shade) AddPasses(
         RenderGraph graph,
         RenderContext context,
+        Resources resources,
         in ClusterRasterOutput raster,
         in ClusterCullOutput cull,
         in ClusterGlobalResources globals,
         RenderGraphHandle hDrawUniforms,
         RenderGraphHandle hMaterialSlotBuffer,
-        ShadePSOGroup[] psoGroups,
+        MaterialPSOGroup[] psoGroups,
         RenderGraphHandle colorTarget,
         RenderGraphHandle depthTarget,
         BinSpace binSpace,
@@ -232,11 +176,13 @@ public static class ClusterShade
         RenderGraphHandle hCacheOffsets = default
     )
     {
-        EnsureInitialized(context);
-        var res = s_shadeBinRes!;
+        resources.EnsureInitialized(context);
+        var res = resources.ShadeBin;
 
         uint drawDebugMode = (uint)debugMode;
-        bool isResolveOnlyDebug = drawDebugMode is 1 or 2 or 3;
+        bool isResolveOnlyDebug = debugMode is ClusterDebugMode.ClusterID
+            or ClusterDebugMode.LODLevel
+            or ClusterDebugMode.SWHWView;
         uint clampedMaterialCount = Math.Max(materialCount, 1u);
 
         // ════════════════════════════════════════════════
@@ -267,6 +213,13 @@ public static class ClusterShade
             Size = (ulong)(maxMaterials * 4), BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
             Mode = BufferMode.Structured, ElementByteStride = 4,
         });
+        var hBinReserveCounters = graph.CreateBuffer("BinReserveCounters", new BufferDesc
+        {
+            Size = 4,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+            Mode = BufferMode.Structured,
+            ElementByteStride = 4,
+        });
         var hPixelCoordBuffer = graph.CreateBuffer("PixelCoordBuffer", new BufferDesc
         {
             Size = (ulong)(screenWidth * screenHeight * 4),
@@ -283,16 +236,23 @@ public static class ClusterShade
         // Clear bin counts
         graph.AddPass(
             "ClearBinCounts",
-            builder => { builder.Write(hBinCounts, ResourceState.CopyDest); },
+            builder =>
+            {
+                builder.Write(hBinCounts, ResourceState.CopyDest);
+                builder.Write(hBinReserveCounters, ResourceState.CopyDest);
+            },
             rgCtx =>
             {
                 var ctx2 = rgCtx.RenderContext.ImmediateContext;
                 var buf = rgCtx.GetBuffer(hBinCounts);
-                if (ctx2 != null && buf != null)
+                var counterBuf = rgCtx.GetBuffer(hBinReserveCounters);
+                if (ctx2 != null && buf != null && counterBuf != null)
                 {
                     byte[] zeros = new byte[maxMaterials * 4];
                     Array.Clear(zeros);
                     ctx2.UpdateBuffer(buf, 0, zeros, ResourceStateTransitionMode.None);
+                    byte[] counterZeros = new byte[4];
+                    ctx2.UpdateBuffer(counterBuf, 0, counterZeros, ResourceStateTransitionMode.None);
                 }
             }
         );
@@ -310,6 +270,8 @@ public static class ClusterShade
             HShadeBinUniforms = hBinUniforms, HBinCounts = hBinCounts,
             HBinOffsets = hBinOffsets, HBinScatterCount = hBinScatterCount,
             HBinIndirectArgs = hBinIndirectArgs,
+            HReserveCounters = hBinReserveCounters,
+            MaterialCount = clampedMaterialCount,
         });
         graph.AddPass(new ClusterShadeBinScatterPass(context, res)
         {
@@ -339,7 +301,7 @@ public static class ClusterShade
         // ════════════════════════════════════════════════
         if (isResolveOnlyDebug)
         {
-            var resolve = new ClusterResolvePass(context);
+            var resolve = new ClusterResolvePass(context, resources.Resolve);
             resolve.Init();
             resolve.HVisBuffer = raster.VisBuffer;
             resolve.HDepthTarget = depthTarget;
@@ -376,6 +338,10 @@ public static class ClusterShade
             CameraPos = cameraPos,
         };
         var hShadeUniforms = CreateDynamicUniform(graph, "ShadeUniforms", shadeUniformData);
+        var hMaterialScalarRegion = CreateDynamicByteAddressBuffer(
+            graph,
+            "MaterialScalarRegion",
+            ClusterMaterialShadePass.GetMaxScalarRegionByteSize(psoGroups));
 
         // Clear shade output
         graph.AddPass(
@@ -407,6 +373,7 @@ public static class ClusterShade
             HInstanceHeaders = globals.GlobalInstanceHeader,
             HInstanceDataHeap = globals.InstanceDataHeap,
             HShadeUniforms = hShadeUniforms,
+            HMaterialScalarRegion = hMaterialScalarRegion,
             HPixelCoordBuffer = shadeBinOut.PixelCoordBuffer,
             HBinOffsets = shadeBinOut.BinOffsets,
             HBinCounts = shadeBinOut.BinCounts,
@@ -416,6 +383,7 @@ public static class ClusterShade
             HCacheOffsets = hCacheOffsets,
             ShadeUniformData = shadeUniformData,
             PSOGroups = psoGroups,
+            MaterialFallbacks = resources.MaterialFallbacks.Fallbacks,
         };
         graph.AddPass(shadePass);
 
@@ -428,13 +396,7 @@ public static class ClusterShade
 
     // ─── Helpers ───
 
-    private static PipelineResourceDesc Res(string name, ShaderResourceType type) => new()
-    {
-        Name = name,
-        ShaderStages = ShaderType.Compute,
-        ResourceType = type,
-        VarType = ShaderResourceVariableType.Dynamic,
-    };
+
 
     private static RenderGraphHandle CreateDynamicUniform<T>(RenderGraph graph, string name, T data) where T : unmanaged
     {
@@ -460,6 +422,20 @@ public static class ClusterShade
             }
         );
         return handle;
+    }
+
+    private static RenderGraphHandle CreateDynamicByteAddressBuffer(RenderGraph graph, string name, int byteSize)
+    {
+        int alignedByteSize = Math.Max(16, ((byteSize + 15) / 16) * 16);
+        return graph.CreateBuffer(name, new BufferDesc
+        {
+            Size = (ulong)alignedByteSize,
+            Usage = Usage.Dynamic,
+            BindFlags = BindFlags.ShaderResource,
+            CPUAccessFlags = CpuAccessFlags.Write,
+            Mode = BufferMode.Raw,
+            ElementByteStride = 4,
+        });
     }
 
     private static void AddCopyPass(

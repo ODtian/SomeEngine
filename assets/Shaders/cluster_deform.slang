@@ -1,6 +1,6 @@
 // cluster_deform.slang — Pre-deformation Compute Shader
-// 32 threads/group, 1 group = 1 RasterBin batch entry.
-// Deform and Raster share the same BinnedClusterIndex/RasterBin outputs.
+// 32 threads/group, 1 group = 1 DeformBin batch entry.
+// DeformCache is binned by VertexEval; raster remains independently binned.
 
 #ifndef CLUSTER_DEFORM_SLANG
 #define CLUSTER_DEFORM_SLANG
@@ -15,13 +15,13 @@ struct DeformUniforms
     float3 QuantOrigin;
     float  QuantStep;
     uint   MaxVisibleClusters;
-    uint   MaxDeformVertices;
-    uint   MaxRasterBins;
+    uint   MaxDeformCacheBytes;
     uint   MaxClusterVertices;
     uint   CurrentBin;
-    uint   _pad0;
-    uint   _pad1;
-    uint   _pad2;
+    uint   CacheStrideBytes;
+    uint   CacheScanBlockCount0;
+    uint   CacheScanBlockCount1;
+    uint   ResetCacheAllocationState;
 };
 
 ConstantBuffer<DeformUniforms> Uniforms;
@@ -29,14 +29,25 @@ ConstantBuffer<DeformUniforms> Uniforms;
 ByteAddressBuffer PageHeap;
 StructuredBuffer<uint4> VisibleClusters;
 StructuredBuffer<uint2> BinnedClusterIndexBuffer;
-StructuredBuffer<RasterBinEntry> RasterBinMeta;
+StructuredBuffer<DeformBinEntry> DeformBinMeta;
 ByteAddressBuffer DrawArgs;
 ByteAddressBuffer ReadOffsetArgs;
 
 RWByteAddressBuffer      DeformCache;
-RWStructuredBuffer<uint> CacheOffsets;
-RWByteAddressBuffer      CacheAllocCounter;
+StructuredBuffer<uint>   CacheOffsets;
+RWStructuredBuffer<uint> CacheOffsetsWrite;
 RWByteAddressBuffer      DeformDispatchArgs;
+RWStructuredBuffer<uint> CacheRequestBytes;
+RWStructuredBuffer<uint> CacheBlockSums0;
+RWStructuredBuffer<uint> CacheBlockSums1;
+RWStructuredBuffer<uint> CacheBlockOffsets0;
+RWStructuredBuffer<uint> CacheBlockOffsets1;
+
+static const uint CACHE_OFFSET_OVERFLOW    = 0xFFFFFFFDu;
+static const uint CACHE_SCAN_BLOCK_SIZE = 256u;
+static const uint CACHE_VISIBLE_THREAD_COUNT = 64u;
+
+groupshared uint CacheScanScratch[CACHE_SCAN_BLOCK_SIZE];
 
 uint DecodeVisibleIdx(uint logicalIdx, out bool valid)
 {
@@ -52,6 +63,11 @@ uint DecodeVisibleIdx(uint logicalIdx, out bool valid)
     uint hwBase = Uniforms.MaxVisibleClusters - readOffset.HWCount - hwCount;
     bool isSW  = logicalIdx < swCount;
     return isSW ? (swBase + logicalIdx) : (hwBase + logicalIdx - swCount);
+}
+
+uint DecodeVisibleThreadIdx(uint3 groupID, uint groupIndex)
+{
+    return (groupID.x + groupID.y * 65535u) * CACHE_VISIBLE_THREAD_COUNT + groupIndex;
 }
 
 uint MaskedBitCount(uint2 bits, uint index)
@@ -86,6 +102,36 @@ int FindNthSetBit2(uint2 mask, int n)
 uint CountBits2(uint2 v)
 {
     return countbits(v.x) + countbits(v.y);
+}
+
+uint LoadClusterVertexCount(uint visibleIndex)
+{
+    uint4 req = VisibleClusters[visibleIndex];
+    uint pageOffset = req.x;
+    uint clusterID = req.y;
+
+    uint4 header1 = PageHeap.Load4(pageOffset + 16);
+    uint clustersOff = header1.x;
+    uint clusterByteOff = pageOffset + clustersOff + clusterID * GPU_CLUSTER_STRIDE_BYTES;
+    uint packedCounts = PageHeap.Load(clusterByteOff + 44);
+    return packedCounts & 0xFF;
+}
+
+uint ScanExclusive256(uint value, uint groupIndex, out uint inclusive)
+{
+    CacheScanScratch[groupIndex] = value;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint scanOffset = 1u; scanOffset < CACHE_SCAN_BLOCK_SIZE; scanOffset <<= 1u)
+    {
+        uint addend = groupIndex >= scanOffset ? CacheScanScratch[groupIndex - scanOffset] : 0u;
+        GroupMemoryBarrierWithGroupSync();
+        CacheScanScratch[groupIndex] += addend;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    inclusive = CacheScanScratch[groupIndex];
+    return inclusive - value;
 }
 
 struct VertexDedup
@@ -143,8 +189,12 @@ void DeformKernel<TVE : IVertexEvaluate>(
 
     uint flatIndex = groupID.x + groupID.y * 65535u;
 
-    // Per-bin dispatch: total count (SW+HW) dispatched at bin*12
-    uint clusterOffset = RasterBinMeta[Uniforms.CurrentBin].ClusterOffset;
+    // Per-bin dispatch: one compute group per DeformBin entry.
+    DeformBinEntry binMeta = DeformBinMeta[Uniforms.CurrentBin];
+    if (flatIndex >= binMeta.BinCount)
+        return;
+
+    uint clusterOffset = binMeta.ClusterOffset;
     uint binnedIndex = clusterOffset + flatIndex;
     uint2 binEntry = BinnedClusterIndexBuffer[binnedIndex];
     uint visibleIndex = binEntry.x;
@@ -162,7 +212,7 @@ void DeformKernel<TVE : IVertexEvaluate>(
     uint attrOffset  = header1.z;
     uint idxOffset   = header1.w;
 
-    uint clusterByteOff = pageOffset + clustersOff + clusterID * 64;
+    uint clusterByteOff = pageOffset + clustersOff + clusterID * GPU_CLUSTER_STRIDE_BYTES;
 
     int3 intBase;
     intBase.x = asint(PageHeap.Load(clusterByteOff + 0));
@@ -178,11 +228,25 @@ void DeformKernel<TVE : IVertexEvaluate>(
     uint packedCounts = PageHeap.Load(clusterByteOff + 44);
     uint vertexCount  = packedCounts & 0xFF;
     uint triCount     = (packedCounts >> 8) & 0xFF;
+    if (vertexCount == 0u || vertexCount > Uniforms.MaxClusterVertices)
+        return;
+
+    uint stride = evaluator.getCacheStride();
+    uint cacheBaseByte = 0;
+    if (WaveGetLaneIndex() == 0)
+    {
+        cacheBaseByte =
+            stride == Uniforms.CacheStrideBytes && stride != 0u && ((stride & 3u) == 0u)
+                ? CacheOffsets[visibleIndex]
+                : CACHE_OFFSET_OVERFLOW;
+    }
+    cacheBaseByte = WaveReadLaneFirst(cacheBaseByte);
+    if (cacheBaseByte >= CACHE_OFFSET_OVERFLOW)
+        return;
 
     uint rangeStart = (packedRange >> 16) & 0xFFFF;
     uint rangeEnd = packedRange & 0xFFFF;
-    if (rangeEnd == 0) rangeEnd = triCount;
-    uint batchTriCount = rangeEnd - rangeStart;
+    uint batchTriCount = rangeEnd > rangeStart ? rangeEnd - rangeStart : 0;
 
     uint localTriIdx = rangeStart + groupThreadIndex;
     bool bTriValid = groupThreadIndex < batchTriCount;
@@ -202,10 +266,6 @@ void DeformKernel<TVE : IVertexEvaluate>(
 
     uint localVertIdx = dedup.laneVertIndex;
     if (localVertIdx >= vertexCount || localVertIdx >= Uniforms.MaxClusterVertices)
-        return;
-
-    uint cacheBaseVert = CacheOffsets[visibleIndex];
-    if (cacheBaseVert + vertexCount > Uniforms.MaxDeformVertices)
         return;
 
     GpuTransform transform = Instances[realInstanceID];
@@ -247,26 +307,27 @@ void DeformKernel<TVE : IVertexEvaluate>(
 
     TVE.DeformedVertex v = evaluator.evaluate(ctx);
 
-    uint stride   = evaluator.getCacheStride();
-    uint byteAddr = (cacheBaseVert + localVertIdx) * stride;
+    uint byteAddr = cacheBaseByte + localVertIdx * stride;
     evaluator.writeCache(DeformCache, byteAddr, v);
 }
 
-// [shader("compute")]
-// [numthreads(32, 1, 1)]
-// void CSDeformStatic(uint3 groupID : SV_GroupID, uint gtid : SV_GroupThreadID)
-// {
-//     StaticVertexEval eval;
-//     DeformKernel(eval, groupID, gtid);
-// }
+[ClusterDeform]
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void CSDeformStatic(uint3 groupID : SV_GroupID, uint gtid : SV_GroupThreadID)
+{
+    StaticVertexEval eval;
+    DeformKernel(eval, groupID, gtid);
+}
 
-// [shader("compute")]
-// [numthreads(32, 1, 1)]
-// void CSDeformWave(uint3 groupID : SV_GroupID, uint gtid : SV_GroupThreadID)
-// {
-//     WaveVertexEval eval;
-//     DeformKernel(eval, groupID, gtid);
-// }
+[ClusterDeform]
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void CSDeformWave(uint3 groupID : SV_GroupID, uint gtid : SV_GroupThreadID)
+{
+    WaveVertexEval eval;
+    DeformKernel(eval, groupID, gtid);
+}
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -274,34 +335,145 @@ void CSDeformPrepareVisibleArgs()
 {
     CullDrawArgs args = DrawArgs.Load<CullDrawArgs>(0);
     uint totalVisible = args.SWCount + args.HWCount;
-    uint dispatchX = min(totalVisible, 65535u);
-    uint dispatchY = (totalVisible > 0) ? ((totalVisible + 65535u - 1u) / 65535u) : 0u;
+    uint groupCount = (totalVisible + CACHE_VISIBLE_THREAD_COUNT - 1u) / CACHE_VISIBLE_THREAD_COUNT;
+    uint dispatchX = min(groupCount, 65535u);
+    uint dispatchY = (groupCount > 0) ? ((groupCount + 65535u - 1u) / 65535u) : 0u;
     DeformDispatchArgs.Store(0, dispatchX);
     DeformDispatchArgs.Store(4, dispatchY);
     DeformDispatchArgs.Store(8, 1u);
 }
 
 [shader("compute")]
-[numthreads(1, 1, 1)]
-void CSDeformInitVisible(uint3 groupID : SV_GroupID)
+[numthreads(64, 1, 1)]
+void CSDeformInitVisible(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
-    uint logicalIdx = groupID.x + groupID.y * 65535u;
+    uint logicalIdx = DecodeVisibleThreadIdx(groupID, groupIndex);
 
     bool valid;
     uint visibleIndex = DecodeVisibleIdx(logicalIdx, valid);
     if (!valid) return;
 
-    uint4 req = VisibleClusters[visibleIndex];
-    uint pageOffset = req.x;
-    uint clusterID = req.y;
-    uint clustersOff = PageHeap.Load(pageOffset + 16);
-    uint clusterByteOff = pageOffset + clustersOff + clusterID * 64;
-    uint packedCounts = PageHeap.Load(clusterByteOff + 44);
-    uint vertexCount = packedCounts & 0xFF;
+    CacheOffsetsWrite[visibleIndex] = CACHE_OFFSET_OVERFLOW;
+}
 
-    uint baseVert;
-    CacheAllocCounter.InterlockedAdd(0, vertexCount, baseVert);
-    CacheOffsets[visibleIndex] = baseVert;
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void CSDeformCacheRequest(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+    uint logicalIdx = DecodeVisibleThreadIdx(groupID, groupIndex);
+
+    bool valid;
+    uint visibleIndex = DecodeVisibleIdx(logicalIdx, valid);
+    if (!valid) return;
+
+    uint vertexCount = LoadClusterVertexCount(visibleIndex);
+    uint stride = Uniforms.CacheStrideBytes;
+    uint requestBytes =
+        vertexCount > 0u && vertexCount <= Uniforms.MaxClusterVertices &&
+        stride != 0u && ((stride & 3u) == 0u)
+            ? vertexCount * stride
+            : 0u;
+
+    CacheRequestBytes[logicalIdx] = requestBytes;
+    CacheOffsetsWrite[visibleIndex] = CACHE_OFFSET_OVERFLOW;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void CSDeformCacheScanVisible(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+    uint logicalIdx = groupID.x * CACHE_SCAN_BLOCK_SIZE + groupIndex;
+
+    bool valid;
+    uint visibleIndex = DecodeVisibleIdx(logicalIdx, valid);
+    uint requestBytes = valid ? CacheRequestBytes[logicalIdx] : 0u;
+
+    uint inclusive;
+    uint localOffset = ScanExclusive256(requestBytes, groupIndex, inclusive);
+
+    if (valid)
+        CacheOffsetsWrite[visibleIndex] = localOffset;
+
+    if (groupIndex == CACHE_SCAN_BLOCK_SIZE - 1u)
+        CacheBlockSums0[groupID.x] = inclusive;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void CSDeformCacheScanBlocks0(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+    uint blockIndex = groupID.x * CACHE_SCAN_BLOCK_SIZE + groupIndex;
+    uint value = blockIndex < Uniforms.CacheScanBlockCount0 ? CacheBlockSums0[blockIndex] : 0u;
+
+    uint inclusive;
+    uint localOffset = ScanExclusive256(value, groupIndex, inclusive);
+
+    if (blockIndex < Uniforms.CacheScanBlockCount0)
+        CacheBlockOffsets0[blockIndex] = localOffset;
+
+    if (groupIndex == CACHE_SCAN_BLOCK_SIZE - 1u)
+        CacheBlockSums1[groupID.x] = inclusive;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void CSDeformCacheScanBlocks1(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+    uint blockIndex = groupID.x * CACHE_SCAN_BLOCK_SIZE + groupIndex;
+    uint value = blockIndex < Uniforms.CacheScanBlockCount1 ? CacheBlockSums1[blockIndex] : 0u;
+
+    uint inclusive;
+    uint localOffset = ScanExclusive256(value, groupIndex, inclusive);
+
+    if (blockIndex < Uniforms.CacheScanBlockCount1)
+        CacheBlockOffsets1[blockIndex] = localOffset;
+
+    if (groupID.x == 0u && groupIndex == 0u && Uniforms.ResetCacheAllocationState != 0u)
+        CacheBlockOffsets1[Uniforms.CacheScanBlockCount1] = 0u;
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void CSDeformCacheApplyBlockOffsets(uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+    uint logicalIdx = DecodeVisibleThreadIdx(groupID, groupIndex);
+
+    bool valid;
+    uint visibleIndex = DecodeVisibleIdx(logicalIdx, valid);
+    if (!valid) return;
+
+    uint requestBytes = CacheRequestBytes[logicalIdx];
+    uint block0 = logicalIdx / CACHE_SCAN_BLOCK_SIZE;
+    uint block1 = block0 / CACHE_SCAN_BLOCK_SIZE;
+    uint localBaseByte =
+        CacheOffsetsWrite[visibleIndex] +
+        CacheBlockOffsets0[block0] +
+        CacheBlockOffsets1[block1];
+    uint phaseBaseByte = CacheBlockOffsets1[Uniforms.CacheScanBlockCount1];
+    uint baseByte = phaseBaseByte + localBaseByte;
+
+    bool overflow =
+        requestBytes == 0u ||
+        requestBytes > Uniforms.MaxDeformCacheBytes ||
+        localBaseByte > 0xFFFFFFFFu - phaseBaseByte ||
+        baseByte > Uniforms.MaxDeformCacheBytes - requestBytes;
+
+    CacheOffsetsWrite[visibleIndex] = overflow ? CACHE_OFFSET_OVERFLOW : baseByte;
+}
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void CSDeformCacheCommitAllocation()
+{
+    uint lastBlock = Uniforms.CacheScanBlockCount1 - 1u;
+    uint totalRequestBytes = CacheBlockOffsets1[lastBlock] + CacheBlockSums1[lastBlock];
+    uint stateIndex = Uniforms.CacheScanBlockCount1;
+    uint currentBase = CacheBlockOffsets1[stateIndex];
+    uint nextBase =
+        totalRequestBytes > 0xFFFFFFFFu - currentBase
+            ? 0xFFFFFFFFu
+            : currentBase + totalRequestBytes;
+    CacheBlockOffsets1[stateIndex] = nextBase;
 }
 
 #endif // CLUSTER_DEFORM_SLANG

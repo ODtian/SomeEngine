@@ -1,6 +1,6 @@
 using System;
-using System.Collections.Concurrent;
 using System.IO;
+using System.Text;
 using Diligent;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Render.Data;
@@ -38,12 +38,8 @@ internal sealed class ClusterResourceUploadPass(
 
 internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
 {
-    private static IPipelineState? s_patchPSO;
-    private static readonly ConcurrentBag<IShaderResourceBinding> s_srbPool = [];
-    private static bool s_initialized;
-    private static readonly Lock s_initLock = new();
-
     private readonly RenderContext _context;
+    private readonly ClusterUploadStage.Resources _resources;
 
     public IReadOnlyList<ClusterResourceManager.BVHPatchData>? Patches;
     public RenderGraphHandle HGlobalBVH;
@@ -52,46 +48,14 @@ internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
 
     public string Name => "Cluster BVH Patch";
 
-    public ClusterBVHPatchPass(RenderContext context)
+    public ClusterBVHPatchPass(RenderContext context, ClusterUploadStage.Resources resources)
     {
         _context = context;
-        EnsureInitialized(context);
+        _resources = resources;
+        _resources.EnsureInitialized(context);
     }
 
-    private static void EnsureInitialized(RenderContext context)
-    {
-        if (s_initialized) return;
-        lock (s_initLock)
-        {
-            if (s_initialized) return;
-            var device = context.Device;
-            if (device == null) return;
-
-            string path = System.IO.Path.GetFullPath(
-                System.IO.Path.Combine(AppContext.BaseDirectory,
-                    "../../../../../../assets/Shaders/bvh_patch.slang"));
-            var patchShaderAsset = SlangShaderImporter.Import(path);
-
-            using var cs = patchShaderAsset.CreateShader(context, "main");
-            s_patchPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
-            {
-                PSODesc = new PipelineStateDesc
-                {
-                    Name = "BVH Patch PSO",
-                    PipelineType = PipelineType.Compute,
-                    ResourceLayout = new PipelineResourceLayoutDesc
-                    {
-                        DefaultVariableType = ShaderResourceVariableType.Dynamic,
-                    },
-                },
-                Cs = cs,
-            });
-
-            s_initialized = true;
-        }
-    }
-
-    public void Init() => EnsureInitialized(_context);
+    public void Init() => _resources.EnsureInitialized(_context);
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -110,7 +74,7 @@ internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
     {
         if (Patches == null || Patches.Count == 0) return;
         var ctx = graphContext.RenderContext.ImmediateContext;
-        if (ctx == null || s_patchPSO == null) return;
+        if (ctx == null || _resources.PatchPSO == null) return;
 
         var bvhBuffer = graphContext.GetBuffer(HGlobalBVH);
         var patchBuffer = graphContext.GetBuffer(HPatchBuffer);
@@ -133,16 +97,16 @@ internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
             pSpan[i] = Patches[i];
         ctx.UnmapBuffer(patchBuffer, MapType.Write);
 
-        var srb = s_srbPool.TryTake(out var s) ? s : s_patchPSO.CreateShaderResourceBinding(false);
+        var srb = _resources.PatchPool.Rent(_resources.PatchPSO);
 
-        srb.GetVariableByName(ShaderType.Compute, "GlobalBVH")
+        srb.GetVariableByReflectedBinding(_context, _resources.PatchShaderAsset, ShaderType.Compute, "GlobalBVH")
             ?.Set(bvhBuffer.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "Uniforms")
+        srb.GetVariableByReflectedBinding(_context, _resources.PatchShaderAsset, ShaderType.Compute, "Uniforms")
             ?.Set(uniformsBuffer, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "Patches")
+        srb.GetVariableByReflectedBinding(_context, _resources.PatchShaderAsset, ShaderType.Compute, "Patches")
             ?.Set(patchBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
 
-        ctx.SetPipelineState(s_patchPSO);
+        ctx.SetPipelineState(_resources.PatchPSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         
         uint groups = ((uint)Patches.Count + 63) / 64;
@@ -153,7 +117,7 @@ internal sealed class ClusterBVHPatchPass : IRenderGraphPass, IDisposable
             ThreadGroupCountZ = 1,
         });
 
-        s_srbPool.Add(srb);
+        _resources.PatchPool.Return(srb);
     }
 
     public void Dispose() { }
@@ -196,7 +160,7 @@ internal sealed class ClusterUploadInstanceDataPass(
         graphContext.CommandList.UpdateBuffer(
             globalInstanceHeaderBuffer,
             0,
-            (ReadOnlySpan<GpuInstanceHeader>)transformSystem.CpuHeaders,
+            (ReadOnlySpan<byte>)transformSystem.CpuHeaders,
             ResourceStateTransitionMode.None
         );
 
@@ -250,7 +214,8 @@ internal sealed class ClusterClearBuffersPass(
         var candidateCountBuffer = candidateCount.IsValid ? graphContext.GetBuffer(candidateCount) : null;
         var pageFault = pageFaultBuffer.IsValid ? graphContext.GetBuffer(pageFaultBuffer) : null;
 
-        Span<uint> resetDrawArgs = [96, 0, 0, 0, 0]; // [0]=VertexCount (96=32tris*3 per VRB batch), [4]=swCount(InstanceCount), [8]=hwCount, rest=unused
+        // CullDrawArgs raw layout: [0]=vertex count per cluster, [4]=SW count, [8]=HW count, [12]=total reservation counter.
+        Span<uint> resetDrawArgs = [96, 0, 0, 0, 0];
         if (drawArgsBuffer != null)
             graphContext.CommandList.UpdateBuffer(
                 drawArgsBuffer,
@@ -334,94 +299,6 @@ internal sealed class ClusterClearBuffersPass(
     }
 }
 
-internal sealed class ClusterBVHReadbackPass(ClusterBVHTraversePass bvhPass) : IRenderGraphPass
-{
-    public string Name => "BVH Readback";
-
-    public void Setup(RenderGraphBuilder builder)
-    {
-        bvhPass.SetupReadbackPass(builder);
-    }
-
-    public void Execute(RenderGraphContext graphContext)
-    {
-        bvhPass.ExecuteReadbackPass(graphContext.RenderContext, graphContext);
-    }
-}
-
-internal sealed class ClusterBVHClearArgsPass(
-    ClusterBVHTraversePass bvhPass,
-    bool clearArgsA,
-    string name
-) : IRenderGraphPass
-{
-    public string Name { get; } = name;
-
-    public void Setup(RenderGraphBuilder builder)
-    {
-        bvhPass.SetupClearArgsPass(builder, clearArgsA);
-    }
-
-    public void Execute(RenderGraphContext graphContext)
-    {
-        bvhPass.ExecuteClearArgsPass(graphContext.RenderContext, graphContext, clearArgsA);
-    }
-}
-
-internal sealed class ClusterBVHInitQueuePass(ClusterBVHTraversePass bvhPass) : IRenderGraphPass
-{
-    public string Name => "BVH Init Queue";
-
-    public void Setup(RenderGraphBuilder builder)
-    {
-        bvhPass.SetupInitQueuePass(builder);
-    }
-
-    public void Execute(RenderGraphContext graphContext)
-    {
-        bvhPass.ExecuteInitQueuePass(graphContext.RenderContext, graphContext);
-    }
-}
-
-internal sealed class ClusterBVHUpdateArgsPass(
-    ClusterBVHTraversePass bvhPass,
-    bool targetIsA,
-    string name
-) : IRenderGraphPass
-{
-    public string Name { get; } = name;
-
-    public void Setup(RenderGraphBuilder builder)
-    {
-        bvhPass.SetupUpdateArgsPass(builder, targetIsA);
-    }
-
-    public void Execute(RenderGraphContext graphContext)
-    {
-        bvhPass.ExecuteUpdateArgsPass(graphContext.RenderContext, graphContext, targetIsA);
-    }
-}
-
-internal sealed class ClusterBVHTraverseDepthPass(
-    ClusterBVHTraversePass bvhPass,
-    bool currentIsA,
-    int depth,
-    string name
-) : IRenderGraphPass
-{
-    public string Name { get; } = name;
-
-    public void Setup(RenderGraphBuilder builder)
-    {
-        bvhPass.SetupTraversePass(builder, currentIsA);
-    }
-
-    public void Execute(RenderGraphContext graphContext)
-    {
-        bvhPass.ExecuteTraversePass(graphContext.RenderContext, graphContext, currentIsA, depth);
-    }
-}
-
 internal sealed class ClusterBVHPageFaultCopyPass(
     ClusterBVHTraversePass bvhPass,
     RenderGraphHandle hPageFaultReadback
@@ -447,138 +324,44 @@ internal sealed class ClusterBVHPageFaultCopyPass(
 
 
 
-internal sealed class ClusterDebugSphereCopyPass(
-    ClusterDebugPass debugPass,
-    RenderGraphHandle hIndirectDrawArgs,
-    RenderGraphHandle hDebugIndirectArgs,
-    RenderGraphHandle hCopyUB
-) : IRenderGraphPass
-{
-    public string Name => "Debug Sphere Copy Args";
-
-    public void Setup(RenderGraphBuilder builder)
-    {
-        debugPass.SetupSphereCopy(builder, hIndirectDrawArgs, hDebugIndirectArgs, hCopyUB);
-    }
-
-    public void Execute(RenderGraphContext graphContext)
-    {
-        debugPass.ExecuteSphereCopy(
-            graphContext.RenderContext,
-            graphContext,
-            hIndirectDrawArgs,
-            hDebugIndirectArgs,
-            hCopyUB
-        );
-    }
-}
-
-internal sealed class ClusterDebugSphereDrawPass(
-    ClusterDebugPass debugPass,
-    RenderGraphHandle hVisibleClusters,
-    RenderGraphHandle hDebugIndirectArgs,
-    RenderGraphHandle hPageHeap,
-    RenderGraphHandle hColor,
-    RenderGraphHandle hDepth,
-    RenderGraphHandle hDrawUB
-) : IRenderGraphPass
-{
-    public string Name => "Debug Sphere Draw";
-
-    public void Setup(RenderGraphBuilder builder)
-    {
-        debugPass.SetupSphereDraw(
-            builder,
-            hVisibleClusters,
-            hDebugIndirectArgs,
-            hDrawUB,
-            hPageHeap,
-            hColor,
-            hDepth
-        );
-    }
-
-    public void Execute(RenderGraphContext graphContext)
-    {
-        debugPass.ExecuteSphereDraw(
-            graphContext.RenderContext,
-            graphContext,
-            hVisibleClusters,
-            hDebugIndirectArgs,
-            hPageHeap,
-            hDrawUB
-        );
-    }
-}
-
 internal sealed class ClusterCullUpdateArgsPass : IRenderGraphPass, IDisposable
 {
     private readonly RenderContext _context;
-
-    private static IPipelineState? s_pso;
-    private static readonly ConcurrentBag<IShaderResourceBinding> s_srbPool = [];
-    private static bool s_initialized;
-    private static readonly Lock s_initLock = new();
+    private readonly ClusterCull.Resources _resources;
 
     public string Name { get; }
 
     public RenderGraphHandle HCandidateCount = RenderGraphHandle.Invalid;
     public RenderGraphHandle HCandidateArgs = RenderGraphHandle.Invalid;
+    public RenderGraphHandle HCullingUniforms = RenderGraphHandle.Invalid;
     public RenderGraphHandle HDebugCullDrawArgs = RenderGraphHandle.Invalid;
 
-    public ClusterCullUpdateArgsPass(RenderContext context, string passName = "Cull Update Args")
+    public ClusterCullUpdateArgsPass(
+        RenderContext context,
+        ClusterCull.Resources resources,
+        string passName = "Cull Update Args")
     {
         _context = context;
+        _resources = resources;
         Name = passName;
-        EnsureInitialized(context);
+        _resources.EnsureUpdateArgsInitialized(context);
     }
 
-    private static void EnsureInitialized(RenderContext context)
-    {
-        if (s_initialized) return;
-        lock (s_initLock)
-        {
-            if (s_initialized) return;
-            var device = context.Device;
-            if (device == null) return;
-
-            string shaderPath = Path.GetFullPath(
-                Path.Combine(AppContext.BaseDirectory,
-                    "../../../../../../assets/Shaders/cluster_cull.slang"));
-            var shaderAsset = SlangShaderImporter.Import(shaderPath);
-
-            using var cs = shaderAsset.CreateShader(context, "UpdateIndirectArgs");
-            s_pso = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
-            {
-                PSODesc = new PipelineStateDesc
-                {
-                    Name = "Cull Update Args PSO",
-                    PipelineType = PipelineType.Compute,
-                    ResourceLayout = new PipelineResourceLayoutDesc
-                    {
-                        DefaultVariableType = ShaderResourceVariableType.Dynamic,
-                    },
-                },
-                Cs = cs,
-            });
-
-            s_initialized = true;
-        }
-    }
-
-    public void Init() => EnsureInitialized(_context);
+    public void Init() => _resources.EnsureUpdateArgsInitialized(_context);
 
     public void Setup(RenderGraphBuilder builder)
     {
-        builder.Read(HCandidateCount, ResourceState.UnorderedAccess);
+        builder.ReadWrite(HCandidateCount, ResourceState.UnorderedAccess);
         builder.Write(HCandidateArgs, ResourceState.UnorderedAccess);
+        if (HCullingUniforms.IsValid)
+            builder.Read(HCullingUniforms, ResourceState.ConstantBuffer);
         if (HDebugCullDrawArgs.IsValid)
             builder.Write(HDebugCullDrawArgs, ResourceState.UnorderedAccess);
     }
 
     public void Execute(RenderGraphContext graphContext)
     {
-        if (s_pso == null) return;
+        if (_resources.UpdateArgsPSO == null) return;
         var ctx = graphContext.RenderContext.ImmediateContext;
         if (ctx == null) return;
 
@@ -586,32 +369,38 @@ internal sealed class ClusterCullUpdateArgsPass : IRenderGraphPass, IDisposable
         var args = graphContext.GetBuffer(HCandidateArgs);
         if (count == null || args == null) return;
 
-        var srb = s_srbPool.TryTake(out var s) ? s : s_pso.CreateShaderResourceBinding(false);
+        var srb = _resources.UpdateArgsPool.Rent(_resources.UpdateArgsPSO);
 
-        srb.GetVariableByName(ShaderType.Compute, "CandidateCount")
+        srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "CandidateCount")
             ?.Set(count.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "CandidateArgs")
+        srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "CandidateArgs")
             ?.Set(args.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        if (HCullingUniforms.IsValid)
+        {
+            var uniforms = graphContext.GetBuffer(HCullingUniforms);
+            if (uniforms != null)
+                srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "Uniforms")
+                    ?.Set(uniforms, SetShaderResourceFlags.None);
+        }
 
         if (HDebugCullDrawArgs.IsValid)
         {
             var debugArgs = graphContext.GetBuffer(HDebugCullDrawArgs);
             if (debugArgs != null)
-                srb.GetVariableByName(ShaderType.Compute, "DebugCullDrawArgs")
+                srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "DebugCullDrawArgs")
                     ?.Set(debugArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
         }
 
-        ctx.SetPipelineState(s_pso);
+        ctx.SetPipelineState(_resources.UpdateArgsPSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
             ThreadGroupCountX = 1, ThreadGroupCountY = 1, ThreadGroupCountZ = 1,
         });
 
-        s_srbPool.Add(srb);
+        _resources.UpdateArgsPool.Return(srb);
     }
 
-    /// <summary>No-op: PSO/SRB are static-cached.</summary>
     public void Dispose() { }
 }
 
@@ -624,15 +413,14 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
     private uint[] _lastPhase2Count = new uint[1];
     private uint[] _lastPhase2DrawArgs = new uint[4];
     private byte[]? _lastDebugHiZData;
+    private bool _dumpHiZThisFrame;
 
     public uint CandidateCount => _lastCandidateCount[0];
-    // DrawArgs layout = CullDrawArgs: [Pad0, SWCount, HWCount]
-    public uint DrawVertexCount => _lastDrawArgs[0]; // Pad0 (legacy VertexCount)
+    // DrawArgs layout = CullDrawArgs: [VertexCountPerCluster, SWCount, HWCount], with byte 12 used as a hidden total reservation counter.
+    public uint DrawVertexCount => _lastDrawArgs[0];
     public uint DrawSWCount => _lastDrawArgs[1];
     public uint DrawHWCount => _lastDrawArgs[2];
     public uint DrawInstanceCount => _lastDrawArgs[1] + _lastDrawArgs[2]; // Total visible = SW + HW
-    public uint DrawStartVertex => _lastDrawArgs[2]; // legacy compat
-    public uint DrawStartInstance => _lastDrawArgs[3]; // legacy compat
     public uint[] CandidateArgs => _lastCandidateArgs;
     public uint Phase2CandidateCount => _lastPhase2Count[0];
     public uint Phase2DrawSWCount => _lastPhase2DrawArgs[1];
@@ -640,6 +428,7 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
     public uint Phase2DrawVertexCount => _lastPhase2DrawArgs[0];
     public uint Phase2DrawInstanceCount => _lastPhase2DrawArgs[1] + _lastPhase2DrawArgs[2];
     public byte[]? DebugHiZData => _lastDebugHiZData;
+    public string? LastHiZDumpPath { get; private set; }
 
     public RenderGraphHandle HCandidateCount = RenderGraphHandle.Invalid;
     public RenderGraphHandle HIndirectDrawArgs = RenderGraphHandle.Invalid;
@@ -663,13 +452,16 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
     public void AddPasses(
         RenderGraph graph,
         in ClusterTraverseOutput traverse,
-        in ClusterCullOutput cull)
+        in ClusterCullOutput cull,
+        bool dumpHiZData = false)
     {
         HCandidateCount = traverse.CandidateCount;
         HIndirectDrawArgs = cull.DrawArgs;
         HCandidateArgs = traverse.CandidateArgs;
         HPhase2CandidateCount = cull.Phase2CandidateCount;
         HPhase2IndirectDrawArgs = cull.Phase2DrawArgs;
+        HDebugHiZOutput = dumpHiZData ? cull.DebugHiZOutput : RenderGraphHandle.Invalid;
+        _dumpHiZThisFrame = dumpHiZData;
 
         var hDebugReadback = graph.CreateBuffer("DebugReadback", new BufferDesc
         {
@@ -679,6 +471,22 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
         });
         graph.MarkOutput(hDebugReadback);
         HDebugReadbackBuffer = hDebugReadback;
+
+        if (dumpHiZData && HDebugHiZOutput.IsValid)
+        {
+            HDebugHiZReadback = graph.CreateBuffer("DebugHiZReadback", new BufferDesc
+            {
+                Size = ClusterHiZDebugLayout.BufferBytes,
+                Usage = Usage.Staging,
+                CPUAccessFlags = CpuAccessFlags.Read,
+            });
+            graph.MarkOutput(HDebugHiZReadback);
+        }
+        else
+        {
+            HDebugHiZReadback = RenderGraphHandle.Invalid;
+        }
+
         graph.AddPass(this);
     }
 
@@ -763,40 +571,162 @@ internal sealed class ClusterDebugReadbackPass : IRenderGraphPass
             ctx.CopyBuffer(phase2DrawArgs, 0, ResourceStateTransitionMode.None, readbackBuffer, 40, 16, ResourceStateTransitionMode.None);
         }
 
-        // Readback DebugHiZOutput
+        // One-shot HiZ debug dump. This uses an RG staging buffer and waits only
+        // on explicit F5 dump frames, so normal frames keep the async readback path.
         if (HDebugHiZOutput.IsValid && HDebugHiZReadback.IsValid)
         {
             var debugSrc = graphContext.GetBuffer(HDebugHiZOutput);
             var debugDst = graphContext.GetBuffer(HDebugHiZReadback);
             if (debugSrc != null && debugDst != null)
             {
-                // Read previous frame's data
-                var debugMap = ctx.MapBuffer<uint>(debugDst, MapType.Read, MapFlags.DoNotWait);
-                if (debugMap.Length > 0)
-                {
-                    // Convert uint span to byte array
-                    var byteSpan = System.Runtime.InteropServices.MemoryMarshal.AsBytes(debugMap);
-                    _lastDebugHiZData = byteSpan.ToArray();
-                }
-                else
-                {
-                    _lastDebugHiZData = null;
-                }
-                ctx.UnmapBuffer(debugDst, MapType.Read);
-
-                // Copy current frame's data for next frame readback
                 var srcDesc = debugSrc.GetDesc();
+                ulong copyBytes = Math.Min(srcDesc.Size, ClusterHiZDebugLayout.BufferBytes);
                 ctx.CopyBuffer(
                     debugSrc,
                     0,
                     ResourceStateTransitionMode.None,
                     debugDst,
                     0,
-                    srcDesc.Size,
+                    copyBytes,
                     ResourceStateTransitionMode.None
                 );
+
+                ctx.WaitForIdle();
+
+                var debugMap = ctx.MapBuffer<uint>(debugDst, MapType.Read, MapFlags.None);
+                if (debugMap.Length > 0)
+                {
+                    var byteSpan = System.Runtime.InteropServices.MemoryMarshal.AsBytes(debugMap);
+                    _lastDebugHiZData = byteSpan.ToArray();
+                    if (_dumpHiZThisFrame)
+                        WriteHiZDump(debugMap);
+                }
+                else
+                {
+                    _lastDebugHiZData = null;
+                }
+                ctx.UnmapBuffer(debugDst, MapType.Read);
             }
         }
     }
+
+    private void WriteHiZDump(ReadOnlySpan<uint> words)
+    {
+        Directory.CreateDirectory("dump");
+        string path = Path.GetFullPath(Path.Combine(
+            "dump",
+            $"hiz_cull_dump_{DateTime.Now:yyyyMMdd_HHmmss_fff}.txt"));
+
+        var text = BuildHiZDumpText(words, includeAllSamples: true);
+        File.WriteAllText(path, text);
+        LastHiZDumpPath = path;
+
+        Console.Write(BuildHiZDumpText(words, includeAllSamples: false));
+        Console.WriteLine($"[HiZ Dump] Full sample dump: {path}");
+    }
+
+    private static string BuildHiZDumpText(ReadOnlySpan<uint> words, bool includeAllSamples)
+    {
+        var sb = new StringBuilder(64 * 1024);
+
+        uint sampleCount = ReadWord(words, ClusterHiZDebugLayout.SampleCountWord);
+        uint captured = Math.Min(sampleCount, ClusterHiZDebugLayout.MaxSamples);
+        uint overflow = ReadWord(words, ClusterHiZDebugLayout.SampleOverflowWord);
+
+        sb.AppendLine("[HiZ Dump]");
+        sb.AppendLine($"  samples: recorded={sampleCount} captured={captured} overflow={overflow}");
+        sb.AppendLine($"  layout: headerBytes={ReadWord(words, ClusterHiZDebugLayout.HeaderBytesWord)} strideBytes={ReadWord(words, ClusterHiZDebugLayout.SampleStrideBytesWord)} capacity={ReadWord(words, ClusterHiZDebugLayout.SampleCapacityWord)}");
+        sb.AppendLine(
+            "  phase1: " +
+            $"input={ReadWord(words, ClusterHiZDebugLayout.Phase1InputWord)} " +
+            $"lodRejected={ReadWord(words, ClusterHiZDebugLayout.Phase1LodRejectedWord)} " +
+            $"noPrevHistory={ReadWord(words, ClusterHiZDebugLayout.Phase1NoHistoryWord)} " +
+            $"tested={ReadWord(words, ClusterHiZDebugLayout.Phase1TestedWord)} " +
+            $"deferredToP2={ReadWord(words, ClusterHiZDebugLayout.Phase1DeferredWord)} " +
+            $"drawn={ReadWord(words, ClusterHiZDebugLayout.Phase1DrawnWord)} " +
+            $"depthVisible={ReadWord(words, ClusterHiZDebugLayout.Phase1DepthVisibleWord)}");
+        sb.AppendLine(
+            "  phase2: " +
+            $"input={ReadWord(words, ClusterHiZDebugLayout.Phase2InputWord)} " +
+            $"lodRejected={ReadWord(words, ClusterHiZDebugLayout.Phase2LodRejectedWord)} " +
+            $"tested={ReadWord(words, ClusterHiZDebugLayout.Phase2TestedWord)} " +
+            $"culled={ReadWord(words, ClusterHiZDebugLayout.Phase2CulledWord)} " +
+            $"drawn={ReadWord(words, ClusterHiZDebugLayout.Phase2DrawnWord)} " +
+            $"depthVisible={ReadWord(words, ClusterHiZDebugLayout.Phase2DepthVisibleWord)}");
+        sb.AppendLine($"  hizDisabledTests={ReadWord(words, ClusterHiZDebugLayout.HiZDisabledWord)}");
+
+        uint sampleLimit = includeAllSamples ? captured : Math.Min(captured, 32u);
+        if (sampleLimit > 0)
+            sb.AppendLine("  samples:");
+
+        for (uint i = 0; i < sampleLimit; i++)
+        {
+            int baseWord = (int)(ClusterHiZDebugLayout.HeaderWords + i * (ClusterHiZDebugLayout.SampleStrideBytes / sizeof(uint)));
+            if (baseWord + 19 >= words.Length)
+                break;
+
+            float minU = UIntToFloat(words[baseWord + 0]);
+            float minV = UIntToFloat(words[baseWord + 1]);
+            float maxU = UIntToFloat(words[baseWord + 2]);
+            float maxV = UIntToFloat(words[baseWord + 3]);
+            float nearDepth = UIntToFloat(words[baseWord + 4]);
+            float hizDepth = UIntToFloat(words[baseWord + 5]);
+            uint mip = words[baseWord + 6];
+            uint flags = words[baseWord + 7];
+            float centerX = UIntToFloat(words[baseWord + 8]);
+            float centerY = UIntToFloat(words[baseWord + 9]);
+            float centerZ = UIntToFloat(words[baseWord + 10]);
+            float radius = UIntToFloat(words[baseWord + 11]);
+            uint pageOffset = words[baseWord + 12];
+            uint clusterId = words[baseWord + 13];
+            uint instanceId = words[baseWord + 14];
+            float boundsExpansion = UIntToFloat(words[baseWord + 15]);
+            float pixelW = UIntToFloat(words[baseWord + 16]);
+            float pixelH = UIntToFloat(words[baseWord + 17]);
+            float depthDelta = UIntToFloat(words[baseWord + 18]);
+            float epsilon = UIntToFloat(words[baseWord + 19]);
+            bool occluded = (flags & 1u) != 0;
+            bool usePrev = (flags & 2u) != 0;
+            bool expanded = (flags & 4u) != 0;
+            bool fullScreen = (flags & 8u) != 0;
+            bool hizDisabled = (flags & 16u) != 0;
+
+            sb.Append("    [").Append(i).Append("] ")
+                .Append(usePrev ? "P1(prev)" : "P2(curr)")
+                .Append(occluded ? " occluded" : " visible")
+                .Append(" mip=").Append(mip)
+                .Append(" uv=(").Append(minU.ToString("F4")).Append(',').Append(minV.ToString("F4"))
+                .Append(")-(").Append(maxU.ToString("F4")).Append(',').Append(maxV.ToString("F4")).Append(')')
+                .Append(" px=").Append(pixelW.ToString("F1")).Append('x').Append(pixelH.ToString("F1"))
+                .Append(" near=").Append(nearDepth.ToString("F6"))
+                .Append(" hiz=").Append(hizDepth.ToString("F6"))
+                .Append(" delta=").Append(depthDelta.ToString("F6"))
+                .Append(" eps=").Append(epsilon.ToString("F6"))
+                .Append(" inst=").Append(instanceId)
+                .Append(" cluster=").Append(clusterId)
+                .Append(" page=").Append(pageOffset)
+                .Append(" center=(").Append(centerX.ToString("F2")).Append(',').Append(centerY.ToString("F2")).Append(',').Append(centerZ.ToString("F2")).Append(')')
+                .Append(" radius=").Append(radius.ToString("F3"));
+
+            if (boundsExpansion > 0.0f || expanded)
+                sb.Append(" expand=").Append(boundsExpansion.ToString("F3"));
+            if (fullScreen)
+                sb.Append(" fullscreenBounds");
+            if (hizDisabled)
+                sb.Append(" hizDisabled");
+            sb.AppendLine();
+        }
+
+        if (!includeAllSamples && captured > sampleLimit)
+            sb.AppendLine($"  ... {captured - sampleLimit} more samples written to file");
+
+        return sb.ToString();
+    }
+
+    private static uint ReadWord(ReadOnlySpan<uint> words, int index)
+        => index >= 0 && index < words.Length ? words[index] : 0;
+
+    private static float UIntToFloat(uint value)
+        => BitConverter.UInt32BitsToSingle(value);
 }
 

@@ -38,7 +38,7 @@ VSOutput VSMain(uint vertexID : SV_VertexID)
         return output;
     }
 
-    uint base = 4 + entryIdx * 48;
+    uint base = 128 + entryIdx * 80;
     float minU = asfloat(DebugHiZInput.Load(base + 0));
     float minV = asfloat(DebugHiZInput.Load(base + 4));
     float maxU = asfloat(DebugHiZInput.Load(base + 8));

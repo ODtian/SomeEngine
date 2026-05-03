@@ -30,18 +30,13 @@ void CSBinCount(uint3 tid : SV_DispatchThreadID)
     if (tid.x >= Uniforms.ScreenWidth || tid.y >= Uniforms.ScreenHeight) return;
     uint visData = VisBuffer[tid.xy];
     if (visData == 0) return;
+    uint visDataClean = visData & 0x7FFFFFFFu;
 
     // VisBuffer → DrawRequest → PageHeap cluster → MaterialSlotBuffer → ShadingBin
-    uint visClusterIdx = (visData >> 7) - 1;
-    uint triIdx = visData & 0x7F;
-
+    uint visClusterIdx = (visDataClean >> 7) - 1;
     DrawRequest req = VisibleClusters[visClusterIdx];
 
-    uint packedMaterials, packedRanges;
-    LoadClusterMaterialInfo(PageHeap, req.PageOffset, req.ClusterID, packedMaterials, packedRanges);
-
-    uint localMatIdx = GetLocalMaterialIndexRaw(packedMaterials, packedRanges, triIdx);
-    uint slotOffset = InstanceHeaders[req.InstanceID].MaterialSlotOffset + localMatIdx;
+    uint slotOffset = GetInstanceMaterialSlotOffset(req.InstanceID);
     uint shadingBin = GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
 
     uint dummy;
@@ -50,48 +45,52 @@ void CSBinCount(uint3 tid : SV_DispatchThreadID)
 
 // ─── Pass 2: Reserve ─── Dispatch: 1, 1, 1 ───
 
-#define MAX_MATERIALS 256
-
 RWStructuredBuffer<uint> BinOffsets;
 RWByteAddressBuffer BinIndirectArgs;
 RWStructuredBuffer<uint> BinScatterCount;
+RWStructuredBuffer<uint> ReserveCounters;
 
-// Simple prefix sum for up to MAX_MATERIALS entries
-groupshared uint sPrefix[MAX_MATERIALS];
+#define SHADE_BIN_RESERVE_BLOCK_SIZE 128
+
+groupshared uint ShadeReservePrefix[SHADE_BIN_RESERVE_BLOCK_SIZE];
+groupshared uint ShadeReserveBlockBase;
 
 [shader("compute")]
-[numthreads(MAX_MATERIALS, 1, 1)]
-void CSBinReserve(uint tid : SV_GroupThreadID)
+[numthreads(SHADE_BIN_RESERVE_BLOCK_SIZE, 1, 1)]
+void CSBinReserve(uint3 tid : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
 {
-    uint count = (tid < Uniforms.MaterialCount) ? BinCounts[tid] : 0;
+    uint bin = tid.x;
+    uint count = bin < Uniforms.MaterialCount ? BinCounts[bin] : 0;
 
-    // Inclusive scan via shared memory
-    sPrefix[tid] = count;
+    ShadeReservePrefix[groupIndex] = count;
     GroupMemoryBarrierWithGroupSync();
 
-    // Up-sweep (reduce)
-    [unroll] for (uint s = 1; s < MAX_MATERIALS; s <<= 1)
+    for (uint scanOffset = 1; scanOffset < SHADE_BIN_RESERVE_BLOCK_SIZE; scanOffset <<= 1)
     {
+        uint addend = groupIndex >= scanOffset ? ShadeReservePrefix[groupIndex - scanOffset] : 0;
         GroupMemoryBarrierWithGroupSync();
-        uint val = 0;
-        if (tid >= s)
-            val = sPrefix[tid - s];
+        ShadeReservePrefix[groupIndex] += addend;
         GroupMemoryBarrierWithGroupSync();
-        sPrefix[tid] += val;
+    }
+
+    uint inclusiveOffset = ShadeReservePrefix[groupIndex];
+    uint blockSum = ShadeReservePrefix[SHADE_BIN_RESERVE_BLOCK_SIZE - 1];
+
+    if (groupIndex == 0)
+    {
+        InterlockedAdd(ReserveCounters[0], blockSum, ShadeReserveBlockBase);
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // sPrefix[tid] is now inclusive prefix sum; convert to exclusive
-    uint exclusiveSum = sPrefix[tid] - count;
+    if (bin >= Uniforms.MaterialCount) return;
 
-    if (tid >= Uniforms.MaterialCount) return;
-
-    BinOffsets[tid] = exclusiveSum;
-    BinScatterCount[tid] = 0;
+    uint offset = ShadeReserveBlockBase + inclusiveOffset - count;
+    BinOffsets[bin] = offset;
+    BinScatterCount[bin] = 0;
 
     // Write indirect dispatch args: {GroupX, 1, 1}
     uint groups = (count + 63) / 64;
-    BinIndirectArgs.Store<DispatchArgs>(tid * 12, DispatchArgs(groups, 1, 1));
+    BinIndirectArgs.Store<DispatchArgs>(bin * 12, DispatchArgs(groups, 1, 1));
 }
 
 // ─── Pass 3: Scatter ─── Dispatch: ceil(W/8), ceil(H/8), 1 ───
@@ -105,17 +104,12 @@ void CSBinScatter(uint3 tid : SV_DispatchThreadID)
     if (tid.x >= Uniforms.ScreenWidth || tid.y >= Uniforms.ScreenHeight) return;
     uint visData = VisBuffer[tid.xy];
     if (visData == 0) return;
+    uint visDataClean = visData & 0x7FFFFFFFu;
 
-    uint visClusterIdx = (visData >> 7) - 1;
-    uint triIdx = visData & 0x7F;
-
+    uint visClusterIdx = (visDataClean >> 7) - 1;
     DrawRequest req = VisibleClusters[visClusterIdx];
 
-    uint packedMaterials, packedRanges;
-    LoadClusterMaterialInfo(PageHeap, req.PageOffset, req.ClusterID, packedMaterials, packedRanges);
-
-    uint localMatIdx = GetLocalMaterialIndexRaw(packedMaterials, packedRanges, triIdx);
-    uint slotOffset = InstanceHeaders[req.InstanceID].MaterialSlotOffset + localMatIdx;
+    uint slotOffset = GetInstanceMaterialSlotOffset(req.InstanceID);
     uint shadingBin = GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
 
     uint writeIdx;

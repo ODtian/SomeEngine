@@ -14,9 +14,15 @@ namespace SomeEngine.Render.Pipelines;
 /// </summary>
 public class ClusterShadeBinningResources : IDisposable
 {
+    internal const string ShaderFile = "cluster_shade_binning.slang";
+    internal const string CountEntryPoint = "CSBinCount";
+    internal const string ReserveEntryPoint = "CSBinReserve";
+    internal const string ScatterEntryPoint = "CSBinScatter";
+
     public IPipelineState? CountPSO { get; private set; }
     public IPipelineState? ReservePSO { get; private set; }
     public IPipelineState? ScatterPSO { get; private set; }
+    public ShaderAsset? ShaderAsset { get; private set; }
     public IShaderResourceBinding? CountSRB { get; private set; }
     public IShaderResourceBinding? ReserveSRB { get; private set; }
     public IShaderResourceBinding? ScatterSRB { get; private set; }
@@ -29,20 +35,16 @@ public class ClusterShadeBinningResources : IDisposable
         var device = context.Device;
         if (device == null) return;
 
-        string path = Path.GetFullPath(
-            Path.Combine(
-                AppContext.BaseDirectory,
-                "../../../../../../assets/Shaders/cluster_shade_binning.slang"
-            )
-        );
+        string path = ClusterStageUtils.ShaderPath(ShaderFile);
         var shaderAsset = SlangShaderImporter.Import(path);
+        ShaderAsset = shaderAsset;
 
         var layout = new PipelineResourceLayoutDesc
         {
             DefaultVariableType = ShaderResourceVariableType.Dynamic,
         };
 
-        using var csCount = shaderAsset.CreateShader(context, "CSBinCount");
+        var csCount = shaderAsset.CreateShader(context, CountEntryPoint);
         CountPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
         {
             PSODesc = new PipelineStateDesc
@@ -55,7 +57,7 @@ public class ClusterShadeBinningResources : IDisposable
         });
         if (CountPSO != null) CountSRB = CountPSO.CreateShaderResourceBinding(false);
 
-        using var csReserve = shaderAsset.CreateShader(context, "CSBinReserve");
+        var csReserve = shaderAsset.CreateShader(context, ReserveEntryPoint);
         ReservePSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
         {
             PSODesc = new PipelineStateDesc
@@ -68,7 +70,7 @@ public class ClusterShadeBinningResources : IDisposable
         });
         if (ReservePSO != null) ReserveSRB = ReservePSO.CreateShaderResourceBinding(false);
 
-        using var csScatter = shaderAsset.CreateShader(context, "CSBinScatter");
+        var csScatter = shaderAsset.CreateShader(context, ScatterEntryPoint);
         ScatterPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
         {
             PSODesc = new PipelineStateDesc
@@ -142,19 +144,19 @@ public class ClusterShadeBinCountPass(
             return;
 
         var srb = resources.CountSRB;
-        srb.GetVariableByName(ShaderType.Compute, "Uniforms")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "Uniforms")
             ?.Set(uniformBuf, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "VisBuffer")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "VisBuffer")
             ?.Set(visBufferSRV, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "VisibleClusters")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "VisibleClusters")
             ?.Set(visibleClusters.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "InstanceHeaders")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "InstanceHeaders")
             ?.Set(instanceHeaders.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "MaterialSlotBuffer")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "MaterialSlotBuffer")
             ?.Set(materialSlotBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "PageHeap")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "PageHeap")
             ?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "BinCounts")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "BinCounts")
             ?.Set(binCounts.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         var texDesc = rgCtx.GetTexture(HVisBuffer)?.GetDesc();
@@ -180,6 +182,8 @@ public class ClusterShadeBinReservePass(
     ClusterShadeBinningResources resources
 ) : IRenderGraphPass
 {
+    private const uint ReserveBlockSize = 128;
+
     public string Name => "Shade Bin Reserve";
 
     public RenderGraphHandle HShadeBinUniforms = RenderGraphHandle.Invalid;
@@ -187,6 +191,8 @@ public class ClusterShadeBinReservePass(
     public RenderGraphHandle HBinOffsets = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinScatterCount = RenderGraphHandle.Invalid;
     public RenderGraphHandle HBinIndirectArgs = RenderGraphHandle.Invalid;
+    public RenderGraphHandle HReserveCounters = RenderGraphHandle.Invalid;
+    public uint MaterialCount;
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -196,6 +202,7 @@ public class ClusterShadeBinReservePass(
         builder.Write(HBinOffsets, ResourceState.UnorderedAccess);
         builder.Write(HBinScatterCount, ResourceState.UnorderedAccess);
         builder.Write(HBinIndirectArgs, ResourceState.UnorderedAccess);
+        builder.ReadWrite(HReserveCounters, ResourceState.UnorderedAccess);
     }
 
     public void Execute(RenderGraphContext rgCtx)
@@ -209,27 +216,31 @@ public class ClusterShadeBinReservePass(
         var binOffsets = rgCtx.GetBuffer(HBinOffsets);
         var binScatterCount = rgCtx.GetBuffer(HBinScatterCount);
         var binIndirectArgs = rgCtx.GetBuffer(HBinIndirectArgs);
+        var reserveCounters = rgCtx.GetBuffer(HReserveCounters);
         if (uniformBuf == null || binCounts == null || binOffsets == null
-            || binScatterCount == null || binIndirectArgs == null)
+            || binScatterCount == null || binIndirectArgs == null || reserveCounters == null)
             return;
 
         var srb = resources.ReserveSRB;
-        srb.GetVariableByName(ShaderType.Compute, "Uniforms")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "Uniforms")
             ?.Set(uniformBuf, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "BinCounts")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "BinCounts")
             ?.Set(binCounts.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "BinOffsets")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "BinOffsets")
             ?.Set(binOffsets.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "BinScatterCount")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "BinScatterCount")
             ?.Set(binScatterCount.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "BinIndirectArgs")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "BinIndirectArgs")
             ?.Set(binIndirectArgs.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "ReserveCounters")
+            ?.Set(reserveCounters.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         ctx.SetPipelineState(resources.ReservePSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
+        uint materialCount = MaterialCount == 0 ? 1u : MaterialCount;
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
-            ThreadGroupCountX = 1,
+            ThreadGroupCountX = (materialCount + ReserveBlockSize - 1) / ReserveBlockSize,
             ThreadGroupCountY = 1,
             ThreadGroupCountZ = 1,
         });
@@ -291,23 +302,23 @@ public class ClusterShadeBinScatterPass(
             return;
 
         var srb = resources.ScatterSRB;
-        srb.GetVariableByName(ShaderType.Compute, "Uniforms")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "Uniforms")
             ?.Set(uniformBuf, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "VisBuffer")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "VisBuffer")
             ?.Set(visBufferSRV, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "VisibleClusters")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "VisibleClusters")
             ?.Set(visibleClusters.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "InstanceHeaders")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "InstanceHeaders")
             ?.Set(instanceHeaders.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "MaterialSlotBuffer")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "MaterialSlotBuffer")
             ?.Set(materialSlotBuffer.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "PageHeap")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "PageHeap")
             ?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "BinOffsets")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "BinOffsets")
             ?.Set(binOffsets.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "BinScatterCount")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "BinScatterCount")
             ?.Set(binScatterCount.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "PixelCoordBuffer")
+        srb.GetVariableByReflectedBinding(context, resources.ShaderAsset, ShaderType.Compute, "PixelCoordBuffer")
             ?.Set(pixelCoordBuffer.GetDefaultView(BufferViewType.UnorderedAccess), SetShaderResourceFlags.None);
 
         var texDesc = rgCtx.GetTexture(HVisBuffer)?.GetDesc();

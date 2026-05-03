@@ -9,10 +9,9 @@ namespace SomeEngine.Render.Pipelines;
 
 /// <summary>
 /// Level 1 Stage: BVH 遍历 — 从全局 BVH 中选出候选 Cluster。
-/// Static class：BVHTraversePass（跨帧 readback 状态）由 Pipeline 持有并传入，
-/// CullUpdateArgsPass 每帧新建（PSO 是 static cached）。
+/// Static stage：向 RenderGraph 添加 BVH 遍历相关节点。
 /// </summary>
-public static class ClusterTraverse
+internal static class ClusterTraverse
 {
     /// <summary>
     /// 向 RenderGraph 添加 BVH 遍历 pass，返回候选 Cluster 列表。
@@ -22,6 +21,7 @@ public static class ClusterTraverse
         RenderGraph graph,
         RenderContext context,
         ClusterBVHTraversePass bvhTraversePass,
+        ClusterCull.Resources cullResources,
         ClusterResourceManager clusterMgr,
         InstanceDataManager instanceMgr,
         in ClusterGlobalResources globals,
@@ -158,38 +158,17 @@ public static class ClusterTraverse
         bvhTraversePass.HGlobalInstanceHeaderBuffer = globals.GlobalInstanceHeader;
         bvhTraversePass.HGlobalBVHBuffer = globals.GlobalBVH;
         bvhTraversePass.HPageHeap = globals.PageHeap;
+        bvhTraversePass.SetExecutionConfig(instanceMgr.Count, config.MaxDepth);
 
-        graph.AddPass(new ClusterBVHClearArgsPass(bvhTraversePass, true, "BVH Clear Args A"));
-        graph.AddPass(new ClusterBVHClearArgsPass(bvhTraversePass, false, "BVH Clear Args B"));
-
-        if (instanceMgr.Count > 0)
-        {
-            graph.AddPass(new ClusterBVHInitQueuePass(bvhTraversePass));
-            graph.AddPass(new ClusterBVHUpdateArgsPass(bvhTraversePass, true, "BVH Update Init Args"));
-
-            bool currentIsA = true;
-            int maxDepth = config.MaxDepth;
-            for (int depth = 0; depth < maxDepth; depth++)
-            {
-                bool nextIsA = !currentIsA;
-                graph.AddPass(new ClusterBVHTraverseDepthPass(
-                    bvhTraversePass, currentIsA, depth, $"BVH Traverse D{depth}"));
-                graph.AddPass(new ClusterBVHUpdateArgsPass(
-                    bvhTraversePass, nextIsA, $"BVH Update Args D{depth}"));
-                graph.AddPass(new ClusterBVHClearArgsPass(
-                    bvhTraversePass, currentIsA, $"BVH Clear Recycle D{depth}"));
-                currentIsA = nextIsA;
-            }
-
-            graph.AddPass(new ClusterBVHReadbackPass(bvhTraversePass));
-        }
+        graph.AddPass(bvhTraversePass);
 
         graph.AddPass(new ClusterBVHPageFaultCopyPass(bvhTraversePass, hPageFaultReadback));
 
         // ─── CullUpdateArgs (fresh per frame, PSO is static cached) ───
-        var cullUpdateArgsPass = new ClusterCullUpdateArgsPass(context);
+        var cullUpdateArgsPass = new ClusterCullUpdateArgsPass(context, cullResources);
         cullUpdateArgsPass.HCandidateCount = hCandidateCount;
         cullUpdateArgsPass.HCandidateArgs = hCandidateArgs;
+        cullUpdateArgsPass.HCullingUniforms = hCullingUB;
         graph.AddPass(cullUpdateArgsPass);
 
         return new ClusterTraverseOutput(

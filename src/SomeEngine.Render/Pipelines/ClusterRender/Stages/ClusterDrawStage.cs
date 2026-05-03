@@ -8,7 +8,7 @@ namespace SomeEngine.Render.Pipelines;
 /// 无状态 Draw/Rasterize 工具函数。
 /// 每次调用创建轻量 ClusterDrawPass 实例（PSO 在 Pass 内 static 缓存）。
 /// </summary>
-public static class ClusterDraw
+internal static partial class ClusterDraw
 {
     /// <summary>
     /// 添加 Draw pass，返回 VisBuffer 和 Depth。
@@ -16,6 +16,7 @@ public static class ClusterDraw
     public static ClusterRasterOutput AddPasses(
         RenderGraph graph,
         RenderContext context,
+        Resources resources,
         in ClusterRasterBinOutput rasterBin,
         in ClusterCullOutput cull,
         in ClusterGlobalResources globals,
@@ -24,8 +25,12 @@ public static class ClusterDraw
         RenderGraphHandle depthTarget,
         uint screenWidth,
         uint screenHeight,
+        MaterialPSOGroup[]? materialDispatchGroups = null,
+        bool materialDispatchGroupsAreGraphics = false,
         RenderGraphHandle hOutputVisBuffer = default,
-        RenderGraphHandle hOutputDepth = default
+        RenderGraphHandle hOutputDepth = default,
+        RenderGraphHandle hDeformCache = default,
+        RenderGraphHandle hCacheOffsets = default
     )
     {
         string tag = config.Tag ?? "";
@@ -103,8 +108,13 @@ public static class ClusterDraw
             );
         }
 
+        var hDrawDispatchUniforms = ClusterStageUtils.AddDynamicUniformPass(
+            graph,
+            $"{tag}DrawDispatchUniforms",
+            new DrawDispatchUniforms());
+
         // ─── Create lightweight pass instance (PSO is static-cached inside) ───
-        var drawPass = new ClusterDrawPass(context, $"{tag}ClusterDraw");
+        var drawPass = new ClusterDrawPass(context, resources, $"{tag}ClusterDraw");
         drawPass.HVisibleClusters = rasterBin.BinnedClusterIndex;
         drawPass.HVisibleClustersData = cull.VisibleClusters;
         drawPass.HIndirectDrawArgs = config.UseHWDrawArgs
@@ -113,10 +123,17 @@ public static class ClusterDraw
         drawPass.HVisBufferTarget = hVisBuffer;
         drawPass.HDepthTarget = hDepth;
         drawPass.HDrawUniforms = hDrawUniforms;
+        drawPass.HDrawDispatchUniforms = hDrawDispatchUniforms;
         drawPass.HGlobalTransformBuffer = globals.GlobalTransform;
         drawPass.HPageHeap = globals.PageHeap;
-        drawPass.HVisibleClusterMeta = hVisibleClusterMeta;
+        drawPass.HVisibleClusterMeta = config.VisibleClusterMeta.IsValid
+            ? config.VisibleClusterMeta
+            : hVisibleClusterMeta;
+        drawPass.HDeformCache = hDeformCache;
+        drawPass.HCacheOffsets = hCacheOffsets;
         drawPass.BinIndex = config.BinIndex;
+        drawPass.PSOGroups = materialDispatchGroups;
+        drawPass.PSOGroupsAreGraphics = materialDispatchGroupsAreGraphics;
         drawPass.SetFrameData(
             config.DebugMode,
             config.Wireframe,

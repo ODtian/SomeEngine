@@ -1,6 +1,8 @@
 #ifndef COMMON_HLSL
 #define COMMON_HLSL
 
+#define GPU_CLUSTER_STRIDE_BYTES 88
+
 struct GpuTransform
 {
     float4 Rotation;

@@ -9,7 +9,7 @@ namespace SomeEngine.Render.Pipelines;
 /// 无状态 Cull 工具函数。
 /// PSO 在 ClusterCullPSOs 内 static 缓存。每次调用创建轻量 pass 实例。
 /// </summary>
-public static class ClusterCull
+internal static partial class ClusterCull
 {
     /// <summary>计算纹理的完整 mip 链层数。</summary>
     public static uint CalculateMipCount(uint width, uint height)
@@ -27,6 +27,7 @@ public static class ClusterCull
     public static ClusterCullOutput AddPasses(
         RenderGraph graph,
         RenderContext context,
+        Resources resources,
         in ClusterTraverseOutput traverse,
         in ClusterGlobalResources globals,
         RenderGraphHandle hCullingUniforms,
@@ -38,7 +39,7 @@ public static class ClusterCull
         bool debugShowHiZAABBs = false
     )
     {
-        ClusterCullPSOs.EnsureInitialized(context);
+        resources.EnsureInitialized(context);
 
         uint maxDraws = ClusterLimits.MaxDraws;
 
@@ -53,45 +54,42 @@ public static class ClusterCull
 
         var hIndirectDrawArgs = traverse.IndirectDrawArgs;
 
-        // ─── HiZ mode management ───
-        bool useHiZBuffers = config.HiZMode != HiZDebugMode.Legacy && config.HiZMode != HiZDebugMode.Phase1OnlyPassAll;
-
         // Phase 2 candidate buffers
         var hPhase2CandidateClusters = RenderGraphHandle.Invalid;
         var hPhase2CandidateCount = RenderGraphHandle.Invalid;
         var hPhase2CandidateArgs = RenderGraphHandle.Invalid;
 
-        if (useHiZBuffers)
+        hPhase2CandidateClusters = graph.CreateBuffer("Phase2CandidateClusters", new BufferDesc
         {
-            hPhase2CandidateClusters = graph.CreateBuffer("Phase2CandidateClusters", new BufferDesc
-            {
-                Size = (ulong)(maxDraws * 12),
-                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-                Mode = BufferMode.Structured,
-                ElementByteStride = 12,
-            });
-            hPhase2CandidateCount = graph.CreateBuffer("Phase2CandidateCount", new BufferDesc
-            {
-                Size = 4,
-                BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-                Mode = BufferMode.Structured,
-                ElementByteStride = 4,
-            });
-            hPhase2CandidateArgs = graph.CreateBuffer("Phase2CandidateArgs", new BufferDesc
-            {
-                Size = 16,
-                BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
-                Mode = BufferMode.Raw,
-                ElementByteStride = 4,
-            });
-        }
+            Size = (ulong)(maxDraws * 12),
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+            Mode = BufferMode.Structured,
+            ElementByteStride = 12,
+        });
+        hPhase2CandidateCount = graph.CreateBuffer("Phase2CandidateCount", new BufferDesc
+        {
+            Size = 4,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+            Mode = BufferMode.Structured,
+            ElementByteStride = 4,
+        });
+        hPhase2CandidateArgs = graph.CreateBuffer("Phase2CandidateArgs", new BufferDesc
+        {
+            Size = 16,
+            BindFlags = BindFlags.UnorderedAccess | BindFlags.IndirectDrawArgs | BindFlags.ShaderResource,
+            Mode = BufferMode.Raw,
+            ElementByteStride = 4,
+        });
 
         // ─── Debug HiZ output buffer ───
+        // DumpNextFrame and the AABB overlay both make the shader write
+        // DebugHiZOutput. Allocate the full buffer when either is enabled.
+        bool enableHiZDebugOutput = debugShowHiZAABBs || config.DumpNextFrame;
         var hDebugHiZOutput = graph.CreateBuffer(
-            debugShowHiZAABBs ? "DebugHiZOutput" : "DebugHiZOutputDummy",
+            enableHiZDebugOutput ? "DebugHiZOutput" : "DebugHiZOutputDummy",
             new BufferDesc
             {
-                Size = debugShowHiZAABBs ? 196612u : 16u,
+                Size = enableHiZDebugOutput ? ClusterHiZDebugLayout.BufferBytes : 16u,
                 BindFlags = BindFlags.UnorderedAccess | (debugShowHiZAABBs ? BindFlags.ShaderResource : BindFlags.None),
                 Mode = BufferMode.Raw,
                 ElementByteStride = 4,
@@ -99,17 +97,14 @@ public static class ClusterCull
         );
 
         // ─── Clear Phase2 candidate buffers ───
-        if (useHiZBuffers)
-        {
-            graph.AddPass(new ClusterClearBuffersPass(
-                RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid,
-                RenderGraphHandle.Invalid, hPhase2CandidateCount, RenderGraphHandle.Invalid,
-                RenderGraphHandle.Invalid, hPhase2CandidateArgs
-            ));
-        }
+        graph.AddPass(new ClusterClearBuffersPass(
+            RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid,
+            RenderGraphHandle.Invalid, hPhase2CandidateCount, RenderGraphHandle.Invalid,
+            RenderGraphHandle.Invalid, hPhase2CandidateArgs
+        ));
 
         // Clear debug buffer if needed
-        if (debugShowHiZAABBs)
+        if (enableHiZDebugOutput)
         {
             graph.AddPass<object>(
                 "ClearDebugHiZ",
@@ -120,33 +115,18 @@ public static class ClusterCull
                     if (buf != null)
                     {
                         var ctx2 = rgCtx.RenderContext.ImmediateContext;
-                        ReadOnlySpan<uint> zero = stackalloc uint[] { 0 };
-                        ctx2?.UpdateBuffer(buf, 0, zero, ResourceStateTransitionMode.None);
+                        Span<uint> header = stackalloc uint[(int)ClusterHiZDebugLayout.HeaderWords];
+                        header[(int)ClusterHiZDebugLayout.SampleCapacityWord] = ClusterHiZDebugLayout.MaxSamples;
+                        header[(int)ClusterHiZDebugLayout.SampleStrideBytesWord] = ClusterHiZDebugLayout.SampleStrideBytes;
+                        header[(int)ClusterHiZDebugLayout.HeaderBytesWord] = ClusterHiZDebugLayout.HeaderBytes;
+                        ctx2?.UpdateBuffer(buf, 0, header, ResourceStateTransitionMode.None);
                     }
                 }
             );
         }
 
-        // ─── Dispatch cull path ───
-        if (config.HiZMode == HiZDebugMode.Legacy || config.HiZMode == HiZDebugMode.Phase1OnlyPassAll)
-        {
-            var cullPass = new ClusterCullPass(context, ClusterCullPhase.Legacy, "CullLegacy");
-            cullPass.HCandidateClusters = traverse.CandidateClusters;
-            cullPass.HCandidateArgs = traverse.CandidateArgs;
-            cullPass.HCandidateCount = traverse.CandidateCount;
-            cullPass.HVisibleClusters = hVisibleClusters;
-            cullPass.HIndirectDrawArgs = hIndirectDrawArgs;
-            cullPass.HCullingUniforms = hCullingUniforms;
-            cullPass.HGlobalTransformBuffer = globals.GlobalTransform;
-            cullPass.HPageHeap = globals.PageHeap;
-            cullPass.HDebugHiZOutput = hDebugHiZOutput;
-            graph.AddPass(cullPass);
-
-            return new ClusterCullOutput(hVisibleClusters, hIndirectDrawArgs, hPhase2IndirectDrawArgs, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, RenderGraphHandle.Invalid, hDebugHiZOutput);
-        }
-
         // Phase1 Cull
-        var phase1Pass = new ClusterCullPass(context, ClusterCullPhase.Phase1, "CullPhase1");
+        var phase1Pass = new ClusterCullPass(context, resources, ClusterCullPhase.Phase1, "CullPhase1");
         phase1Pass.HCandidateClusters = traverse.CandidateClusters;
         phase1Pass.HCandidateArgs = traverse.CandidateArgs;
         phase1Pass.HCandidateCount = traverse.CandidateCount;
@@ -155,6 +135,7 @@ public static class ClusterCull
         phase1Pass.HHiZTexture = config.HiZMode == HiZDebugMode.Phase1Only ? RenderGraphHandle.Invalid : hPrevHiZ;
         phase1Pass.HCullingUniforms = hCullingUniforms;
         phase1Pass.HGlobalTransformBuffer = globals.GlobalTransform;
+        phase1Pass.HGlobalInstanceHeaderBuffer = globals.GlobalInstanceHeader;
         phase1Pass.HPageHeap = globals.PageHeap;
         phase1Pass.HPhase2CandidateClusters = hPhase2CandidateClusters;
         phase1Pass.HPhase2CandidateCount = hPhase2CandidateCount;
@@ -170,19 +151,21 @@ public static class ClusterCull
     public static void AddPhase2Passes(
         RenderGraph graph,
         RenderContext context,
+        Resources resources,
         in ClusterCullOutput cullOut,
         in ClusterGlobalResources globals,
         RenderGraphHandle hCullingUniforms,
         RenderGraphHandle hHiZ)
     {
         // Phase 2 Update Args
-        var updateArgsPass = new ClusterCullUpdateArgsPass(context, "CullUpdateArgsPhase2");
+        var updateArgsPass = new ClusterCullUpdateArgsPass(context, resources, "CullUpdateArgsPhase2");
         updateArgsPass.HCandidateCount = cullOut.Phase2CandidateCount;
         updateArgsPass.HCandidateArgs = cullOut.Phase2CandidateArgs;
+        updateArgsPass.HCullingUniforms = hCullingUniforms;
         graph.AddPass(updateArgsPass);
 
         // Phase 2 Cull
-        var phase2Pass = new ClusterCullPass(context, ClusterCullPhase.Phase2, "CullPhase2");
+        var phase2Pass = new ClusterCullPass(context, resources, ClusterCullPhase.Phase2, "CullPhase2");
         phase2Pass.HCandidateClusters = cullOut.Phase2CandidateClusters;
         phase2Pass.HCandidateArgs = cullOut.Phase2CandidateArgs;
         phase2Pass.HCandidateCount = cullOut.Phase2CandidateCount;
@@ -192,6 +175,7 @@ public static class ClusterCull
         phase2Pass.HHiZTexture = hHiZ;
         phase2Pass.HCullingUniforms = hCullingUniforms;
         phase2Pass.HGlobalTransformBuffer = globals.GlobalTransform;
+        phase2Pass.HGlobalInstanceHeaderBuffer = globals.GlobalInstanceHeader;
         phase2Pass.HPageHeap = globals.PageHeap;
         phase2Pass.HDebugHiZOutput = cullOut.DebugHiZOutput;
         graph.AddPass(phase2Pass);
@@ -200,11 +184,11 @@ public static class ClusterCull
     /// <summary>
     /// 全 HiZ 重建（在 Draw 后调用，为下帧 Phase1 准备完整深度）。
     /// </summary>
-    public static void AddFinalHiZBuild(RenderGraph graph, RenderContext context, RenderGraphHandle depthTarget, RenderGraphHandle hCurrHiZ, uint hizMipCount)
+    public static void AddFinalHiZBuild(RenderGraph graph, RenderContext context, ClusterHiZ.HiZBuildResources hiZResources, RenderGraphHandle depthTarget, RenderGraphHandle hCurrHiZ, uint hizMipCount)
     {
-        HiZBuildPSOs.EnsureInitialized(context);
-        graph.AddPass(new HiZMip0Pass(context, depthTarget, hCurrHiZ));
+        hiZResources.EnsureInitialized(context);
+        graph.AddPass(new HiZMip0Pass(context, hiZResources, depthTarget, hCurrHiZ));
         for (uint mip = 1; mip < hizMipCount; mip++)
-            graph.AddPass(new HiZDownsamplePass(context, hCurrHiZ, mip));
+            graph.AddPass(new HiZDownsamplePass(context, hiZResources, hCurrHiZ, mip));
     }
 }

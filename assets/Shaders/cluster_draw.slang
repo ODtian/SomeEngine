@@ -12,7 +12,16 @@ struct DrawUniforms
     float QuantStep;     // Global quantization step (power of 2)
 };
 
+struct DrawDispatchUniforms
+{
+    uint DrawArgsByteOffset;
+    uint Pad0;
+    uint Pad1;
+    uint Pad2;
+};
+
 ConstantBuffer<DrawUniforms> Uniforms;
+ConstantBuffer<DrawDispatchUniforms> DispatchUniforms;
 
 ByteAddressBuffer PageHeap;
 // Instances declared in cluster_common.slang (via vertex_evaluate.slang)
@@ -33,6 +42,12 @@ struct PSInput
     nointerpolation uint ClusterID : CLUSTER_ID;
 };
 
+uint GetBinnedClusterIndex(uint instanceID)
+{
+    DrawInstancedArgs args = VisibleClusterMeta.Load<DrawInstancedArgs>(DispatchUniforms.DrawArgsByteOffset);
+    return args.StartInstance + instanceID;
+}
+
 // NOTE: GPUPageHeader and GPUCluster are defined in cluster_structures.slang
 
 // Helper to load partial cluster info needed for draw
@@ -40,7 +55,7 @@ void LoadClusterInfo(uint pageOffset, uint clusterId,
                      out int3 intBase, out uint vStart, out uint tStart, out uint packedCounts)
 {
     uint clustersOffset = PageHeap.Load(pageOffset + 16);
-    uint clusterOffset = pageOffset + clustersOffset + clusterId * 64;
+    uint clusterOffset = pageOffset + clustersOffset + clusterId * GPU_CLUSTER_STRIDE_BYTES;
 
     // IntBase at offset 0 (int3 = 12 bytes)
     int3 ib;
@@ -67,8 +82,7 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
     PSInput output;
 
     // 1. Decode Page and Cluster from Binned Index
-    uint clusterOffset = VisibleClusterMeta.Load<CullDrawArgs>(0).SWCount;
-    uint binnedIndex = clusterOffset + instanceID;
+    uint binnedIndex = GetBinnedClusterIndex(instanceID);
     uint2 binEntry = BinnedClusterIndexBuffer[binnedIndex];
     uint originalIndex = binEntry.x;
     uint packedRange = binEntry.y;
@@ -98,8 +112,7 @@ PSInput VSMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
     uint triCount = (packedCounts >> 8) & 0xFF;
     uint rangeStart = (packedRange >> 16) & 0xFFFF;
     uint rangeEnd = packedRange & 0xFFFF;
-    if (rangeEnd == 0) rangeEnd = triCount; // legacy fallback
-    uint batchTriCount = rangeEnd - rangeStart;
+    uint batchTriCount = rangeEnd > rangeStart ? rangeEnd - rangeStart : 0;
 
     output.ClusterID = clusterID; // Pass to PS for debug
 
@@ -235,13 +248,13 @@ struct PSVisBufferInput
     nointerpolation uint TriangleID : TRIANGLE_ID;
 };
 
+[ClusterRaster("hw_vs_inline")]
 [shader("vertex")]
 PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
 {
     PSVisBufferInput output;
 
-    uint clusterOffset = VisibleClusterMeta.Load<CullDrawArgs>(0).SWCount;
-    uint binnedIndex = clusterOffset + instanceID;
+    uint binnedIndex = GetBinnedClusterIndex(instanceID);
     uint2 binEntry = BinnedClusterIndexBuffer[binnedIndex];
     uint originalIndex = binEntry.x;
     uint packedRange = binEntry.y;
@@ -268,8 +281,7 @@ PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_Ins
     uint triCount = (packedCounts >> 8) & 0xFF;
     uint rangeStart = (packedRange >> 16) & 0xFFFF;
     uint rangeEnd = packedRange & 0xFFFF;
-    if (rangeEnd == 0) rangeEnd = triCount; // legacy fallback
-    uint batchTriCount = rangeEnd - rangeStart;
+    uint batchTriCount = rangeEnd > rangeStart ? rangeEnd - rangeStart : 0;
 
     output.VisibleClusterIndex = originalIndex;
     output.TriangleID = rangeStart + vertexID / 3;
@@ -308,7 +320,7 @@ PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_Ins
 
     vfArgs.visibleClusterIndex = originalIndex;
 
-    InlineSource<WaveVertexEval> source;
+    InlineSource<StaticVertexEval> source;
     output.Pos = source.fetchClipPosition(vfArgs);
 
     return output;
@@ -318,13 +330,13 @@ PSVisBufferInput VSVisBuffer(uint vertexID: SV_VertexID, uint instanceID: SV_Ins
 ByteAddressBuffer DeformCache;
 StructuredBuffer<uint> CacheOffsets;
 
+[ClusterRaster("hw_vs_cached")]
 [shader("vertex")]
 PSVisBufferInput VSVisBufferCached(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID)
 {
     PSVisBufferInput output;
 
-    uint clusterOffset = VisibleClusterMeta.Load<CullDrawArgs>(0).SWCount;
-    uint binnedIndex = clusterOffset + instanceID;
+    uint binnedIndex = GetBinnedClusterIndex(instanceID);
     uint2 binEntry = BinnedClusterIndexBuffer[binnedIndex];
     uint originalIndex = binEntry.x;
     uint packedRange = binEntry.y;
@@ -347,8 +359,7 @@ PSVisBufferInput VSVisBufferCached(uint vertexID: SV_VertexID, uint instanceID: 
     uint triCount = (packedCounts >> 8) & 0xFF;
     uint rangeStart = (packedRange >> 16) & 0xFFFF;
     uint rangeEnd = packedRange & 0xFFFF;
-    if (rangeEnd == 0) rangeEnd = triCount;
-    uint batchTriCount = rangeEnd - rangeStart;
+    uint batchTriCount = rangeEnd > rangeStart ? rangeEnd - rangeStart : 0;
 
     output.VisibleClusterIndex = originalIndex;
     output.TriangleID = rangeStart + vertexID / 3;
@@ -383,7 +394,7 @@ PSVisBufferInput VSVisBufferCached(uint vertexID: SV_VertexID, uint instanceID: 
     vfArgs.viewProj        = Uniforms.ViewProj;
     vfArgs.visibleClusterIndex = originalIndex;
 
-    CachedSource<WaveVertexEval> source;
+    CachedSource<StaticVertexEval> source;
     source.deformCache = DeformCache;
     source.cacheOffsets = CacheOffsets;
     output.Pos = source.fetchClipPosition(vfArgs);
@@ -391,6 +402,7 @@ PSVisBufferInput VSVisBufferCached(uint vertexID: SV_VertexID, uint instanceID: 
     return output;
 }
 
+[ClusterRaster("hw_ps")]
 [shader("pixel")]
 uint PSVisBuffer(PSVisBufferInput input) : SV_TARGET
 {

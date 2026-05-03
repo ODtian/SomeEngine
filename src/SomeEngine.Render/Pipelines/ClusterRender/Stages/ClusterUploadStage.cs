@@ -1,6 +1,11 @@
+using System;
+using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Diligent;
+using SomeEngine.Assets.Importers;
+using SomeEngine.Assets.Schema;
 using SomeEngine.Render.Data;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.RHI;
@@ -18,13 +23,66 @@ public class ClusterUploadStage(
     InstanceDataManager instanceMgr
 )
 {
+    internal sealed class Resources : IDisposable
+    {
+        internal const string PatchShaderFile = "bvh_patch.slang";
+        internal const string PatchEntryPoint = "main";
+
+        internal IPipelineState? PatchPSO;
+        internal ShaderAsset? PatchShaderAsset;
+        internal readonly SRBPool PatchPool = new();
+
+        private bool _initialized;
+        private readonly Lock _initLock = new();
+
+        internal void EnsureInitialized(RenderContext context)
+        {
+            if (_initialized) return;
+            lock (_initLock)
+            {
+                if (_initialized) return;
+
+                var device = context.Device;
+                if (device == null) return;
+
+                string path = ClusterStageUtils.ShaderPath(PatchShaderFile);
+                var patchShaderAsset = SlangShaderImporter.Import(path);
+                PatchShaderAsset = patchShaderAsset;
+
+                var cs = patchShaderAsset.CreateShader(context, PatchEntryPoint);
+                PatchPSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
+                {
+                    PSODesc = new PipelineStateDesc
+                    {
+                        Name = "BVH Patch PSO",
+                        PipelineType = PipelineType.Compute,
+                        ResourceLayout = new PipelineResourceLayoutDesc
+                        {
+                            DefaultVariableType = ShaderResourceVariableType.Dynamic,
+                        },
+                    },
+                    Cs = cs,
+                });
+
+                _initialized = true;
+            }
+        }
+
+        public void Dispose()
+        {
+            PatchPool.Dispose();
+            PatchPSO?.Dispose();
+        }
+    }
+
+    private readonly Resources _resources = new();
     private ClusterBVHPatchPass? _bvhPatchPass;
     private bool _initialized;
 
     public void Init()
     {
         if (_initialized) return;
-        _bvhPatchPass = new ClusterBVHPatchPass(context);
+        _bvhPatchPass = new ClusterBVHPatchPass(context, _resources);
         _bvhPatchPass.Init();
         _initialized = true;
     }
@@ -52,10 +110,9 @@ public class ClusterUploadStage(
             "GlobalInstanceHeader",
             new BufferDesc
             {
-                Size = (ulong)(maxInstances * GpuInstanceHeader.SizeInBytes),
+                Size = (ulong)(maxInstances * InstanceHeaderLayout.StrideBytes),
                 BindFlags = BindFlags.ShaderResource,
-                Mode = BufferMode.Structured,
-                ElementByteStride = GpuInstanceHeader.SizeInBytes,
+                Mode = BufferMode.Raw,
             }
         );
         var hInstanceDataHeap = graph.CreateBuffer(
@@ -129,5 +186,6 @@ public class ClusterUploadStage(
     public void Dispose()
     {
         _bvhPatchPass?.Dispose();
+        _resources.Dispose();
     }
 }

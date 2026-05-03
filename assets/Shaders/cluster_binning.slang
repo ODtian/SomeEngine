@@ -26,6 +26,14 @@ RWByteAddressBuffer BinnedDrawArgs;          // IndirectDrawArgs: must stay raw
 RWByteAddressBuffer BinnedHWDrawArgs;        // IndirectDrawArgs: must stay raw
 RWByteAddressBuffer BinningDispatchArgs;     // IndirectDrawArgs: must stay raw
 RWByteAddressBuffer BinnedSWDispatchArgs;    // Per-bin IndirectDispatchArgs: [0..MaxBins) = Total(SW+HW), [MaxBins..2*MaxBins) = SW only
+RWStructuredBuffer<uint> ReserveCounters;    // [0] = total batch allocator, [1] = SW batch allocator
+
+DispatchArgs MakeIndirectDispatchArgs(uint groupCount)
+{
+    uint dispatchX = min(groupCount, 65535u);
+    uint dispatchY = max(1u, (groupCount + 65534u) / 65535u);
+    return DispatchArgs(dispatchX, dispatchY, 1);
+}
 
 // ─── Helper: decode VRB batch count and compute total entries ───
 struct VRBDecoded
@@ -70,26 +78,15 @@ void ReadClusterVRB(uint4 entry, out uint vrbInfo, out uint triangleCount)
     uint pageOffset = entry.x;
     uint clusterID = entry.y;
     uint clustersOff = PageHeap.Load(pageOffset + 16); // header.ClustersOffset
-    uint packedCounts = PageHeap.Load(pageOffset + clustersOff + clusterID * 64 + 44);
+    uint packedCounts = PageHeap.Load(pageOffset + clustersOff + clusterID * GPU_CLUSTER_STRIDE_BYTES + 44);
     triangleCount = (packedCounts >> 8) & 0xFF;
-    vrbInfo = PageHeap.Load(pageOffset + clustersOff + clusterID * 64 + 60);
+    vrbInfo = PageHeap.Load(pageOffset + clustersOff + clusterID * GPU_CLUSTER_STRIDE_BYTES + 60);
 }
 
-// ─── Helper: get raster bin key for a specific triangle range's material ───
-uint ReadClusterMaterialBinKey(uint4 entry, uint rangeStart, uint instanceID)
+// ─── Helper: get raster bin key for an instance ───
+uint ReadClusterMaterialBinKey(uint instanceID)
 {
-    uint pageOffset = entry.x;
-    uint clusterID = entry.y;
-    uint clustersOff = PageHeap.Load(pageOffset + 16);
-    uint clusterOffset = pageOffset + clustersOff + clusterID * 64;
-
-    uint packedMaterials = PageHeap.Load(clusterOffset + 48);
-    uint packedRanges = PageHeap.Load(clusterOffset + 52);
-
-    uint localMatIdx = GetLocalMaterialIndexRaw(packedMaterials, packedRanges, rangeStart);
-
-    GpuInstanceHeader header = InstanceHeaders[instanceID];
-    uint slotOffset = header.MaterialSlotOffset + localMatIdx;
+    uint slotOffset = GetInstanceMaterialSlotOffset(instanceID);
     return GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
 }
 
@@ -129,7 +126,7 @@ void DecodeVisibleIndex(uint logicalIdx, out uint visibleIndex, out bool isSW)
 }
 
 // ─── Pass 2: CSBinningCount: count per-batch entries per bin ───
-// Both SW and HW paths emit per-VRB-batch entries with per-batch material binKey.
+// Both SW and HW paths emit per-VRB-batch entries with the instance bin key.
 [numthreads(64, 1, 1)]
 void CSBinningCount(uint3 dtid : SV_DispatchThreadID)
 {
@@ -148,11 +145,11 @@ void CSBinningCount(uint3 dtid : SV_DispatchThreadID)
     ReadClusterVRB(entry, vrbInfo, triangleCount);
     VRBDecoded vrb = DecodeVRB(vrbInfo, triangleCount);
 
-    // Emit per-batch counts with per-batch material binKey
+    // Emit per-batch counts with the instance bin key.
     uint triStart = 0;
     for (uint b = 0; b < vrb.batchCount; b++)
     {
-        uint batchBinKey = ReadClusterMaterialBinKey(entry, triStart, entry.z);
+        uint batchBinKey = ReadClusterMaterialBinKey(entry.z);
         if (batchBinKey >= Uniforms.MaxBins) batchBinKey = 0;
         uint unused;
         if (isSW)
@@ -164,7 +161,7 @@ void CSBinningCount(uint3 dtid : SV_DispatchThreadID)
     // Slow residual batches (fixed 32-tri windows)
     while (triStart < triangleCount)
     {
-        uint batchBinKey = ReadClusterMaterialBinKey(entry, triStart, entry.z);
+        uint batchBinKey = ReadClusterMaterialBinKey(entry.z);
         if (batchBinKey >= Uniforms.MaxBins) batchBinKey = 0;
         uint unused;
         if (isSW)
@@ -176,66 +173,81 @@ void CSBinningCount(uint3 dtid : SV_DispatchThreadID)
 }
 
 // ─── Pass 3: CSBinningReserve: Prefix Scan ───
-#define MAX_BINS 256
-groupshared uint sPrefixTotal[MAX_BINS];
-groupshared uint sPrefixSW[MAX_BINS];
+#define RASTER_BIN_RESERVE_BLOCK_SIZE 128
 
-[numthreads(MAX_BINS, 1, 1)]
-void CSBinningReserve(uint tid : SV_GroupThreadID)
+groupshared uint RasterReserveTotalPrefix[RASTER_BIN_RESERVE_BLOCK_SIZE];
+groupshared uint RasterReserveSWPrefix[RASTER_BIN_RESERVE_BLOCK_SIZE];
+groupshared uint RasterReserveTotalBlockBase;
+groupshared uint RasterReserveSWBlockBase;
+
+[numthreads(RASTER_BIN_RESERVE_BLOCK_SIZE, 1, 1)]
+void CSBinningReserve(uint3 tid : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
 {
-    uint swCount = (tid < Uniforms.MaxBins) ? RasterBinMeta[tid].BinSWCount : 0;
-    uint hwCount = (tid < Uniforms.MaxBins) ? RasterBinMeta[tid].BinHWCount : 0;
-    uint count = swCount + hwCount;
+    uint bin = tid.x;
+    uint swCount = 0;
+    uint hwCount = 0;
 
-    // Inclusive scan via shared memory for Total and SW
-    sPrefixTotal[tid] = count;
-    sPrefixSW[tid] = swCount;
+    if (bin < Uniforms.MaxBins)
+    {
+        swCount = RasterBinMeta[bin].BinSWCount;
+        hwCount = RasterBinMeta[bin].BinHWCount;
+    }
+
+    uint count = swCount + hwCount;
+    RasterReserveTotalPrefix[groupIndex] = count;
+    RasterReserveSWPrefix[groupIndex] = swCount;
     GroupMemoryBarrierWithGroupSync();
 
-    [unroll] for (uint s = 1; s < MAX_BINS; s <<= 1)
+    for (uint scanOffset = 1; scanOffset < RASTER_BIN_RESERVE_BLOCK_SIZE; scanOffset <<= 1)
     {
+        uint totalAddend = groupIndex >= scanOffset ? RasterReserveTotalPrefix[groupIndex - scanOffset] : 0;
+        uint swAddend = groupIndex >= scanOffset ? RasterReserveSWPrefix[groupIndex - scanOffset] : 0;
         GroupMemoryBarrierWithGroupSync();
-        uint valTotal = 0;
-        uint valSW = 0;
-        if (tid >= s)
-        {
-            valTotal = sPrefixTotal[tid - s];
-            valSW = sPrefixSW[tid - s];
-        }
+        RasterReserveTotalPrefix[groupIndex] += totalAddend;
+        RasterReserveSWPrefix[groupIndex] += swAddend;
         GroupMemoryBarrierWithGroupSync();
-        sPrefixTotal[tid] += valTotal;
-        sPrefixSW[tid] += valSW;
+    }
+
+    uint totalInclusive = RasterReserveTotalPrefix[groupIndex];
+    uint swInclusive = RasterReserveSWPrefix[groupIndex];
+    uint totalBlockSum = RasterReserveTotalPrefix[RASTER_BIN_RESERVE_BLOCK_SIZE - 1];
+    uint swBlockSum = RasterReserveSWPrefix[RASTER_BIN_RESERVE_BLOCK_SIZE - 1];
+
+    if (groupIndex == 0)
+    {
+        InterlockedAdd(ReserveCounters[0], totalBlockSum, RasterReserveTotalBlockBase);
+        InterlockedAdd(ReserveCounters[1], swBlockSum, RasterReserveSWBlockBase);
     }
     GroupMemoryBarrierWithGroupSync();
 
-    uint exclusiveSumTotal = sPrefixTotal[tid] - count;
-    uint exclusiveSumSW    = sPrefixSW[tid] - swCount;
+    if (bin >= Uniforms.MaxBins) return;
 
-    if (tid >= Uniforms.MaxBins) return;
+    uint totalOffset = RasterReserveTotalBlockBase + totalInclusive - count;
+    uint swOffset = RasterReserveSWBlockBase + swInclusive - swCount;
 
-    RasterBinMeta[tid].ClusterOffset = exclusiveSumTotal;
-    RasterBinMeta[tid].BinCapacity = count;
-    RasterBinMeta[tid].SWCursor = 0;
-    RasterBinMeta[tid].HWCursor = 0;
-    RasterBinMeta[tid].SWOffset = exclusiveSumSW;
+    RasterBinMeta[bin].ClusterOffset = totalOffset;
+    RasterBinMeta[bin].BinCapacity = count;
+    RasterBinMeta[bin].SWCursor = 0;
+    RasterBinMeta[bin].HWCursor = 0;
+    RasterBinMeta[bin].SWOffset = swOffset;
 
-    BinnedDrawArgs.Store<DrawInstancedArgs>(tid * 16,
-        DrawInstancedArgs(96, swCount, 0, exclusiveSumTotal));
+    BinnedDrawArgs.Store<DrawInstancedArgs>(bin * 16,
+        DrawInstancedArgs(96, count, 0, totalOffset));
 
-    BinnedHWDrawArgs.Store<DrawInstancedArgs>(tid * 16,
-        DrawInstancedArgs(96, hwCount, 0, exclusiveSumTotal + swCount));
+    BinnedHWDrawArgs.Store<DrawInstancedArgs>(bin * 16,
+        DrawInstancedArgs(96, hwCount, 0, totalOffset + swCount));
 
     // Per-bin Total dispatch args (SW+HW, for deform: offset bin*12)
-    BinnedSWDispatchArgs.Store<DispatchArgs>(tid * 12,
-        DispatchArgs(count, 1, 1));
+    BinnedSWDispatchArgs.Store<DispatchArgs>(bin * 12,
+        MakeIndirectDispatchArgs(count));
 
     // Per-bin SW-only dispatch args (for SW raster: offset (MaxBins+bin)*12)
-    BinnedSWDispatchArgs.Store<DispatchArgs>((Uniforms.MaxBins + tid) * 12,
-        DispatchArgs(swCount, 1, 1));
+    BinnedSWDispatchArgs.Store<DispatchArgs>((Uniforms.MaxBins + bin) * 12,
+        MakeIndirectDispatchArgs(swCount));
 }
 
 // ─── Pass 4: CSBinningScatter: scatter per-batch entries ───
-// Both SW and HW paths scatter per-VRB-batch entries with per-batch material binKey.
+// Both SW and HW paths scatter per-VRB-batch entries with the instance bin key.
 [numthreads(64, 1, 1)]
 void CSBinningScatter(uint3 dtid : SV_DispatchThreadID)
 {
@@ -261,7 +273,7 @@ void CSBinningScatter(uint3 dtid : SV_DispatchThreadID)
         uint triEnd = triStart + vrb.triCounts[b];
         triEnd = min(triEnd, triangleCount);
 
-        uint batchBinKey = ReadClusterMaterialBinKey(entry, triStart, entry.z);
+        uint batchBinKey = ReadClusterMaterialBinKey(entry.z);
         if (batchBinKey >= Uniforms.MaxBins) batchBinKey = 0;
         uint batchClusterOffset = RasterBinMeta[batchBinKey].ClusterOffset;
 
@@ -286,7 +298,7 @@ void CSBinningScatter(uint3 dtid : SV_DispatchThreadID)
     {
         uint triEnd = min(triStart + 32, triangleCount);
 
-        uint batchBinKey = ReadClusterMaterialBinKey(entry, triStart, entry.z);
+        uint batchBinKey = ReadClusterMaterialBinKey(entry.z);
         if (batchBinKey >= Uniforms.MaxBins) batchBinKey = 0;
         uint batchClusterOffset = RasterBinMeta[batchBinKey].ClusterOffset;
 

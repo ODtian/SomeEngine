@@ -8,6 +8,8 @@ using SomeEngine.Assets.Schema; // Added
 using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
 using SomeEngine.Core.Math;
+using SomeEngine.Render.Components;
+using SomeEngine.Render.Frame;
 using SomeEngine.Render.Graph;
 using SomeEngine.Render.Materials;
 using SomeEngine.Render.Pipelines;
@@ -23,15 +25,17 @@ class Program
     private static TriangleRenderPass? _trianglePass;
     private static ClusterPipeline? _clusterPipeline;
     private static ClusterResourceManager? _clusterManager;
+    private static RenderWorld? _renderWorld;
     private static RenderGraph? _renderGraph;
+    private static readonly FrameTargetRegistry _frameTargets = new();
+    private static GlobalPsoCache? _globalPsoCache;
     private static GameWorld? _gameWorld;
     private static InstanceSyncSystem? _transformSync;
     private static InstanceDataManager? _instanceDataManager;
+    private static ulong _frameIndex;
 
     static void Main(string[] args)
     {
-        AssetTypeRegistration.RegisterBuiltIns();
-
         WindowOptions options = WindowOptions.Default;
         options.Size = new Vector2D<int>(1280, 720);
         options.Title = "SomeEngine Editor";
@@ -55,6 +59,8 @@ class Program
 
     private static void OnClose()
     {
+        _clusterPipeline?.Dispose();
+        _globalPsoCache?.Dispose();
         _renderContext?.Dispose();
     }
 
@@ -71,25 +77,24 @@ class Program
         }
 
         _instanceDataManager = new InstanceDataManager();
-        _transformSync = new InstanceSyncSystem(_instanceDataManager);
+        _transformSync = new InstanceSyncSystem(_instanceDataManager, _gameWorld.SystemContext);
         _gameWorld.SystemRoot.Add(_transformSync);
 
         // Create Clusters
         _clusterManager = new ClusterResourceManager(_renderContext);
-        // var cube = CreateCube(); // Deprecated
-        // _clusterManager.AddMesh(cube); // Deprecated signature
-        // _clusterManager.CommitPageTable(); // New API call if we had data
 
         // Create Test Entities
         for (int i = 0; i < 100; i++)
         {
             var e = _gameWorld.EntityStore.CreateEntity();
-            e.AddComponent(
-                new TransformQvvs(
+            e.AddComponent(new LocalTransform
+            {
+                Value = new TransformQvvs(
                     new Vector3((i % 10 - 4.5f) * 1.5f, (i / 10 - 4.5f) * 1.5f, 0),
                     Quaternion.Identity
-                )
-            );
+                ),
+            });
+            e.AddComponent(new WorldTransform());
             e.AddComponent(new MeshInstance { BVHRootIndex = 0 }); // Placeholder root
         }
 
@@ -98,11 +103,10 @@ class Program
         _trianglePass.TransformSystem = _instanceDataManager;
         _trianglePass.InitPSO();
 
-        var materialSystem = new SomeEngine.Render.Materials.MaterialSystem();
-
-        var globalPsoCache = new GlobalPsoCache();
+        _globalPsoCache = new GlobalPsoCache();
+        _renderWorld = new RenderWorld();
         _clusterPipeline = ClusterPipeline.Opaque(
-            _renderContext, _clusterManager, _instanceDataManager!, materialSystem, globalPsoCache);
+            _renderContext, _clusterManager, _instanceDataManager!, _globalPsoCache, _renderWorld);
         _clusterPipeline.Initialize(_renderContext);
     }
 
@@ -115,6 +119,11 @@ class Program
 
     private static void OnUpdate(double deltaTime)
     {
+        if (_gameWorld != null && _clusterPipeline != null)
+        {
+            _clusterPipeline.PrepareFrame(_gameWorld.EntityStore, _ => null);
+        }
+
         _gameWorld?.Update(deltaTime);
     }
 
@@ -131,12 +140,26 @@ class Program
             return;
 
         _renderGraph!.BeginFrame();
-        var bbHandle = _renderGraph.Import(
-            "ColorTarget",
-            bbView.GetTexture(),
-            ResourceState.RenderTarget
+        var scDesc = _renderContext.SwapChain!.GetDesc();
+        _frameTargets.BeginFrame(
+            _renderGraph,
+            new FrameTargetContext(scDesc.Width, scDesc.Height, _frameIndex++)
         );
-        var depthHandle = _renderGraph.CreateTexture("DepthTarget", _renderContext.DepthBufferDesc);
+        _frameTargets.ImportTexture(
+            StandardFrameTargets.SceneColor,
+            bbView.GetTexture(),
+            ResourceState.RenderTarget,
+            "SceneColor"
+        );
+        _frameTargets.DeclareTexture(
+            StandardFrameTargets.SceneDepth,
+            _ => _renderContext.DepthBufferDesc with { Name = "SceneDepth" },
+            FrameTargetLifetime.FrameLocal,
+            ResourceState.Unknown,
+            "SceneDepth"
+        );
+        var bbHandle = _frameTargets.ResolveTexture(StandardFrameTargets.SceneColor);
+        var depthHandle = _frameTargets.ResolveTexture(StandardFrameTargets.SceneDepth);
 
         // Clear pass via RG
         _renderGraph.AddPass<object>(
@@ -173,7 +196,7 @@ class Program
             }
         );
 
-        _clusterPipeline!.AddPasses(_renderGraph);
+        _clusterPipeline!.AddPasses(_renderGraph, _frameTargets);
         _renderGraph.Compile(_renderContext.Device);
         _renderGraph.Execute(_renderContext);
 

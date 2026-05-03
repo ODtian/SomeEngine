@@ -1,5 +1,6 @@
 using System.IO;
 using System.Linq;
+using SomeEngine.Assets;
 using SomeEngine.Assets.Importers;
 
 namespace SomeEngine.Tests;
@@ -88,6 +89,8 @@ public class WaveQueueCompilationTest
             if (File.Exists(assetFile)) File.Delete(assetFile);
             string assetMetaFile = assetFile + ".meta";
             if (File.Exists(assetMetaFile)) File.Delete(assetMetaFile);
+            string sourceMetaFile = SourceMetaManager.GetMetaPath(slangFile);
+            if (File.Exists(sourceMetaFile)) File.Delete(sourceMetaFile);
         }
     }
 }

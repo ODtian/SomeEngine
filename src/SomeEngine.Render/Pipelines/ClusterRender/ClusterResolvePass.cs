@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Collections.Concurrent;
 using System.Threading;
 using Diligent;
 using SomeEngine.Assets.Importers;
@@ -10,25 +9,32 @@ using SomeEngine.Render.RHI;
 
 namespace SomeEngine.Render.Pipelines;
 
-internal static class ClusterResolvePSOs
+public static partial class ClusterShade
 {
-    internal static IPipelineState? PSO;
-    internal static readonly ConcurrentBag<IShaderResourceBinding> SRBPool = [];
-    private static bool s_initialized;
-    private static readonly Lock s_initLock = new();
+internal sealed class ResolveResources : IDisposable
+{
+    internal const string ShaderFile = "cluster_resolve.slang";
+    internal const string ResolveEntryPoint = "CSResolve";
 
-    internal static void EnsureInitialized(RenderContext context)
+    internal IPipelineState? PSO;
+    internal ShaderAsset? ShaderAsset;
+    internal readonly SRBPool Pool = new();
+    private bool _initialized;
+    private readonly Lock _initLock = new();
+
+    internal void EnsureInitialized(RenderContext context)
     {
-        if (s_initialized) return;
-        lock (s_initLock)
+        if (_initialized) return;
+        lock (_initLock)
         {
-            if (s_initialized) return;
+            if (_initialized) return;
             var device = context.Device;
             if (device == null) return;
 
-            string path = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../assets/Shaders/cluster_resolve.slang"));
+            string path = ClusterStageUtils.ShaderPath(ShaderFile);
             var shaderAsset = SlangShaderImporter.Import(path);
-            using var cs = shaderAsset.CreateShader(context, "CSResolve");
+            ShaderAsset = shaderAsset;
+            var cs = shaderAsset.CreateShader(context, ResolveEntryPoint);
 
             PSO = device.CreateComputePipelineState(new ComputePipelineStateCreateInfo
             {
@@ -40,24 +46,23 @@ internal static class ClusterResolvePSOs
                 },
                 Cs = cs,
             });
-
-            s_initialized = true;
+            _initialized = true;
         }
     }
 
-    internal static IShaderResourceBinding RentSRB()
+    public void Dispose()
     {
-        if (PSO == null) throw new InvalidOperationException("PSO is not initialized.");
-        return SRBPool.TryTake(out var srb) ? srb : PSO.CreateShaderResourceBinding(false);
+        Pool.Dispose();
+        PSO?.Dispose();
     }
-
-    internal static void ReturnSRB(IShaderResourceBinding srb) => SRBPool.Add(srb);
+}
 }
 
-public class ClusterResolvePass : IRenderGraphPass, IDisposable
+internal class ClusterResolvePass : IRenderGraphPass, IDisposable
 {
     public string Name => "Cluster Resolve";
     private readonly RenderContext _context;
+    private readonly ClusterShade.ResolveResources _resources;
 
     public RenderGraphHandle HVisBuffer = RenderGraphHandle.Invalid;
     public RenderGraphHandle HDepthTarget = RenderGraphHandle.Invalid;
@@ -67,13 +72,14 @@ public class ClusterResolvePass : IRenderGraphPass, IDisposable
     public RenderGraphHandle HDrawUniforms = RenderGraphHandle.Invalid;
     public RenderGraphHandle HColorTarget = RenderGraphHandle.Invalid;
 
-    public ClusterResolvePass(RenderContext context)
+    public ClusterResolvePass(RenderContext context, ClusterShade.ResolveResources resources)
     {
         _context = context;
-        ClusterResolvePSOs.EnsureInitialized(context);
+        _resources = resources;
+        _resources.EnsureInitialized(context);
     }
 
-    public void Init() => ClusterResolvePSOs.EnsureInitialized(_context);
+    public void Init() => _resources.EnsureInitialized(_context);
 
     public void Setup(RenderGraphBuilder builder)
     {
@@ -88,7 +94,7 @@ public class ClusterResolvePass : IRenderGraphPass, IDisposable
 
     public void Execute(RenderGraphContext rgCtx)
     {
-        if (ClusterResolvePSOs.PSO == null) return;
+        if (_resources.PSO == null) return;
         var ctx = _context.ImmediateContext;
         if (ctx == null) return;
 
@@ -109,27 +115,27 @@ public class ClusterResolvePass : IRenderGraphPass, IDisposable
 
         var globalTransformView = rgCtx.GetBufferView(HGlobalTransformBuffer, BufferViewType.ShaderResource);
 
-        var srb = ClusterResolvePSOs.RentSRB();
+        var srb = _resources.Pool.Rent(_resources.PSO);
 
-        srb.GetVariableByName(ShaderType.Compute, "Uniforms")?.Set(drawUniforms, SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "VisBuffer")?.Set(visBufferSRV, SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "Uniforms")?.Set(drawUniforms, SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "VisBuffer")?.Set(visBufferSRV, SetShaderResourceFlags.None);
         if (depthSRV != null)
         {
-            srb.GetVariableByName(ShaderType.Compute, "DepthBuffer")?.Set(depthSRV, SetShaderResourceFlags.None);
+            srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "DepthBuffer")?.Set(depthSRV, SetShaderResourceFlags.None);
         }
-        srb.GetVariableByName(ShaderType.Compute, "VisibleClusters")?.Set(visibleClusters.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
-        srb.GetVariableByName(ShaderType.Compute, "PageHeap")?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "VisibleClusters")?.Set(visibleClusters.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "PageHeap")?.Set(pageHeap.GetDefaultView(BufferViewType.ShaderResource), SetShaderResourceFlags.None);
         if (globalTransformView != null)
         {
-            srb.GetVariableByName(ShaderType.Compute, "Instances")?.Set(globalTransformView, SetShaderResourceFlags.None);
+            srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "Instances")?.Set(globalTransformView, SetShaderResourceFlags.None);
         }
-        srb.GetVariableByName(ShaderType.Compute, "OutputColor")?.Set(colorUAV, SetShaderResourceFlags.None);
+        srb.GetVariableByReflectedBinding(_context, _resources.ShaderAsset, ShaderType.Compute, "OutputColor")?.Set(colorUAV, SetShaderResourceFlags.None);
 
         var desc = colorTarget.GetDesc();
         uint width = desc.Width;
         uint height = desc.Height;
 
-        ctx.SetPipelineState(ClusterResolvePSOs.PSO);
+        ctx.SetPipelineState(_resources.PSO);
         ctx.CommitShaderResources(srb, ResourceStateTransitionMode.None);
         ctx.DispatchCompute(new DispatchComputeAttribs
         {
@@ -138,7 +144,7 @@ public class ClusterResolvePass : IRenderGraphPass, IDisposable
             ThreadGroupCountZ = 1,
         });
 
-        ClusterResolvePSOs.ReturnSRB(srb);
+        _resources.Pool.Return(srb);
     }
 
     public void Dispose() { }

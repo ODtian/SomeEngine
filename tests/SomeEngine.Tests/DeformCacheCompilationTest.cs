@@ -58,7 +58,23 @@ public class DeformCacheCompilationTest
     {
         CompileAndAssert("_test_cluster_deform.slang",
             """#include "cluster_deform.slang" """,
-            "CSDeformPrepareVisibleArgs", "CSDeformInitVisible");
+            "CSDeformPrepareVisibleArgs",
+            "CSDeformInitVisible",
+            "CSDeformCacheRequest",
+            "CSDeformCacheScanVisible",
+            "CSDeformCacheScanBlocks0",
+            "CSDeformCacheScanBlocks1",
+            "CSDeformCacheApplyBlockOffsets",
+            "CSDeformCacheCommitAllocation");
+    }
+
+    [Fact]
+    public void CSDeform_GuardsFoldedIndirectDispatchTail()
+    {
+        string shaderPath = Path.Combine(GetShaderDir(), "cluster_deform.slang");
+        string source = File.ReadAllText(shaderPath);
+
+        Assert.Contains("if (flatIndex >= binMeta.BinCount)", source);
     }
 
     [Fact]

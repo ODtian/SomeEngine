@@ -72,9 +72,10 @@ bool decodeTriangle(uint2 pixelCoord, out TriangleInfo tri)
     uint visData = VisBuffer[pixelCoord];
     if (visData == 0)
         return false;
+    uint visDataClean = visData & 0x7FFFFFFFu;
 
-    tri.visibleClusterIndex = (visData >> 7) - 1;
-    tri.triangleID = visData & 0x7F;
+    tri.visibleClusterIndex = (visDataClean >> 7) - 1;
+    tri.triangleID = visDataClean & 0x7F;
 
     DrawRequest req = VisibleClusters[tri.visibleClusterIndex];
     tri.pageOffset = req.PageOffset;
@@ -130,11 +131,21 @@ void fetchCachedTrianglePositions<TVE : IVertexEvaluate>(
     ByteAddressBuffer cache, StructuredBuffer<uint> offsets,
     out float3 wp0, out float3 wp1, out float3 wp2)
 {
-    uint cacheBase = offsets[tri.visibleClusterIndex];
+    uint baseByte = offsets[tri.visibleClusterIndex];
+    if (baseByte >= 0xFFFFFFFDu)
+    {
+        evaluateTrianglePositions(evaluator, tri, wp0, wp1, wp2);
+        return;
+    }
+
     uint stride = evaluator.getCacheStride();
-    wp0 = evaluator.getPosition(evaluator.readCache(cache, (cacheBase + tri.vi0) * stride));
-    wp1 = evaluator.getPosition(evaluator.readCache(cache, (cacheBase + tri.vi1) * stride));
-    wp2 = evaluator.getPosition(evaluator.readCache(cache, (cacheBase + tri.vi2) * stride));
+    uint byteAddr0 = baseByte + tri.vi0 * stride;
+    uint byteAddr1 = baseByte + tri.vi1 * stride;
+    uint byteAddr2 = baseByte + tri.vi2 * stride;
+
+    wp0 = evaluator.getPosition(evaluator.readCache(cache, byteAddr0));
+    wp1 = evaluator.getPosition(evaluator.readCache(cache, byteAddr1));
+    wp2 = evaluator.getPosition(evaluator.readCache(cache, byteAddr2));
 }
 
 /// 从三角形信息 + 3 个世界空间位置 → 构建完整 PixelContext。
@@ -194,9 +205,10 @@ void handleDebugMode<TVE : IVertexEvaluate>(TVE evaluator, uint2 pixelCoord, uin
 {
     uint visData = VisBuffer[pixelCoord];
     if (visData == 0) return;
+    uint visDataClean = visData & 0x7FFFFFFFu;
 
-    uint visibleClusterIndex = (visData >> 7) - 1;
-    uint triangleID = visData & 0x7F;
+    uint visibleClusterIndex = (visDataClean >> 7) - 1;
+    uint triangleID = visDataClean & 0x7F;
     DrawRequest req = VisibleClusters[visibleClusterIndex];
 
     float3 color;

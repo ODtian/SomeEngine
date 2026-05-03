@@ -3,6 +3,7 @@
 
 #include "common.slang"
 #include "cluster_structures.slang"
+#include "generated/instance_header_layout.slang"
 
 // ── Shared structures ──
 
@@ -22,7 +23,7 @@ void LoadClusterInfo(ByteAddressBuffer pageHeap, uint pageOffset, uint clusterId
                      out int3 intBase, out uint vStart, out uint tStart, out uint packedCounts)
 {
     uint clustersOffset = pageHeap.Load(pageOffset + 16);
-    uint clusterOffset = pageOffset + clustersOffset + clusterId * 64;
+    uint clusterOffset = pageOffset + clustersOffset + clusterId * GPU_CLUSTER_STRIDE_BYTES;
 
     int3 ib;
     ib.x = asint(pageHeap.Load(clusterOffset + 0));
@@ -37,30 +38,6 @@ void LoadClusterInfo(ByteAddressBuffer pageHeap, uint pageOffset, uint clusterId
     tStart = packedTStartGroup & 0xFFFF;
 
     packedCounts = pageHeap.Load(clusterOffset + 44);
-}
-
-/// Load material info (PackedMaterials + PackedRanges) from the page heap for a given cluster.
-void LoadClusterMaterialInfo(ByteAddressBuffer pageHeap, uint pageOffset, uint clusterId,
-                             out uint packedMaterials, out uint packedRanges)
-{
-    uint clustersOffset = pageHeap.Load(pageOffset + 16);
-    uint clusterOffset = pageOffset + clustersOffset + clusterId * 64;
-    packedMaterials = pageHeap.Load(clusterOffset + 48);
-    packedRanges    = pageHeap.Load(clusterOffset + 52);
-}
-
-/// Decode local material index from raw PackedRanges/PackedMaterials, given triangle index.
-uint GetLocalMaterialIndexRaw(uint packedMaterials, uint packedRanges, uint triIdx)
-{
-    uint range0End = packedRanges & 0xFF;
-    uint range1End = (packedRanges >> 8) & 0xFF;
-
-    if (triIdx < range0End)
-        return packedMaterials & 0xFF;
-    else if (triIdx < range1End)
-        return (packedMaterials >> 8) & 0xFF;
-    else
-        return (packedMaterials >> 16) & 0xFF;
 }
 
 /// Fetch a quantized vertex position from the page heap and dequantize to object space.
@@ -109,15 +86,30 @@ uint FetchVertexIndex(ByteAddressBuffer pageHeap, uint pageOffset, uint idxOffse
 
 // ── Instance Data ──
 StructuredBuffer<GpuTransform> Instances;
-StructuredBuffer<GpuInstanceHeader> InstanceHeaders;
+ByteAddressBuffer InstanceHeaders;
 ByteAddressBuffer InstanceDataHeap;
+
+uint GetInstanceBVHRootIndex(uint instanceID)
+{
+    return LoadInstanceBVHRootIndex(InstanceHeaders, instanceID);
+}
+
+uint GetInstanceMaterialSlotOffset(uint instanceID)
+{
+    return LoadInstanceMaterialSlotOffset(InstanceHeaders, instanceID);
+}
+
+float GetInstanceBoundsExpansion(uint instanceID)
+{
+    return LoadInstanceBoundsExpansionWorld(InstanceHeaders, instanceID);
+}
 
 float4 getInstancePropertyFloat4(uint instanceID, uint relativeOffset, float4 defaultValue)
 {
-    uint baseOffset = InstanceHeaders[instanceID].MetadataOffset;
-    uint count = InstanceHeaders[instanceID].MetadataCount;
-    if (count > 0)
+    uint flags = LoadInstanceDataFlags(InstanceHeaders, instanceID);
+    if ((flags & INSTANCE_DATA_FLAG_MATERIAL_OVERRIDE) != 0)
     {
+        uint baseOffset = LoadInstanceDataOffset(InstanceHeaders, instanceID);
         return asfloat(InstanceDataHeap.Load4(baseOffset + relativeOffset));
     }
     return defaultValue;
