@@ -10,5 +10,5 @@ public sealed class MeshAssetProvider : AssetProvider<MeshAsset>
         => assetPath.EndsWith(".mesh.asset", StringComparison.OrdinalIgnoreCase);
 
     public override MeshAsset Create(AssetGuid guid, string filePath)
-        => MeshAssetSerializer.Load(filePath);
+        => MeshAssetCodec.Load(filePath);
 }

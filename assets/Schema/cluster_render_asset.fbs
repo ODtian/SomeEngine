@@ -1,0 +1,28 @@
+// FlatBuffers schema for the concrete Cluster render asset.
+include "asset_refs.fbs";
+
+namespace SomeEngine.Assets.Schema;
+
+attribute "fs_serializer";
+
+table ClusterRenderAsset (fs_serializer) {
+    asset_guid: string;
+    name: string;
+
+    temporal_resolve: ShaderAssetRef;
+
+    cluster_binning: ShaderAssetRef;
+    cluster_bvh_traverse: ShaderAssetRef;
+    cluster_cull: ShaderAssetRef;
+    cluster_deform_binning: ShaderAssetRef;
+    cluster_deform: ShaderAssetRef;
+    cluster_draw: ShaderAssetRef;
+    cluster_motion_vectors: ShaderAssetRef;
+    cluster_resolve: ShaderAssetRef;
+    cluster_shade_binning: ShaderAssetRef;
+    depth_merge: ShaderAssetRef;
+    hiz_build: ShaderAssetRef;
+    bvh_patch: ShaderAssetRef;
+}
+
+root_type ClusterRenderAsset;

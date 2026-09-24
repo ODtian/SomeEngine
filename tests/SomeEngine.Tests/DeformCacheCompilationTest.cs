@@ -1,87 +1,110 @@
 using System.IO;
 using System.Linq;
 using SomeEngine.Assets.Importers;
-
 namespace SomeEngine.Tests;
 
-public class DeformCacheCompilationTest
+public class DeformCompileTests
 {
-    private string GetShaderDir() => Path.GetFullPath(Path.Combine(
-        AppContext.BaseDirectory,
-        "..", "..", "..", "..", "..", "..", "assets", "Shaders"));
-
-    private void CompileAndAssert(string filename, string source, params string[] expectedEntryPoints)
+    private void CompileOk(string shaderFile, params string[] expectedEntryPoints)
     {
-        string shaderDir = GetShaderDir();
-        string slangFile = Path.Combine(shaderDir, filename);
-        File.WriteAllText(slangFile, source);
+        var asset = SlangShaderImporter.Import(TestProjectPaths.ShaderPath(shaderFile));
+        Assert.NotNull(asset);
+        Assert.NotNull(asset.Variants);
+        Assert.NotEmpty(asset.Variants!);
 
-        try
+        foreach (var ep in expectedEntryPoints)
         {
-            var asset = SlangShaderImporter.Import(slangFile, source);
-            Assert.NotNull(asset);
-            Assert.NotNull(asset.Variants);
-            Assert.NotEmpty(asset.Variants!);
-
-            foreach (var ep in expectedEntryPoints)
-            {
-                var variant = asset.Variants!.FirstOrDefault(v => v.EntryPoint == ep && v.Backend == "spirv");
-                Assert.NotNull(variant);
-                Assert.True(variant!.Data.HasValue && variant.Data.Value.Length > 0, $"SPIR-V bytecode should be non-empty for {ep}");
-            }
-
-            Console.WriteLine($"DeformCache compilation OK: {asset.Variants!.Count} variants");
-            foreach (var v in asset.Variants)
-                Console.WriteLine($"  {v.Backend} / {v.Stage} / {v.EntryPoint}: {v.Data?.Length ?? 0} bytes");
+            var variant = asset.Variants!.FirstOrDefault(v => v.EntryPoint == ep && v.Backend == "spirv");
+            Assert.NotNull(variant);
+            Assert.True(variant!.Data.HasValue && variant.Data.Value.Length > 0, $"SPIR-V bytecode should be non-empty for {ep}");
         }
-        finally
-        {
-            if (File.Exists(slangFile)) File.Delete(slangFile);
-            foreach (var ext in new[] { ".meta", ".shader.asset", ".shader.asset.meta" })
-            {
-                string f = ext == ".meta" ? slangFile + ext : Path.ChangeExtension(slangFile, ext);
-                if (File.Exists(f)) File.Delete(f);
-            }
-        }
+
+        Console.WriteLine($"DeformCache compilation OK: {asset.Variants!.Count} variants");
+        foreach (var v in asset.Variants)
+            Console.WriteLine($"  {v.Backend} / {v.Stage} / {v.EntryPoint}: {v.Data?.Length ?? 0} bytes");
     }
 
     [Fact]
-    public void CSSWRasterCached_CompilesSuccessfully()
+    public void SwRasterCompiles()
     {
-        CompileAndAssert("_test_sw_raster_cached.slang",
-            """#include "sw_raster.slang" """,
+        CompileOk("sw_raster.slang",
             "CSSWRasterCached");
     }
 
     [Fact]
-    public void CSDeform_EntryPoints_CompileSuccessfully()
+    public void DeformCompiles()
     {
-        CompileAndAssert("_test_cluster_deform.slang",
-            """#include "cluster_deform.slang" """,
-            "CSDeformPrepareVisibleArgs",
-            "CSDeformInitVisible",
-            "CSDeformCacheRequest",
-            "CSDeformCacheScanVisible",
-            "CSDeformCacheScanBlocks0",
-            "CSDeformCacheScanBlocks1",
-            "CSDeformCacheApplyBlockOffsets",
-            "CSDeformCacheCommitAllocation");
+        CompileOk("cluster_deform.slang",
+            "CSDeformStatic",
+            "CSDeformWave");
     }
 
     [Fact]
-    public void CSDeform_GuardsFoldedIndirectDispatchTail()
+    public void DeformTailGuard()
     {
-        string shaderPath = Path.Combine(GetShaderDir(), "cluster_deform.slang");
+        string shaderPath = TestProjectPaths.ShaderPath("cluster_deform.slang");
         string source = File.ReadAllText(shaderPath);
 
         Assert.Contains("if (flatIndex >= binMeta.BinCount)", source);
     }
 
     [Fact]
-    public void VSVisBufferCached_CompilesSuccessfully()
+    public void UsesDirectAllocation()
     {
-        CompileAndAssert("_test_visbuffer_cached.slang",
-            """#include "cluster_draw.slang" """,
+        string shaderPath = TestProjectPaths.ShaderPath("cluster_deform.slang");
+        string source = File.ReadAllText(shaderPath);
+
+        Assert.Contains("uint requestBytesRaw = evaluator.getCacheByteSize(vertexCount);", source);
+        Assert.Contains("InterlockedAdd(CacheAllocationCounter[0], requestBytes", source);
+        Assert.DoesNotContain("CacheRequestBytes", source);
+        Assert.DoesNotContain("CacheBlockSums", source);
+        Assert.DoesNotContain("CacheBlockOffsets", source);
+        Assert.DoesNotContain("vertexCount * Uniforms.CacheStrideBytes", source);
+        Assert.DoesNotContain("CacheStrideBytes", source);
+        Assert.DoesNotContain("getCacheStride", source);
+    }
+
+    [Fact]
+    public void CacheOffsetsCommit()
+    {
+        string shaderPath = TestProjectPaths.ShaderPath("cluster_deform.slang");
+        string source = File.ReadAllText(shaderPath);
+
+        Assert.Contains("CacheOffsetsWrite[visibleIndex] = cacheBaseByte;", source);
+        Assert.Contains("[numthreads(64, 1, 1)]", source);
+    }
+
+    [Fact]
+    public void BinningEmitsOnce()
+    {
+        string shaderPath = TestProjectPaths.ShaderPath("cluster_deform_binning.slang");
+        string source = File.ReadAllText(shaderPath);
+        string io = File.ReadAllText(TestProjectPaths.ShaderPath("cluster_bin_io.slang"));
+
+        Assert.Contains("#include \"cluster_bin_io.slang\"", source);
+        Assert.Contains("ScatterDeform(", source);
+        Assert.Contains("indices[offset + local] = uint2(visible, 0u);", io);
+        Assert.Contains("offsets[visible] = sentinel;", io);
+        Assert.DoesNotContain("triStart << 16", source);
+    }
+
+    [Fact]
+    public void VisBufferCompiles()
+    {
+        CompileOk("cluster_draw.slang",
             "VSVisBufferCached");
     }
+
+    [Fact]
+    public void StreamCursorTotal()
+    {
+        string shaderPath = TestProjectPaths.ShaderPath("cluster_draw.slang");
+        string source = File.ReadAllText(shaderPath);
+
+        Assert.Contains("totalVertexCount = PageHeap.Load(pageOffset + 4u);", source);
+        Assert.Contains("ctx.totalVertexCount = totalVertexCount;", source);
+        Assert.DoesNotContain("ctx.totalVertexCount = vertexCount;", source);
+        Assert.DoesNotContain("VertexFetchArgs", source);
+    }
+
 }

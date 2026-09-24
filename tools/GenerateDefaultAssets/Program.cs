@@ -19,7 +19,20 @@ WriteGeneratedFile(
     Path.Combine(shadersDir, "generated", "instance_header_layout.slang"),
     InstanceHeaderLayout.SlangSource);
 
-using AssetDatabase assetDb = GeneratedAssetPipelineCatalog.CreateDatabase(projectRoot);
+using AssetDatabase assetDb = AssetCatalog.CreateDatabase(projectRoot);
+
+if (args.Contains("--stamp-vertex-layout-abi", StringComparer.Ordinal))
+{
+    Console.WriteLine("Shader vertex layout protocol metadata is authored on shader entries.");
+    return;
+}
+
+if (args.Contains("--reimport-icosphere", StringComparer.Ordinal))
+{
+    assetDb.Import("samples/IcoSphere.glb");
+    Console.WriteLine("Reimported samples/IcoSphere.glb.");
+    return;
+}
 
 AssetGuid defaultWhiteTextureGuid = GenerateDefault1x1Texture(assetDb, "default_white", PackRgba(255, 255, 255, 255));
 AssetGuid defaultNormalTextureGuid = GenerateDefault1x1Texture(
@@ -29,7 +42,7 @@ AssetGuid defaultNormalTextureGuid = GenerateDefault1x1Texture(
 );
 AssetGuid defaultArmTextureGuid = GenerateDefault1x1Texture(assetDb, "default_arm", PackRgba(255, 255, 255, 255));
 
-string[] clusterShaderSources =
+string[] shaderSources =
 [
     "bvh_patch.slang",
     "cluster_binning.slang",
@@ -38,17 +51,22 @@ string[] clusterShaderSources =
     "cluster_deform.slang",
     "cluster_deform_binning.slang",
     "cluster_draw.slang",
+    "cluster_motion_vectors.slang",
     "cluster_resolve.slang",
     "cluster_shade_binning.slang",
     "cluster_shade_material.slang",
     "cluster_shade_unlit.slang",
-    "debug_aabb.slang",
+    "debug_args_copy.slang",
+    "debug_sphere.slang",
     "depth_merge.slang",
     "hiz_build.slang",
+    "imgui.slang",
+    "post_tonemap.slang",
     "sw_raster.slang",
+    "temporal_resolve.slang",
 ];
 
-foreach (string shaderName in clusterShaderSources)
+foreach (string shaderName in shaderSources)
 {
     string shaderPath = Path.Combine(shadersDir, shaderName);
     if (File.Exists(shaderPath))
@@ -57,6 +75,7 @@ foreach (string shaderName in clusterShaderSources)
     }
 }
 
+GenerateClusterPipeline(assetDb, projectRoot);
 GenerateMaterialTemplate(
     assetDb,
     "DefaultPBR",
@@ -100,6 +119,7 @@ if (diagnostics.Any(static d => d.Severity == AssetDiagnosticSeverity.Error))
 Console.WriteLine($"Generated default texture assets in: {texturesDir}");
 Console.WriteLine($"Generated material templates in: {materialsDir}");
 Console.WriteLine($"Generated shader assets in: {shadersDir}");
+Console.WriteLine("Generated default render asset.");
 Console.WriteLine("Manifest updated successfully.");
 
 static string ResolveProjectRoot(string startPath)
@@ -196,7 +216,6 @@ static void GenerateMaterialTemplate(
                 new PassEntry
                 {
                     ShaderGuid = shadeShaderGuid.ToFlatString(),
-                    EntryPoint = shadeEntryPoint,
                     Tags = [new TagEntry { Name = "opaque" }],
                 },
                 new PassEntry
@@ -223,6 +242,12 @@ static void GenerateMaterialTemplate(
                         },
                     ],
                 },
+                new PassEntry
+                {
+                    ShaderGuid = deformShaderGuid.ToFlatString(),
+                    EntryPoint = "CSDeformCacheRequestWave",
+                    Tags = [new TagEntry { Name = "opaque" }],
+                },
             ],
             Textures = CreateDefaultTextureBindings(
                 defaultWhiteTextureGuid,
@@ -235,6 +260,48 @@ static void GenerateMaterialTemplate(
     );
     Console.WriteLine($"  Material: {outputPath}");
 }
+
+static void GenerateClusterPipeline(AssetDatabase assetDb, string projectRoot)
+{
+    const string outputPath = "assets/Pipelines/default_cluster.clusterrender.asset";
+    ClusterRenderAsset asset = new()
+    {
+        AssetGuid = ClusterRenderAssets.DefaultGuid.ToFlatString(),
+        Name = "DefaultCluster",
+        TemporalResolve = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/temporal_resolve.slang")),
+        ClusterBinning = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/cluster_binning.slang")),
+        ClusterBvhTraverse = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/cluster_bvh_traverse.slang")),
+        ClusterCull = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/cluster_cull.slang")),
+        ClusterDeformBinning = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/cluster_deform_binning.slang")),
+        ClusterDeform = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/cluster_deform.slang")),
+        ClusterDraw = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/cluster_draw.slang")),
+        ClusterMotionVectors = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/cluster_motion_vectors.slang")),
+        ClusterResolve = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/cluster_resolve.slang")),
+        ClusterShadeBinning = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/cluster_shade_binning.slang")),
+        DepthMerge = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/depth_merge.slang")),
+        HizBuild = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/hiz_build.slang")),
+        BvhPatch = ShaderRef(ResolveRequired(assetDb, "assets/Shaders/bvh_patch.slang")),
+    };
+
+    string fullPath = Path.Combine(projectRoot, outputPath.Replace('/', Path.DirectorySeparatorChar));
+    Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+    ClusterRenderCodec.Save(asset, fullPath);
+    var provider = new ClusterRenderProvider();
+    assetDb.Manifest.AddAsset(
+        ClusterRenderAssets.DefaultGuid,
+        asset.Name ?? "DefaultCluster",
+        outputPath,
+        nameof(ClusterRenderAsset),
+        dependencies: provider.GetDependencies(fullPath));
+    assetDb.Manifest.Save(Path.Combine(projectRoot, "Library", "AssetManifest"));
+    Console.WriteLine($"  ClusterPipeline: {outputPath}");
+}
+
+static ShaderAssetRef ShaderRef(AssetGuid shaderGuid)
+    => new()
+    {
+        ShaderGuid = shaderGuid.ToFlatString(),
+    };
 
 static AssetGuid ResolveRequired(AssetDatabase assetDb, string sourcePath) =>
     assetDb.Resolve(sourcePath)

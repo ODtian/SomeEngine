@@ -3,18 +3,18 @@ using System.Buffers.Binary;
 
 namespace SomeEngine.Render.Data;
 
-public enum GpuInstanceHeaderFieldType
+public enum HeaderFieldType
 {
     UInt32,
     Float32,
 }
 
 [AttributeUsage(AttributeTargets.Assembly, AllowMultiple = true)]
-public sealed class GpuInstanceHeaderFieldAttribute : Attribute
+public sealed class HeaderFieldAttribute : Attribute
 {
-    public GpuInstanceHeaderFieldAttribute(
+    public HeaderFieldAttribute(
         string csharpName,
-        GpuInstanceHeaderFieldType type,
+        HeaderFieldType type,
         int order)
     {
         CSharpName = csharpName;
@@ -23,16 +23,18 @@ public sealed class GpuInstanceHeaderFieldAttribute : Attribute
     }
 
     public string CSharpName { get; }
-    public GpuInstanceHeaderFieldType Type { get; }
+    public HeaderFieldType Type { get; }
     public int Order { get; }
     public string? SlangName { get; set; }
     public string? LoadFunctionSuffix { get; set; }
+    public string? InstanceMember { get; set; }
+    public bool Source { get; set; } = true;
 }
 
 [AttributeUsage(AttributeTargets.Assembly, AllowMultiple = true)]
-public sealed class GpuInstanceDataFlagAttribute : Attribute
+public sealed class InstanceFlagAttribute : Attribute
 {
-    public GpuInstanceDataFlagAttribute(string csharpName, int bit)
+    public InstanceFlagAttribute(string csharpName, int bit)
     {
         CSharpName = csharpName;
         Bit = bit;
@@ -45,45 +47,38 @@ public sealed class GpuInstanceDataFlagAttribute : Attribute
 
 public static partial class InstanceHeaderLayout
 {
-    public static uint ReadUInt32(ReadOnlySpan<byte> header, int byteOffset)
+    public static uint ReadU32(ReadOnlySpan<byte> header, int byteOffset)
         => BinaryPrimitives.ReadUInt32LittleEndian(header.Slice(byteOffset, sizeof(uint)));
 
     public static float ReadFloat32(ReadOnlySpan<byte> header, int byteOffset)
-        => BitConverter.UInt32BitsToSingle(ReadUInt32(header, byteOffset));
-}
+        => BitConverter.UInt32BitsToSingle(ReadU32(header, byteOffset));
 
-public ref struct InstanceHeaderWriter
-{
-    private readonly Span<byte> _header;
+    public static ReadOnlySpan<byte> Slice(ReadOnlySpan<byte> headers, int index)
+        => headers.Slice(
+            checked(index * StrideBytes),
+            StrideBytes);
 
-    public InstanceHeaderWriter(Span<byte> header)
+    public static Span<byte> Slice(Span<byte> headers, int index)
+        => headers.Slice(
+            checked(index * StrideBytes),
+            StrideBytes);
+
+    public static void Clear(Span<byte> header)
     {
-        if (header.Length < InstanceHeaderLayout.StrideBytes)
+        if (header.Length < StrideBytes)
             throw new ArgumentException("Instance header span is smaller than the generated layout stride.", nameof(header));
 
-        _header = header[..InstanceHeaderLayout.StrideBytes];
+        header[..StrideBytes].Clear();
     }
 
-    public void Clear() => _header.Clear();
+    public static void WriteU32(Span<byte> header, int byteOffset, uint value)
+    {
+        if (header.Length < StrideBytes)
+            throw new ArgumentException("Instance header span is smaller than the generated layout stride.", nameof(header));
 
-    public void SetUInt32(int byteOffset, uint value)
-        => BinaryPrimitives.WriteUInt32LittleEndian(_header.Slice(byteOffset, sizeof(uint)), value);
+        BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(byteOffset, sizeof(uint)), value);
+    }
 
-    public void SetFloat32(int byteOffset, float value)
-        => SetUInt32(byteOffset, BitConverter.SingleToUInt32Bits(value));
-
-    public void SetBvhRootIndex(uint value)
-        => SetUInt32(InstanceHeaderLayout.BVHRootIndex, value);
-
-    public void SetMaterialSlotOffset(uint value)
-        => SetUInt32(InstanceHeaderLayout.MaterialSlotOffset, value);
-
-    public void SetInstanceDataOffset(uint value)
-        => SetUInt32(InstanceHeaderLayout.InstanceDataOffset, value);
-
-    public void SetInstanceDataFlags(GpuInstanceDataFlags value)
-        => SetUInt32(InstanceHeaderLayout.InstanceDataFlags, (uint)value);
-
-    public void SetBoundsExpansionWorld(float value)
-        => SetFloat32(InstanceHeaderLayout.BoundsExpansionWorld, value);
+    public static void WriteFloat32(Span<byte> header, int byteOffset, float value)
+        => WriteU32(header, byteOffset, BitConverter.SingleToUInt32Bits(value));
 }

@@ -1,4 +1,4 @@
-# HiZ 2-Phase Culling Implementation Plan (Codebase Grounded)
+# HiZ 2-Phase Culling Implementation Notes (Codebase Grounded)
 
 目标：在当前 Cluster 渲染链路中落地 Two-Phase Occlusion Culling，优先复用已有 BVH/Compute/RenderGraph 架构，减少对现有流程（尤其是 `ClusterBVHTraversePass` 与 Page Streaming）的扰动。
 
@@ -52,9 +52,9 @@
 为了优雅地管理跨帧历史资源（如 `PrevHiZ`），将扩展当前 RenderGraph 的能力，仿照 Unreal RDG 的机制：
 
 1. **外部资源注册 (`RegisterExternalTexture`)**：
-   - 提供 API 将上一帧提取的 `ITexture` 导入到当前帧 RenderGraph，并返回 `RGTextureRef`，由 RenderGraph 追踪生命周期但避免在 Transient 池中分配。
+   - 提供 API 将上一帧提取的纹理导入到当前帧 RenderGraph，并返回 `RenderGraphHandle`，由 RenderGraph 追踪生命周期但避免在 transient 池中分配。
 2. **资源提取队列 (`QueueTextureExtraction`)**：
-   - 提供 API 请求从 Graph 提取内部的 `RGTextureRef` 对应的底层纹理。在 RenderGraph `Execute(...)` 结束后，将实际分配的 `ITexture` 取出，供下一帧使用。这部分纹理资源必须不被资源池销毁。
+   - 提供 API 请求从 Graph 提取内部的 `RenderGraphHandle` 对应底层纹理。在 RenderGraph `Execute(...)` 结束后，将实际分配的纹理取出，供下一帧使用。这部分纹理资源必须不被资源池销毁。
 3. **Pipeline 级别的历史句柄持有**：
    - `ClusterPipeline` 不再维护 `Prev` / `Curr` 两个纹理实例的手动 Ping-Pong。
    - 仅持有一个历史句柄：`ITexture _historyHiZTexture;`
@@ -202,8 +202,8 @@ Phase 分流：
 - `src/SomeEngine.Render/RenderGraph/RGResourceRegistry.cs`
 
 改造点：
-1. **注册接口**：提供 `RegisterExternalTexture(ITexture, string)`，返回一个特殊生命周期标记（如 `External`）的 `RGTextureRef`。这个资源在物理内存池中被豁免重新分配/释放。
-2. **提取接口**：提供 `QueueTextureExtraction(RGTextureRef, ref ITexture)`。内部维护一个委托队列或句柄列表。在 RenderGraph 的 `Execute()` 或者底层 Graph Compile 阶段的末尾，将 `RGTextureRef` 关联的底层 `ITexture` 回写给提供的引用。同时需确保此被提取的纹理脱离 Transient 资源池的管理，转为由 Pipeline (或用户) 管理。
+1. **注册接口**：通过 `ImportTexture` 导入外部纹理，返回一个 `RenderGraphHandle`。这个资源在物理内存池中被豁免重新分配/释放。
+2. **提取接口**：通过 `ExtractTexture(RenderGraphHandle, ResourceState, Action<TextureHandle, ResourceState>)` 提取当前帧结果。在 RenderGraph 的 `Execute()` 末尾，将 handle 关联的底层纹理交给调用方。同时需确保此被提取的纹理脱离 transient 资源池的管理，转为由 Pipeline 管理。
 
 ## 7. 风险与降级策略
 

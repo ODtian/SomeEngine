@@ -54,4 +54,4 @@ WorldTransform.Matrix → GPU GpuTransform buffer
 
 ## 和渲染管线的连接
 
-`ClusterUploadStage` 从 ECS 查询 `WorldTransform` + `MeshInstanceComponent`，构建 `GpuTransform[]` 和 `GpuInstanceHeader[]` 上传到 GPU。
+`RenderWorldExtractor` 写入 mesh/material handle 与 instance dirty state；`ClusterPipeline` 通过 `InstanceGpu` 和 `ClusterGpuResources` 上传实例/cluster 资源，再由 `ClusterSceneStage` 编排 BVH patch、traverse、cull pass。

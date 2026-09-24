@@ -14,8 +14,8 @@ Diligent Placed 资源 API 如下：
 
 | API | 说明 |
 |-----|------|
-| `GetTextureMemoryRequirements(desc)` &rarr; `MemoryRequirements` | 查询纹理所需内存大小和对齐 |
-| `GetBufferMemoryRequirements(desc)` &rarr; `MemoryRequirements` | 查询缓冲区所需内存大小和对齐 |
+| `GetTextureReqs(desc)` &rarr; `MemoryRequirements` | 查询纹理所需内存大小和对齐 |
+| `GetBufferReqs(desc)` &rarr; `MemoryRequirements` | 查询缓冲区所需内存大小和对齐 |
 | `CreateDeviceMemory(createInfo)` &rarr; `IDeviceMemory` | 创建设备内存堆（`DEVICE_MEMORY_TYPE_PLACED`） |
 | `CreatePlacedTexture(desc, memory, offset)` &rarr; `ITexture` | 在内存堆指定偏移处创建纹理 |
 | `CreatePlacedBuffer(desc, memory, offset)` &rarr; `IBuffer` | 在内存堆指定偏移处创建缓冲区 |
@@ -26,7 +26,7 @@ Diligent Placed 资源 API 如下：
 
 ### 1. 新建 `RGMemoryHeap` 类
 
-#### [NEW] [RGMemoryHeap.cs](file:///d:/SomeEngine/src/SomeEngine.Render/Graph/RGMemoryHeap.cs)
+#### [NEW] `src/SomeEngine.Render/Graph/RGMemoryHeap.cs`
 
 管理一块 `IDeviceMemory`，使用线性分配器 + 别名重叠支持。
 
@@ -61,7 +61,7 @@ public class RGMemoryHeap : IDisposable
 
 ### 2. 修改 `RGResource`
 
-#### [MODIFY] [RGResource.cs](file:///d:/SomeEngine/src/SomeEngine.Render/Graph/RGResource.cs)
+#### [MODIFY] `src/SomeEngine.Render/Graph/RGResource.cs`
 
 为 `RGResource` 添加内存别名元数据：
 
@@ -81,25 +81,25 @@ public class RGMemoryHeap : IDisposable
 
 ### 3. 修改 `RenderGraph.Compile()`
 
-#### [MODIFY] [RenderGraph.cs](file:///d:/SomeEngine/src/SomeEngine.Render/Graph/RenderGraph.cs)
+#### [MODIFY] `src/SomeEngine.Render/Graph/RenderGraph.cs`
 
 在现有的 **步骤5（计算资源生命周期）** 之后，新增 **步骤6：内存别名分配**。
 
 算法：
 1. 收集所有非 imported、有生命周期的 transient 资源
-2. 对每个 transient 资源，查询 `GetTextureMemoryRequirements` / `GetBufferMemoryRequirements` 获取 `MemoryRequirements`
+2. 对每个 transient 资源，查询 `GetTextureReqs` / `GetBufferReqs` 获取 `MemoryRequirements`
 3. 按 `Size` 降序排列（大资源优先分配，贪心策略）
 4. 对每个资源，在堆的时间线上查找一个可用的偏移区间，使得该区间在此资源的 `[FirstPassIndex, LastPassIndex]` 生命周期内不与其他已分配资源重叠
 5. 如果找不到合适位置，则扩展堆容量或创建新堆
 6. 记录每个资源的 `(HeapIndex, MemoryOffset)`
 
-> **注意**：因为 `GetTextureMemoryRequirements` 需要 `IRenderDevice`，而 `Compile()` 目前不接受 device 参数。需要修改 `Compile` 签名以接收 `IRenderDevice` 以实现 Placed 资源分配。
+> **注意**：因为 `GetTextureReqs` 需要 `IRenderDevice`，而 `Compile()` 目前不接受 device 参数。需要修改 `Compile` 签名以接收 `IRenderDevice` 以实现 Placed 资源分配。
 
 ---
 
 ### 4. 修改 `RenderGraph.Execute()`
 
-#### [MODIFY] [RenderGraph.cs](file:///d:/SomeEngine/src/SomeEngine.Render/Graph/RenderGraph.cs)
+#### [MODIFY] `src/SomeEngine.Render/Graph/RenderGraph.cs`
 
 修改 **步骤2.1（分配资源）**：
 
@@ -140,7 +140,7 @@ public class RGMemoryHeap : IDisposable
 
 ### 5. 修改 `RGResourcePool`（可选重构）
 
-#### [MODIFY] [RGResourcePool.cs](file:///d:/SomeEngine/src/SomeEngine.Render/Graph/RGResourcePool.cs)
+#### [MODIFY] `src/SomeEngine.Render/Graph/RGResourcePool.cs`
 
 保留现有池作为 Placed 资源不可用时的回退方案。不做大改动。
 
@@ -148,7 +148,7 @@ public class RGMemoryHeap : IDisposable
 
 ### 6. 新增单元测试
 
-#### [MODIFY] [RenderGraphTests.cs](file:///d:/SomeEngine/tests/SomeEngine.Tests/RenderGraphTests.cs)
+#### [MODIFY] `tests/SomeEngine.Tests/RenderGraphTests.cs`
 
 添加测试用例 `TestPlacedResourceAliasing`，验证：
 - 生命周期不重叠的两个同大小纹理被分配到同一偏移（完美别名）

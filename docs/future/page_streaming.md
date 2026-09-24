@@ -2,11 +2,11 @@
 
 ## 现状
 
-当前 `ClusterStreamer` + `ClusterResourceManager` 实现了基础的 page fault → readback → load → patch BVH 链路：
+当前 `PageFaults` + `PageStream` + `ClusterMeshes` 实现了基础的 page fault → readback → load → patch BVH 链路：
 
 1. **Shader 端**：BVH 遍历时，叶节点 `ChildPointer == 0xFFFFFFFF` 写入 `PageFaultBuffer`
 2. **Readback**：`ClusterBVHPageFaultCopyPass` 复制到 staging buffer，CPU 读取
-3. **CPU 处理**：`ClusterStreamer.EnqueueFaultNodes` → `Update` → `TryLoadPage` → upload + patch
+3. **CPU 处理**：`PageFaults.Read` → `PageStream.Push` → `Update` → `TryLoadPage` → upload + patch
 4. **Heap 管理**：64MB heap，first-fit 分配，LRU 驱逐
 
 ### 已验证可用
@@ -111,7 +111,7 @@ PageFaultBuffer.Store(4 + faultIndex * 8 + 4, instanceID);
 
 这样 CPU 端可以直接拿到 instance transform 计算距离优先级，不需要额外查表。
 
-> **Buffer 大小**：从 `4 + MaxPageFaults * 4` 增加到 `4 + MaxPageFaults * 8`
+> **Buffer 大小**：从 `4 + PageFaults.MaxCount * 4` 增加到 `4 + PageFaults.MaxCount * 8`
 
 ---
 

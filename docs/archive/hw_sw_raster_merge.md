@@ -14,7 +14,7 @@ SW raster 写 `DepthUAV`（R32_UINT），HiZ build 读真实 `depthTarget` → P
 | [cluster_binning.slang](file:///f:/SomeEngine/assets/Shaders/cluster_binning.slang) | 加 `PageHeap` 绑定 + `VRBDecoded` 解码器 + Count/Scatter 发射 per-VRB-batch entries |
 | [sw_raster.slang](file:///f:/SomeEngine/assets/Shaders/sw_raster.slang) | 删除 while 循环 → 单 pass，从 `binEntry.y` 读取 `[rangeStart, rangeEnd)` |
 | [ClusterBinningPass.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Pipelines/ClusterRender/ClusterBinningPass.cs) | `BindSRB` + Count/Scatter pass 加 `HPageHeap` |
-| [ClusterRasterBinStage.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Pipelines/ClusterRender/Stages/ClusterRasterBinStage.cs) | `AddPasses` 加 `hPageHeap` 参数 + buffer 增大 6x |
+| [RasterBinStage.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Pipelines/ClusterRender/Stages/RasterBinStage.cs) | `AddPasses` 加 `hPageHeap` 参数 + buffer 增大 6x |
 | [ClusterHiZStage.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Pipelines/ClusterRender/Stages/ClusterHiZStage.cs) | P1/P2 调用传入 `globals.PageHeap` |
 
 ### 2. Cull 阶段 SW/HW 分离
@@ -50,9 +50,9 @@ SW raster 写 `DepthUAV`（R32_UINT），HiZ build 读真实 `depthTarget` → P
 
 - `BinningUniforms` 增加 `SWCount` 和 `HWCount` 字段（从 DrawArgs 读取后 CPU 上传或在 Prepare shader 中写入）
 
-#### [MODIFY] [ClusterRasterBinStage.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Pipelines/ClusterRender/Stages/ClusterRasterBinStage.cs)
+#### [MODIFY] [RasterBinStage.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Pipelines/ClusterRender/Stages/RasterBinStage.cs)
 
-- `ClusterRasterBinOutput` 增加 `BinnedHWDrawArgs`（HW 部分的 DrawIndirect 参数）  
+- `RasterBinFrame` 增加 `BinnedHWDrawArgs`（HW 部分的 DrawIndirect 参数）  
 - 或：在 `RasterBinMeta` 中存储 `BinSWCount`/`BinHWCount`，dispatch 时分别引用
 
 ---

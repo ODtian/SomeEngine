@@ -83,7 +83,7 @@ At render extract time, the source authoring entity is expanded into RenderWorld
 Current runtime metadata:
 
 - `RenderSourceEntity`
-- `RenderMaterialSlotBinding`
+- `RenderMaterials`
 
 Current files:
 

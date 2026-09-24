@@ -11,11 +11,11 @@ public sealed class MaterialAssetProvider : AssetProvider<MaterialAsset>
             || assetPath.EndsWith(".mat.asset", StringComparison.OrdinalIgnoreCase);
 
     public override MaterialAsset Create(AssetGuid guid, string filePath)
-        => MaterialAssetSerializer.Load(filePath);
+        => MaterialAssetCodec.Load(filePath);
 
     public override IReadOnlyList<AssetGuid> GetDependencies(string filePath)
     {
-        MaterialAsset material = MaterialAssetSerializer.Load(filePath);
+        MaterialAsset material = MaterialAssetCodec.Load(filePath);
         var deps = new HashSet<AssetGuid>();
 
         if (material.Passes != null)

@@ -7,7 +7,7 @@
 当前围绕 `docs/design/asset_identity_and_source_tracking.md` 已经完成了一批基础设施：
 
 - `AssetGuid` / `SourceGuid`
-- `SourceMetaManager` / `AssetMetaManager`
+- `SourceMetaFiles` / `AssetMetaFiles`
 - `SlangShaderImporter` 的稳定 GUID 与依赖追踪
 - `IAssetResolver` / `MemoryAssetResolver` / `ManifestAssetResolver`
 - `AssetManifest` / `AssetManifestBuilder` / `AssetManifestScanner`
@@ -47,8 +47,8 @@
 - `AssetRef<T>`
 - `ImportTraceData`
 - `DependencyEntryData`
-- `SourceMetaManager`
-- `AssetMetaManager`
+- `SourceMetaFiles`
+- `AssetMetaFiles`
 
 #### 导入链
 - `SlangShaderImporter` 已支持：
@@ -136,8 +136,8 @@
 
 - `SourceGuid`
 - `AssetGuid`
-- `SourceMetaManager`
-- `AssetMetaManager`
+- `SourceMetaFiles`
+- `AssetMetaFiles`
 - `AssetManifest`
 - `AssetManifestScanner`
 - `AssetProjectValidator`
@@ -311,8 +311,8 @@ public sealed class AssetProblem
 ### 6.1 底层继续保留
 这些对象仍然是当前实现的基础，不建议删除：
 
-- `SourceMetaManager`
-- `AssetMetaManager`
+- `SourceMetaFiles`
+- `AssetMetaFiles`
 - `AssetManifest`
 - `AssetManifestBuilder`
 - `AssetManifestScanner`

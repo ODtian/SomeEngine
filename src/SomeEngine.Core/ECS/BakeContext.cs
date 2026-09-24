@@ -1,24 +1,25 @@
-using Friflo.Engine.ECS;
+using SomeECS.Core;
+using SomeECS.Core.Entities;
 
 namespace SomeEngine.Core.ECS;
 
 public sealed class BakeContext
 {
-    public BakeContext(EntityStore authoringStore, EntityStore runtimeStore)
+    public BakeContext(World authoringWorld, World runtimeWorld)
     {
-        ArgumentNullException.ThrowIfNull(authoringStore);
-        ArgumentNullException.ThrowIfNull(runtimeStore);
+        ArgumentNullException.ThrowIfNull(authoringWorld);
+        ArgumentNullException.ThrowIfNull(runtimeWorld);
 
-        AuthoringStore = authoringStore;
-        RuntimeStore = runtimeStore;
+        AuthoringWorld = authoringWorld;
+        RuntimeWorld = runtimeWorld;
     }
 
-    public EntityStore AuthoringStore { get; }
+    public World AuthoringWorld { get; }
 
-    public EntityStore RuntimeStore { get; }
+    public World RuntimeWorld { get; }
 
-    public Entity CreateRuntimeEntity()
+    public EntityId CreateRuntimeEntity()
     {
-        return RuntimeStore.CreateEntity();
+        return RuntimeWorld.CreateEntity();
     }
 }

@@ -7,7 +7,7 @@ namespace SomeEngine.Assets.Importers;
 
 public sealed class SlangSourceImporter : IAssetImporter
 {
-    private static readonly string[] Extensions = [".slang", ".hlsl"];
+    private static readonly string[] Extensions = [".slang"];
 
     public string ImporterName => nameof(SlangShaderImporter);
     public IReadOnlyList<string> SourceExtensions => Extensions;
@@ -21,17 +21,17 @@ public sealed class SlangSourceImporter : IAssetImporter
             ? Path.GetFullPath(sourcePath)
             : Path.GetFullPath(Path.Combine(projectRoot, sourcePath));
         string outputPath = Path.ChangeExtension(fullPath, ".shader.asset");
-        AssetMeta? existingAsset = AssetMetaManager.TryLoad(outputPath);
+        AssetMeta? existingAsset = AssetMetaFiles.TryLoad(outputPath);
         if (existingAsset == null)
         {
             return null;
         }
 
-        return SlangShaderImporter.TryComputeCurrentFingerprint(
+        return SlangDeps.Refresh(
                 existingAsset.Dependencies,
                 projectRoot,
                 SlangShaderImporter.ImporterVersion)
-            ?? SlangShaderImporter.TryComputeCurrentFingerprint(
+            ?? SlangDeps.Refresh(
                 existingAsset.Dependencies,
                 Path.GetDirectoryName(fullPath) ?? projectRoot,
                 SlangShaderImporter.ImporterVersion);
@@ -42,9 +42,9 @@ public sealed class SlangSourceImporter : IAssetImporter
         string fullPath = Path.IsPathRooted(sourcePath)
             ? Path.GetFullPath(sourcePath)
             : Path.GetFullPath(Path.Combine(projectRoot, sourcePath));
-        SourceMeta sourceMeta = SourceMetaManager.GetOrCreate(fullPath, ImporterName);
+        SourceMeta sourceMeta = SourceMetaFiles.GetOrCreate(fullPath, ImporterName);
         string outputPath = Path.ChangeExtension(fullPath, ".shader.asset");
-        ShaderAsset asset = SlangShaderImporter.Import(fullPath, sourceMeta, AssetMetaManager.TryLoad(outputPath));
+        ShaderAsset asset = SlangShaderImporter.Import(fullPath, sourceMeta, AssetMetaFiles.TryLoad(outputPath));
         return AssetGuid.TryParse(asset.AssetGuid, out AssetGuid guid) && !guid.IsEmpty
             ? [new ImportedAsset(asset, "shader:main", outputPath)]
             : [];

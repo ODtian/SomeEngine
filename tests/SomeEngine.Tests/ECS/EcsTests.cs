@@ -1,9 +1,9 @@
+using System.Numerics;
 using SomeEngine.Core.ECS;
 using SomeEngine.Core.ECS.Components;
-using SomeEngine.Core.ECS.Systems;
 using SomeEngine.Core.Math;
-using System.Numerics;
-using Friflo.Engine.ECS;
+using SomeECS.Core.Entities;
+using SomeECS.Core.Hierarchy;
 
 namespace SomeEngine.Tests.ECS;
 
@@ -12,73 +12,57 @@ public class EcsTests
     [Fact]
     public void TestTransformHierarchy()
     {
-        var world = new GameWorld();
-        // Systems are initialized in GameWorld constructor
+        var gameWorld = new GameWorld();
 
-        // Root
-        var root = world.EntityStore.CreateEntity();
-        root.AddComponent(new LocalTransform
+        EntityId root = gameWorld.World.CreateEntity();
+        gameWorld.World.Add(root, new LocalTransform
         {
-            Value = new TransformQvvs(new Vector3(10, 0, 0), Quaternion.Identity)
+            Value = new TransformQvvs(new Vector3(10, 0, 0), Quaternion.Identity),
         });
-        root.AddComponent(new WorldTransform());
+        gameWorld.World.Add(root, new WorldTransform());
 
-        // Child
-        var child = world.EntityStore.CreateEntity();
-        child.AddComponent(new LocalTransform
+        EntityId child = gameWorld.World.CreateEntity();
+        gameWorld.World.Add(child, new LocalTransform
         {
-            Value = new TransformQvvs(new Vector3(0, 5, 0), Quaternion.Identity)
+            Value = new TransformQvvs(new Vector3(0, 5, 0), Quaternion.Identity),
         });
-        child.AddComponent(new WorldTransform());
+        gameWorld.World.Add(child, new WorldTransform());
 
-        // Add child to root
-        root.AddChild(child);
-        // child.AddComponent(new Parent { Value = root });
+        OrderedHierarchy.Attach(gameWorld.World, child, root);
+        gameWorld.Update(0);
 
-        // Run systems via World
-        world.Update(0);
-
-        // Check Root
-        var rootWorld = root.GetComponent<WorldTransform>();
+        var rootWorld = gameWorld.World.Read<WorldTransform>(root);
         Assert.Equal(new Vector3(10, 0, 0), rootWorld.Qvvs.Position);
 
-        // Check Child
-        var childWorld = child.GetComponent<WorldTransform>();
-        // Child local (0,5,0) + Parent (10,0,0) = (10,5,0) (No rotation)
+        var childWorld = gameWorld.World.Read<WorldTransform>(child);
         Assert.Equal(new Vector3(10, 5, 0), childWorld.Qvvs.Position);
     }
 
     [Fact]
     public void TestRotationHierarchy()
     {
-        var world = new GameWorld();
-        // Systems are initialized in GameWorld constructor
+        var gameWorld = new GameWorld();
 
-        // Root at (0,0,0), Rotated 90 deg around Y
         var rotation90Y = Quaternion.CreateFromAxisAngle(Vector3.UnitY, MathF.PI / 2.0f);
-        var root = world.EntityStore.CreateEntity();
-        root.AddComponent(new LocalTransform
+        EntityId root = gameWorld.World.CreateEntity();
+        gameWorld.World.Add(root, new LocalTransform
         {
-            Value = new TransformQvvs(Vector3.Zero, rotation90Y)
+            Value = new TransformQvvs(Vector3.Zero, rotation90Y),
         });
-        root.AddComponent(new WorldTransform());
+        gameWorld.World.Add(root, new WorldTransform());
 
-        // Child at (1,0,0) local. 
-        var child = world.EntityStore.CreateEntity();
-        child.AddComponent(new LocalTransform
+        EntityId child = gameWorld.World.CreateEntity();
+        gameWorld.World.Add(child, new LocalTransform
         {
-            Value = new TransformQvvs(new Vector3(1, 0, 0), Quaternion.Identity)
+            Value = new TransformQvvs(new Vector3(1, 0, 0), Quaternion.Identity),
         });
-        child.AddComponent(new WorldTransform());
+        gameWorld.World.Add(child, new WorldTransform());
 
-        root.AddChild(child);
-        // child.AddComponent(new Parent { Value = root });
+        OrderedHierarchy.Attach(gameWorld.World, child, root);
+        gameWorld.Update(0);
 
-        world.Update(0);
+        var childWorld = gameWorld.World.Read<WorldTransform>(child);
 
-        var childWorld = child.GetComponent<WorldTransform>();
-
-        // Allow some float error
         Assert.InRange(childWorld.Qvvs.Position.X, 0 - 1e-5, 0 + 1e-5);
         Assert.InRange(childWorld.Qvvs.Position.Y, 0 - 1e-5, 0 + 1e-5);
         Assert.InRange(childWorld.Qvvs.Position.Z, -1 - 1e-5, -1 + 1e-5);

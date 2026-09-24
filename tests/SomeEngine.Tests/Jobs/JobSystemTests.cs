@@ -1,4 +1,4 @@
-using SomeEngine.Core.Jobs;
+using SomeJob;
 using System.Threading;
 
 namespace SomeEngine.Tests.Jobs;
@@ -24,7 +24,7 @@ public class JobSystemTests
         var job = new SimpleJob();
         var handle = JobSystem.Schedule(job);
 
-        JobSystem.Return(handle);
+        handle.Complete();
 
         Assert.Equal(1, SimpleJob.ExecutedCount);
     }
@@ -60,8 +60,8 @@ public class JobSystemTests
         var handle1 = JobSystem.Schedule(job1);
         var handle2 = JobSystem.Schedule(job2, handle1);
 
-        JobSystem.Return(handle2);
-        JobSystem.Return(handle1);
+        handle2.Complete();
+        handle1.Complete();
 
         Assert.Equal(2, DependencyJob.Step);
     }
@@ -83,9 +83,9 @@ public class JobSystemTests
         ParallelJob.Data = new int[count];
 
         var job = new ParallelJob();
-        var handle = JobSystem.Dispatch(job, count, 10);
+        var handle = JobSystem.ScheduleParallel(job, count, 10);
 
-        JobSystem.Return(handle);
+        handle.Complete();
 
         for (int i = 0; i < count; i++)
         {
@@ -105,7 +105,7 @@ public class JobSystemTests
             {
                 var child = new RecursiveJob { Depth = Depth - 1 };
                 var handle = JobSystem.Schedule(child);
-                JobSystem.Return(handle); // This will block/wait recursively
+                handle.Complete();
             }
         }
     }
@@ -118,7 +118,7 @@ public class JobSystemTests
 
         var rootJob = new RecursiveJob { Depth = depth };
         var handle = JobSystem.Schedule(rootJob);
-        JobSystem.Return(handle);
+        handle.Complete();
 
         // Depth 10 -> 10, 9, 8... 0 = 11 jobs
         Assert.Equal(depth + 1, RecursiveJob.TotalExecuted);

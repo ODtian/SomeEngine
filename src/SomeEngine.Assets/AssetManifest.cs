@@ -84,11 +84,11 @@ public sealed class AssetManifest
         _referencers = null;
     }
 
-    public bool TryGetSourcePath(SourceGuid guid, out string path) => _sources.TryGetValue(guid, out path!);
+    public bool TrySourcePath(SourceGuid guid, out string path) => _sources.TryGetValue(guid, out path!);
     public bool TryGetAsset(AssetGuid guid, out AssetManifestRecord record) => _assets.TryGetValue(guid, out record);
-    public bool TryGetSourceGuid(string path, out SourceGuid guid) => _sourceGuidsByPath.TryGetValue(AssetIoHelpers.NormalizePath(path), out guid);
+    public bool TrySourceGuid(string path, out SourceGuid guid) => _sourceGuidsByPath.TryGetValue(AssetIoHelpers.NormalizePath(path), out guid);
 
-    public bool TryGetAssetByPath(string path, out AssetManifestRecord record)
+    public bool TryAssetPath(string path, out AssetManifestRecord record)
     {
         if (_assetGuidsByPath.TryGetValue(AssetIoHelpers.NormalizePath(path), out AssetGuid guid) && _assets.TryGetValue(guid, out record))
         {
@@ -99,7 +99,7 @@ public sealed class AssetManifest
         return false;
     }
 
-    public bool TryGetAssetBySourceAndSubAssetKey(SourceGuid sourceGuid, string subAssetKey, out AssetManifestRecord record)
+    public bool TrySourceAsset(SourceGuid sourceGuid, string subAssetKey, out AssetManifestRecord record)
     {
         EnsureIndexes();
         record = default;
@@ -120,7 +120,7 @@ public sealed class AssetManifest
         return false;
     }
 
-    public IReadOnlyList<AssetGuid> GetAssetsBySource(SourceGuid sourceGuid)
+    public IReadOnlyList<AssetGuid> AssetsBySource(SourceGuid sourceGuid)
     {
         EnsureIndexes();
         return _assetsBySource!.TryGetValue(sourceGuid, out IReadOnlyList<AssetGuid>? values) ? values : [];
@@ -146,7 +146,7 @@ public sealed class AssetManifest
         Directory.CreateDirectory(manifestDirectory = Path.GetFullPath(manifestDirectory));
         File.WriteAllText(Path.Combine(manifestDirectory, SourceIndexFileName), JsonSerializer.Serialize(new SourceIndexDocument
         {
-            Sources = _sources.OrderBy(static pair => pair.Key.ToString(), StringComparer.Ordinal).Select(static pair => new SourceIndexEntryDocument
+            Sources = _sources.OrderBy(static pair => pair.Key.ToString(), StringComparer.Ordinal).Select(static pair => new SourceEntryDoc
             {
                 SourceGuid = pair.Key.ToFlatString(),
                 Path = pair.Value,
@@ -154,7 +154,7 @@ public sealed class AssetManifest
         }, AssetIoHelpers.JsonOptions));
         File.WriteAllText(Path.Combine(manifestDirectory, AssetIndexFileName), JsonSerializer.Serialize(new AssetIndexDocument
         {
-            Assets = _assets.Values.OrderBy(static record => record.Guid.ToString(), StringComparer.Ordinal).Select(static record => new AssetIndexEntryDocument
+            Assets = _assets.Values.OrderBy(static record => record.Guid.ToString(), StringComparer.Ordinal).Select(static record => new AssetEntryDoc
             {
                 AssetGuid = record.Guid.ToFlatString(),
                 Name = record.Name,
@@ -166,7 +166,7 @@ public sealed class AssetManifest
         }, AssetIoHelpers.JsonOptions));
         File.WriteAllText(Path.Combine(manifestDirectory, DependencyGraphFileName), JsonSerializer.Serialize(new DependencyGraphDocument
         {
-            Assets = _dependencies.OrderBy(static pair => pair.Key.ToString(), StringComparer.Ordinal).Select(static pair => new DependencyGraphEntryDocument
+            Assets = _dependencies.OrderBy(static pair => pair.Key.ToString(), StringComparer.Ordinal).Select(static pair => new DepEntryDoc
             {
                 AssetGuid = pair.Key.ToFlatString(),
                 Dependencies = pair.Value.Select(static guid => guid.ToFlatString()).ToList(),
@@ -180,7 +180,7 @@ public sealed class AssetManifest
         AssetManifest manifest = new();
 
         SourceIndexDocument sourceIndex = ReadDocument<SourceIndexDocument>(Path.Combine(manifestDirectory, SourceIndexFileName));
-        foreach (SourceIndexEntryDocument entry in sourceIndex.Sources)
+        foreach (SourceEntryDoc entry in sourceIndex.Sources)
         {
             if (SourceGuid.TryParse(entry.SourceGuid, out SourceGuid guid))
             {
@@ -190,7 +190,7 @@ public sealed class AssetManifest
 
         Dictionary<AssetGuid, IReadOnlyList<AssetGuid>> dependencies = [];
         DependencyGraphDocument dependencyGraph = ReadDocument<DependencyGraphDocument>(Path.Combine(manifestDirectory, DependencyGraphFileName));
-        foreach (DependencyGraphEntryDocument entry in dependencyGraph.Assets)
+        foreach (DepEntryDoc entry in dependencyGraph.Assets)
         {
             if (!AssetGuid.TryParse(entry.AssetGuid, out AssetGuid guid))
             {
@@ -206,7 +206,7 @@ public sealed class AssetManifest
         }
 
         AssetIndexDocument assetIndex = ReadDocument<AssetIndexDocument>(Path.Combine(manifestDirectory, AssetIndexFileName));
-        foreach (AssetIndexEntryDocument entry in assetIndex.Assets)
+        foreach (AssetEntryDoc entry in assetIndex.Assets)
         {
             if (!AssetGuid.TryParse(entry.AssetGuid, out AssetGuid guid))
             {
@@ -282,10 +282,10 @@ public sealed class AssetManifest
 
     private sealed class SourceIndexDocument
     {
-        public List<SourceIndexEntryDocument> Sources { get; set; } = [];
+        public List<SourceEntryDoc> Sources { get; set; } = [];
     }
 
-    private sealed class SourceIndexEntryDocument
+    private sealed class SourceEntryDoc
     {
         public string SourceGuid { get; set; } = string.Empty;
         public string Path { get; set; } = string.Empty;
@@ -293,10 +293,10 @@ public sealed class AssetManifest
 
     private sealed class AssetIndexDocument
     {
-        public List<AssetIndexEntryDocument> Assets { get; set; } = [];
+        public List<AssetEntryDoc> Assets { get; set; } = [];
     }
 
-    private sealed class AssetIndexEntryDocument
+    private sealed class AssetEntryDoc
     {
         public string AssetGuid { get; set; } = string.Empty;
         public string Name { get; set; } = string.Empty;
@@ -308,10 +308,10 @@ public sealed class AssetManifest
 
     private sealed class DependencyGraphDocument
     {
-        public List<DependencyGraphEntryDocument> Assets { get; set; } = [];
+        public List<DepEntryDoc> Assets { get; set; } = [];
     }
 
-    private sealed class DependencyGraphEntryDocument
+    private sealed class DepEntryDoc
     {
         public string AssetGuid { get; set; } = string.Empty;
         public List<string> Dependencies { get; set; } = [];

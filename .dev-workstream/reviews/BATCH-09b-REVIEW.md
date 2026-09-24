@@ -31,12 +31,12 @@ Passed: 147, Failed: 0, Skipped: 0
 ```
 
 ```text
-dotnet test ... --filter "FullyQualifiedName~RenderWorld|FullyQualifiedName~ClusterMaterialSlotPreparer|FullyQualifiedName~ClusterPipelineQueryCache|FullyQualifiedName~LoaderDelegateIntegration"
+dotnet test ... --filter "FullyQualifiedName~RenderWorld|FullyQualifiedName~SlotPreparer|FullyQualifiedName~ClusterPipelineQueryCache|FullyQualifiedName~LoaderDelegateIntegration"
 Passed: 11, Failed: 0
 ```
 
 ```text
-dotnet test ... --filter "FullyQualifiedName~RenderWorldExtractorTests.Rebuild_SteadyState_DoesNotAllocateManagedMemory|FullyQualifiedName~ClusterMaterialSlotPreparerTests.Prepare_SteadyState_DoesNotAllocateManagedMemory"
+dotnet test ... --filter "FullyQualifiedName~RenderWorldExtractorTests.Rebuild_SteadyState_DoesNotAllocateManagedMemory|FullyQualifiedName~SlotPreparerTests.Prepare_SteadyState_DoesNotAllocateManagedMemory"
 Passed: 2, Failed: 0
 ```
 
@@ -46,7 +46,7 @@ Passed: 2, Failed: 0
 
 ## Residual Risks
 
-1. `ClusterMaterialSlotPreparer` 目前采用线性扫描 source cache 与 RenderWorld pass buffer；steady-state 无 GC 已验证，但在更大规模场景下仍需继续观察 CPU 成本。
+1. `SlotPreparer` 目前采用线性扫描 source cache 与 RenderWorld pass buffer；steady-state 无 GC 已验证，但在更大规模场景下仍需继续观察 CPU 成本。
 2. `Runtime Program.cs` 仍有既有可空 warning，没有在本批顺手清理。
 3. 历史工件 `BATCH-09-INSTRUCTIONS.md` 与 `BATCH-09-REPORT.md` 保留了上一阶段的叙述，这是刻意保留历史记录，不代表当前架构状态。
 

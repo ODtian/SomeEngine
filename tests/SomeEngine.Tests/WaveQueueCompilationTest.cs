@@ -12,8 +12,9 @@ public class WaveQueueCompilationTest
     {
         // Inline Slang source that includes wave_queue.slang and implements a trivial IWaveTask.
         // Each lane "produces" 1 task that writes lane index to a UAV buffer.
-        string source = """
-            #include "wave_queue.slang"
+        string waveQueuePath = TestProjectPaths.ShaderPath("wave_queue.slang").Replace('\\', '/');
+        string source = $$"""
+            #include "{{waveQueuePath}}"
 
             RWStructuredBuffer<uint> OutputBuffer;
 
@@ -42,14 +43,9 @@ public class WaveQueueCompilationTest
             }
         """;
 
-        // Write to the same directory as wave_queue.slang so #include resolves.
-        // TestDirectory = tests/SomeEngine.Tests/bin/x64/Debug/net10.0/
-        // Need to go up 6 levels to reach project root, then into assets/Shaders
-        string shaderDir = Path.GetFullPath(Path.Combine(
-            AppContext.BaseDirectory,
-            "..", "..", "..", "..", "..", "..", "assets", "Shaders"));
-
-        string slangFile = Path.Combine(shaderDir, "_test_wave_queue_trivial.slang");
+        string tempDir = Path.Combine(Path.GetTempPath(), "SomeEngine.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        string slangFile = Path.Combine(tempDir, "wave_queue_trivial.slang");
         File.WriteAllText(slangFile, source);
 
         try
@@ -83,14 +79,8 @@ public class WaveQueueCompilationTest
         }
         finally
         {
-            if (File.Exists(slangFile)) File.Delete(slangFile);
-            // Also clean up generated .asset and meta files
-            string assetFile = Path.ChangeExtension(slangFile, ".shader.asset");
-            if (File.Exists(assetFile)) File.Delete(assetFile);
-            string assetMetaFile = assetFile + ".meta";
-            if (File.Exists(assetMetaFile)) File.Delete(assetMetaFile);
-            string sourceMetaFile = SourceMetaManager.GetMetaPath(slangFile);
-            if (File.Exists(sourceMetaFile)) File.Delete(sourceMetaFile);
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
         }
     }
 }

@@ -45,10 +45,7 @@ public class IcoSphereTest
         Assert.Equal("TEXCOORD_0", meshAsset.Attributes[2].Name);
 
         // Save to disk for engine to use
-        string outputPath = Path.Combine(
-            Directory.GetCurrentDirectory(),
-            "../../../../../../samples/IcoSphere.mesh"
-        );
+        string outputPath = Path.Combine(TestProjectPaths.ProjectRoot(), "samples", "IcoSphere.mesh");
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
         using var fs = File.Create(outputPath);
@@ -111,10 +108,7 @@ public class IcoSphereTest
         var scene = new SceneBuilder();
         scene.AddRigidMesh(mesh, System.Numerics.Matrix4x4.Identity);
 
-        string outputPath = Path.Combine(
-            Directory.GetCurrentDirectory(),
-            "../../../../../../samples/IcoSphere.glb"
-        );
+        string outputPath = Path.Combine(TestProjectPaths.ProjectRoot(), "samples", "IcoSphere.glb");
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
         scene.ToGltf2().SaveGLB(outputPath);

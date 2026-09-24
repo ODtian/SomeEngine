@@ -1,86 +1,192 @@
-# Cluster Rendering Pipeline 设计文档
+# Cluster Pipeline 设计指南
 
-> 合并自 `plan_cluster_rendering.md`、`instance_plan.md`、`cluster_bvh_culling.md`。
->
-> **核心管线状态：✅ 已实施**
+> 当前有效方向：删除旧 `ClusterPipelineStateSet`、旧 slot/bin 公共框架、旧 bind set cache、dispatch table 和 cluster baker。保留全局 PipelineCache / BindSet owner，保留 SlotBuffer 和 binning 算法，但它们归 cluster pipeline 内部派生数据所有。
 
----
+## 作废内容
 
-## 1. 架构总览
+以下旧 cluster pipeline 内容不可作为实现依据：
 
-GPU-Driven Cluster Rendering，核心流程：
+- `ClusterPipelineStateSet` / `ClusterPipelineStateSlice` / PipelineState slice lifecycle。
+- 旧 `PipelineStateCache` 耦合路径。
+- `BindRecipe` / `BindRole` / 旧 binding set cache / SRB pool。
+- `SlotStage` / `SlotTable` / `SlotPreparer` / `SlotCache` 作为公共 slot 体系。
+- `BinSpace` / `BinQueue` / `ClusterBinTable` 作为跨 pipeline 公共框架。
+- `MaterialSlotBind`。
+- `MaterialSlotOffset` 写回 `RenderWorld` source state 的协议。
+- `VertexLayoutReq` / opaque vertex layout blob。
+- `ClusterBakers` / `ClusterShaderBaker` / `ClusterComponentBaker` / `ClusterPassRules` / `ClusterPassCopy`。
 
-```
-Upload Globals → BVH Traverse → 2-Phase HiZ Cull → DeformBin → RasterBin → SW/HW Draw → DepthMerge → HiZ Build → ShadeBin → MaterialShade
-```
+这些概念不能改名保留。
 
-### 三层架构
+## 保留逻辑
 
-| 层级 | 实例 | 职责 |
-|------|------|------|
-| **RenderPass** | `ClusterCullPass`, `ClusterSWRasterPass` 等 | GPU 命令，barrier 由 RG 管理 |
-| **Stage（静态函数）** | `ClusterCull.AddPasses`, `ClusterSWDraw.AddPasses` 等 | 编排 Pass + 创建 RG 资源 |
-| **Feature / Pipeline** | `ClusterPipeline` | 组合 Stage，管理跨帧资源 |
+旧类删除不等于算法删除。cluster 仍需要这些逻辑：
 
-### 已实现的 9 个 Stage
+- SlotBuffer 作为 GPU index table。
+- slot offset 分配。
+- slot dirty range。
+- SlotBuffer upload。
+- field 布局。
+- 按 signature 分组。
+- bin index。
+- args bin map。
+- count / reserve / scatter。
+- bin counts。
+- bin offsets。
+- indirect args。
 
-| Stage 类 | 职责 |
-|---------|------|
-| `ClusterUploadStage` | 上传实例变换、Uniform buffer |
-| `ClusterTraverseStage` | BVH 遍历，输出 Candidates |
-| `ClusterCullStage` | 视锥+遮挡剔除，SW/HW 分流 |
-| `ClusterDeformBinStage` | 可变形 Cluster 的 Vertex Eval Binning |
-| `ClusterRasterBinStage` | 光栅化 Binning（4-pass: Init/Count/Reserve/Scatter） |
-| `ClusterDrawStage` | HW 光栅化（VS/PS，DrawIndirect） |
-| `ClusterSWDrawStage` | SW 光栅化（CS，VRB+WaveQueue） |
-| `ClusterHiZStage` | 2-Phase HiZ 全流程编排 |
-| `ClusterShade` | 着色 Binning (Count/Reserve/Scatter) + 材质着色 Dispatch，静态编排器 |
+这些逻辑全部归 cluster pipeline 内部，不进入 `RenderWorld`，不进入 `Material`，不进入 `MaterialPass`。
 
----
+## 新边界
 
-## 2. 数据结构
+Cluster pipeline 只保留真实 GPU 算法边界：
 
-### GPU Page Layout
-
-```
-[ Page Header ] → ClusterCount, 各 Stream 字节偏移
-[ Cluster List ] → GPUCluster (64B): IntBase/PackedCenterXY/LODCenter/LODRadius/PackedCenterZRadius/LODErrorHalf/VertexStart/TriangleStart/GroupId/PackedCounts/PackedMaterials/PackedRanges/MaterialTableOffset/VRBBatchInfo
-[ Position Stream ] → uint16×3 量化
-[ Attribute Stream ] → OctNormal + UV
-[ Index Stream ] → u8/u16
-```
-
-### 实例数据（✅ 已实施）
-
-| Buffer | 内容 |
-|--------|------|
-| `StructuredBuffer<GpuTransform>` | QVVS 变换矩阵（per-instance） |
-| `StructuredBuffer<GpuInstanceHeader>` | BVHRootIndex + MaterialSlotOffset + MetadataOffset + MetadataCount + BoundsExpansion |
-
-### VisibleClusters 双端布局
-
-```
-← swCount →              ← hwCount →
-[ SW₀ SW₁ ... SWₙ |  ... gap ...  | HWₘ ... HW₁ HW₀ ]
+```text
+Upload
+Traverse
+Cull
+Raster
+Shade
+Resolve
+Temporal
 ```
 
----
+边界之间通过显式 output record 传递 graph handle。材质、shader entry、render state 从 `RenderWorld + AssetStore + MaterialPass` 读取，不再经旧 slot/bin/dispatch，也不经 cluster baker 私有组件。
 
-## 3. BVH 遍历与剔除
+## RenderWorld 输入
 
-- **BVH Traverse**：当前实现为队列驱动（双缓冲 queueA/queueB 交替 dispatch），计划支持 Persistent Thread 模型作为双架构
-- **LOD 选择**：`Error_self ≤ Threshold && Error_parent > Threshold`
-- **Page Fault 反馈**：`ChildPointer == 0xFFFFFFFF` 时通过 `InterlockedAdd` 写入 `PageFaultBuffer`
-- **Frustum Culling**：在 BVH 节点和 Cluster 两级执行
-- **2-Phase HiZ Occlusion Culling**：
-  - Phase 1：用上帧 HiZ 保守剔除
-  - Phase 1 后 HiZ Build
-  - Phase 2：用当前帧 HiZ 补测
+`RenderWorld` 提供权威 CPU 对象状态：
 
----
+- instance。
+- transform。
+- mesh handle。
+- material handle。
+- dirty flags。
 
-## 4. 待完成
+`RenderWorld` 不提供：
 
-- [ ] Instance-level sparse grid 空间索引（加速实例级剔除）
-- [ ] 运行时 Page 流式加载管理（`ClusterStreamer` 框架已有，Page 管理待完善）
-- [ ] Phase 3-4 of `instance_plan.md`：流式加载 + 泛型 Metadata 属性解耦
+- PipelineState key。
+- BindSet key。
+- `PipelineHandle`。
+- `BindingSetHandle`。
+- slot/bin。
+- material slot offset。
+- dispatch table。
+- `VertexLayoutReq`。
+- `MaterialSlotBind`。
+- cluster-specific baker output。
+- material pass entity。
+- shader entry fact。
+
+## Asset 输入
+
+Cluster pipeline 通过 `Handle<T>` 从 `AssetStore` 聚合入口读取运行时 asset；实际每个 runtime asset 类型由同一个泛型实现 `AssetStore<T>` 管 id + generation 生命周期：
+
+- `Handle<Material>`。
+- `MaterialPass`。
+- `Handle<Shader>`。
+- mesh data。
+- shader metadata。
+
+fbs 和 guid 不进入 cluster 热路径。
+
+## Material 契约
+
+Material / cluster target / RHI state 的命名结论见 [Cluster Material Contract](cluster_material_contract.md)。
+
+当前有效结论：
+
+- `MaterialPass.Pipeline` 改为 `MaterialPass.Target`。
+- `MaterialPass.Entry` 改为 `MaterialPass.EntryPoint`。
+- `PipelineState` 改为 `MaterialState`。
+- `ClusterPipes` 删除，target parsing 收回 `MaterialItems`。
+- `ShaderVariantRef` 改为 runtime `PassShader`。
+- `ClusterItem` 改为 `MaterialItem`。
+- `ClusterBatch` 改为 `MaterialBin`。
+- `ClusterBatches` 改为 `MaterialItems`。
+- `ClusterDispatch` / `ClusterDispatches` 删除。
+
+`MaterialPass.Target` 是通用 material 字符串目标，不是 cluster enum。cluster 只在 `MaterialItems` 的私有 target 解析中解释 `cluster.*` target。forward、shadow、deferred 等路径可以有自己的 target 命名空间，不回灌到 `MaterialPass`。
+
+## SlotBuffer
+
+Cluster 可以持有自己的 SlotBuffer。SlotBuffer 是 pipeline 内部 GPU 查询表：
+
+```text
+slot offset + local index + field -> bin / shader / material group
+```
+
+field 布局由 cluster pipeline 固定。例如：
+
+```text
+field 0 = raster
+field 1 = shade
+field 2 = deform
+```
+
+slot offset 进入 cluster 自己上传的 instance header，不写回 `RenderWorld` component。
+
+SlotBuffer 存紧凑 index，不存 entity、material guid 或 shader object。
+
+## Bin
+
+Cluster bin 是 pipeline 内部分组结果，不是跨 pipeline API。
+
+bin 逻辑：
+
+```text
+MaterialPass / PipelineState / BindSet / order
+  -> 完整 signature
+  -> bin index
+  -> SlotBuffer field value
+  -> GPU count/reserve/scatter
+```
+
+hash 只能用于 bucket，命中必须走完整 equality。
+
+## PipelineState
+
+Cluster pass 不使用旧 `ClusterPipelineStateSet` 或 dispatch table。
+
+Cluster pass 通过全局 PipelineCache 在初始化或 dirty 时声明 PipelineState 需求，得到 `PipelineTicket`。pass、material bin 或 cluster 派生数据只保存 ticket；执行路径通过 `RenderGraphContext.GetPipeline` 解析 ready `PipelineHandle`。
+
+PipelineState 生命周期归全局 PipelineCache，不归 pass/batch。
+
+## Binding
+
+Cluster pass 不使用旧 `BindRecipe`、`BindRole`、旧 binding set cache。
+
+Material 字段通过生成器生成 binding input。Cluster pass 用 binding input 查全局 BindSet owner，取得 `BindingSetHandle`。
+
+frame/pass/transient binding handle 放在使用位置，不包成聚合引用。
+
+## Baker
+
+cluster pipeline 不再依赖 cluster-specific baker。
+
+禁止 baker 直接写：
+
+- cluster raster/shade/deform component。
+- BVH root。
+- material slot offset。
+- material slot bind。
+- vertex layout opaque blob。
+- cache/surface signature blob。
+
+Cluster pipeline 自己从运行时 material、shader metadata、mesh data 和 `RenderWorld` instance state 构建内部 item、batch、bin、SlotBuffer 和 GPU buffer。
+
+## Pass
+
+每个 pass 直接拥有或接收自己需要的引用：
+
+- fixed pass 通过全局 PipelineCache 声明 fixed PipelineState，并在初始化路径显式 warmup。
+- material-dependent pass 从 cluster item 选择 material/pass/shader。
+- pass 自己写 binding 映射。
+- pass 接收 SlotBuffer graph/RHI handle。
+- pass 不消费旧 material slot buffer。
+- pass 不消费 dispatch table。
+
+## 重建参考
+
+- [RenderWorld 与 Pipeline Reference](render_world_pipeline_reference.md)
+- [RenderWorld 与 Material 重构文档](render_world_pipeline_refactor.md)

@@ -5,15 +5,11 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <UsesDiligentEngine>true</UsesDiligentEngine>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.3" />
     <PackageReference Include="Silk.NET.Windowing" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Input" Version="2.22.0" />
-    <PackageReference Include="DiligentGraphics.DiligentEngine.Core" Version="$(DiligentPackageVersion)" Condition="'$(DiligentUseLocalBuild)' != 'true'" />
-    <PackageReference Include="Diligent-SharpGen.Runtime" Version="$(DiligentSharpGenRuntimeVersion)" Condition="'$(DiligentUseLocalBuild)' == 'true'" />
     <PackageReference Include="FlatSharp.Runtime" Version="7.9.0" />
     <PackageReference Include="ImGui.NET" Version="1.91.6.1" />
   </ItemGroup>
@@ -22,6 +18,10 @@
     <ProjectReference Include="..\SomeEngine.Core\SomeEngine.Core.csproj" />
     <ProjectReference Include="..\SomeEngine.Render\SomeEngine.Render.csproj" />
     <ProjectReference Include="..\SomeEngine.Assets\SomeEngine.Assets.csproj" />
+    <ProjectReference Include="..\SomeEngine.Rhi\SomeEngine.Rhi.csproj" />
+    <ProjectReference Include="..\SomeEngine.Rhi.D3D12\SomeEngine.Rhi.D3D12.csproj" />
+    <ProjectReference Include="..\..\..\SomeECS\src\SomeECS.Core\SomeECS.Core.csproj" />
+    <ProjectReference Include="..\..\..\SomeECS\src\SomeECS.Systems\SomeECS.Systems.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -2,12 +2,12 @@
   "asset_guid": "3dc64d6f-9f36-5c94-b823-7a249deea078",
   "source_guid": "1d4fa3b7-b72e-4eb7-9a53-13f64cc5d107",
   "sub_asset_key": "shader:main",
-  "content_fingerprint": "fa5c478386bc9cee09f3b1f82080ffc043cd2d32fc4612621d328b76b26e7ff2",
+  "content_fingerprint": "818750f7dbc94a56e72ec429e303853cfd45951fa4c2ac2c4cd77f0687f9980e",
   "dependencies": [
     {
-      "path": "assets/Shaders/imgui.hlsl",
-      "hash": "1c4b275620bf7180999f6b4f6dc79346de03379a85ad68fe221e8c0d559426bd"
+      "path": "assets/Shaders/imgui.slang",
+      "hash": "731f3b8ac1ef6eefe432e53cabc0ec4d363e84bf85fb24f9a9ca6092e3e76fb6"
     }
   ],
-  "importer_version": 6
+  "importer_version": 15
 }

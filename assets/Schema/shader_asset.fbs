@@ -20,12 +20,26 @@ enum ShaderStage : ubyte {
     Callable
 }
 
+enum ShaderBindingType : ubyte {
+    None,
+    ConstantBuffer,
+    StorageBufferRead,
+    StorageBufferReadWrite,
+    RawBufferRead,
+    RawBufferReadWrite,
+    TextureRead,
+    TextureReadWrite,
+    Sampler,
+    AccelerationStructure
+}
+
 table ShaderResourceReflection {
     name: string;
     stages: uint; // Diligent SHADER_TYPE bitmask
     binding: uint; // Diligent Register / Vulkan binding / WebGPU binding index
     space: uint; // Diligent Space / Vulkan descriptor set / WebGPU bind group
     resource_type: ubyte; // Diligent ShaderResourceType numeric value; 0=Unknown
+    binding_type: ShaderBindingType = None;
 }
 
 table ShaderReflectionData {
@@ -42,6 +56,13 @@ table ShaderBytecode {
 
 table BackendReflection {
     backend: string; // "dxil", "spirv", etc.
+    reflection: ShaderReflectionData;
+}
+
+table ShaderEntryPointReflection {
+    backend: string; // "dxil", "spirv", etc.
+    entry_point: string;
+    stage: ShaderStage;
     reflection: ShaderReflectionData;
 }
 
@@ -71,6 +92,11 @@ table ShaderEntryPointAttribute {
     args: [string];
 }
 
+table ShaderEntryPointMetadata {
+    variant_index: int;
+    vertex_layout_descriptor: [ubyte];
+}
+
 table ShaderMetadata {
     tags: [string];
     material_bindings: [ShaderMaterialBinding];
@@ -98,7 +124,9 @@ table ShaderAsset (fs_serializer) {
     variants: [ShaderBytecode];
     entry_point_attributes: [ShaderEntryPointAttribute];
     reflections: [BackendReflection];
+    entry_point_reflections: [ShaderEntryPointReflection];
     metadata: ShaderMetadata;
+    entry_point_metadata: [ShaderEntryPointMetadata];
 }
 
 root_type ShaderAsset;

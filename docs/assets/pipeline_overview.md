@@ -118,10 +118,10 @@ public record ImportedAsset(IAsset Asset, string SubAssetKey, string OutputPath)
 
 ### Source Generator 自动注册
 
-`AssetPipelineCatalogGenerator` 扫描 SomeEngine.Assets 程序集中所有实现 `IAssetProvider` 和 `IAssetImporter` 的具体类，生成 `GeneratedAssetPipelineCatalog`：
+`AssetCatalogGen` 扫描 SomeEngine.Assets 程序集中所有实现 `IAssetProvider` 和 `IAssetImporter` 的具体类，生成 `AssetCatalog`：
 
 ```csharp
-public static class GeneratedAssetPipelineCatalog
+public static class AssetCatalog
 {
     public static IReadOnlyList<IAssetProvider> CreateProviders();
     public static IReadOnlyList<IAssetImporter> CreateImporters();
@@ -129,7 +129,7 @@ public static class GeneratedAssetPipelineCatalog
 }
 ```
 
-跨程序集的 Provider（如 `TextureAssetProvider` 在 Render 层）在 Runtime 的 `Program.cs` 中手动追加到 provider 列表。
+跨程序集的 Provider（如 `TextureAssetProvider` 在 Render 层）在 Runtime 的 `RuntimeApp.cs` 中手动追加到 provider 列表。
 
 ## 三种运行模式
 
@@ -147,7 +147,7 @@ public static class GeneratedAssetPipelineCatalog
 | `ShaderAssetProvider` | `ShaderAsset` | `.shader.asset` / `.slang.asset` | [ShaderAssetProvider.cs](file:///f:/SomeEngine/src/SomeEngine.Assets/Pipeline/ShaderAssetProvider.cs) |
 | `MeshAssetProvider` | `MeshAsset` | `.mesh.asset` | [MeshAssetProvider.cs](file:///f:/SomeEngine/src/SomeEngine.Assets/Pipeline/MeshAssetProvider.cs) |
 | `MaterialAssetProvider` | `MaterialAsset` | `.material.asset` / `.mat.asset` | [MaterialAssetProvider.cs](file:///f:/SomeEngine/src/SomeEngine.Assets/Pipeline/MaterialAssetProvider.cs) |
-| `MaterialInstanceAssetProvider` | `MaterialInstanceAsset` | `.materialinstance.asset` / `.matinst.asset` | [MaterialInstanceAssetProvider.cs](file:///f:/SomeEngine/src/SomeEngine.Assets/Pipeline/MaterialInstanceAssetProvider.cs) |
+| `MaterialInstanceProvider` | `MaterialInstanceAsset` | `.materialinstance.asset` / `.matinst.asset` | [MaterialInstanceProvider.cs](file:///f:/SomeEngine/src/SomeEngine.Assets/Pipeline/MaterialInstanceProvider.cs) |
 | `TextureAssetDataProvider` | `TextureAsset` | `.texture.asset` | [TextureAssetDataProvider.cs](file:///f:/SomeEngine/src/SomeEngine.Assets/Pipeline/TextureAssetDataProvider.cs) |
 | `TextureAssetProvider` (GPU) | `ITexture` | `.texture.asset` | [TextureAssetProvider.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Assets/TextureAssetProvider.cs) |
 

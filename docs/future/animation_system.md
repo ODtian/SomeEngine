@@ -340,7 +340,7 @@ GPU: Skinning CS → DeformedPositionBuffer / DeformedNormalBuffer
 
 ### 5.2 RasterBin 集成
 
-蒙皮 Mesh 通过 BinSpace 的 RasterBin Field 分类：
+蒙皮 Mesh 通过 cluster pipeline 的 raster bin / SlotBuffer field 分类：
 
 ```
 RasterBin Field:
@@ -692,7 +692,7 @@ public struct RootMotionData : IComponent
 | GPU Buffer | `GpuTransform` StructuredBuffer | 新增 `BoneMatrixBuffer` |
 | Deformed Mesh | `DeformedClusterAlloc` 已存在 | Skinning CS 写入 Deformed Buffer |
 | Instance Header | `GpuInstanceHeader.BoundsExpansion` | 蒙皮实例设保守 BoundsExpansion |
-| RasterBin | BinSpace Region | 新增 "Skinned" region |
+| RasterBin | pipeline-owned raster group | 新增 "Skinned" group |
 | Draw Shader | Vertex Pulling from PageHeap | Skinned 变体从 DeformedBuffer 拉取 |
 
 ### 8.2 ECS 系统顺序

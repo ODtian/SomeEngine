@@ -1,10 +1,11 @@
 using System.IO;
 using System.Text.Json;
 using SomeEngine.Assets;
+using static SomeEngine.Tests.TestProjectPaths;
 
 namespace SomeEngine.Tests.Assets;
 
-public class SourceMetaManagerTests
+public class SourceMetaFilesTests
 {
     [Fact]
     public void SaveLoad_Roundtrip_PreservesImporterSettings()
@@ -22,14 +23,14 @@ public class SourceMetaManagerTests
             }
             """).RootElement.Clone();
 
-        SourceMetaManager.Save(sourcePath, new SourceMeta
+        SourceMetaFiles.Save(sourcePath, new SourceMeta
         {
             SourceGuid = SourceGuid.New(),
             Importer = "GltfSourceImporter",
             ImporterSettings = settings,
         });
 
-        SourceMeta loaded = SourceMetaManager.Load(sourcePath);
+        SourceMeta loaded = SourceMetaFiles.Load(sourcePath);
 
         Assert.True(loaded.ImporterSettings.HasValue);
         Assert.Equal(
@@ -42,10 +43,4 @@ public class SourceMetaManagerTests
         Directory.Delete(dir, true);
     }
 
-    private static string CreateTempDir()
-    {
-        string dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(dir);
-        return dir;
-    }
 }

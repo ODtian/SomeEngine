@@ -146,6 +146,138 @@ public class ClusterBuilderTests
     }
 
     [Fact]
+    public void TestSoAStreamLayout_WithTangent_PlacesUvAfterTangent()
+    {
+        var positions = new Vector3[]
+        {
+            new(0, 0, 0),
+            new(1, 0, 0),
+            new(0, 1, 0),
+        };
+        var normals = new float[] { 0, 1, 0, 0, 1, 0, 0, 1, 0 };
+        var tangents = new float[] { 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1 };
+        var uvs = new float[] { 0, 0, 1, 0, 0, 1 };
+        var indices = new uint[] { 0, 1, 2 };
+
+        var rawAttributes = new List<RawAttribute>
+        {
+            new("NORMAL", normals, 3, ValueType.Int8, 3, true),
+            new("TANGENT", tangents, 4, ValueType.Int8, 4, true),
+            new("TEXCOORD_0", uvs, 2, ValueType.Float16, 2, false),
+        };
+
+        var asset = ClusterBuilder.ProcessRaw(positions, rawAttributes, indices, new List<string>(), "TestSoAWithTangent");
+
+        Assert.NotNull(asset.Payload);
+        var span = asset.Payload.Value.Span;
+        var header = MemoryMarshal.Read<MeshPageHeader>(span.Slice(0, MeshPageHeader.Size));
+
+        uint attrBase = header.AttributesOffset;
+        uint tangentBase = attrBase + (uint)(3 * 3);
+        uint uvBase = tangentBase + (uint)(3 * 4);
+
+        for (int v = 0; v < 3; v++)
+        {
+            int uvOffset = (int)uvBase + v * 4;
+            ushort rawU = BitConverter.ToUInt16(span.Slice(uvOffset, 2));
+            ushort rawV = BitConverter.ToUInt16(span.Slice(uvOffset + 2, 2));
+            Assert.InRange((float)BitConverter.UInt16BitsToHalf(rawU), uvs[v * 2 + 0] - 0.01f, uvs[v * 2 + 0] + 0.01f);
+            Assert.InRange((float)BitConverter.UInt16BitsToHalf(rawV), uvs[v * 2 + 1] - 0.01f, uvs[v * 2 + 1] + 0.01f);
+        }
+
+        uint expectedIndicesOffset = uvBase + (uint)(3 * 4);
+        Assert.Equal(expectedIndicesOffset, header.IndicesOffset);
+    }
+
+    [Fact]
+    public void ProcessRaw_DoesNotMergeVerticesWithDifferentAttributes()
+    {
+        var positions = new Vector3[]
+        {
+            new(0, 0, 0),
+            new(1, 0, 0),
+            new(0, 1, 0),
+            new(0, 0, 0),
+        };
+        var uvs = new float[]
+        {
+            0, 0,
+            1, 0,
+            0, 1,
+            0.5f, 0.5f,
+        };
+        var indices = new uint[] { 0, 1, 2, 3, 2, 1 };
+        var rawAttributes = new List<RawAttribute>
+        {
+            new("TEXCOORD_0", uvs, 2, ValueType.Float16, 2, false),
+        };
+
+        var asset = ClusterBuilder.ProcessRaw(
+            positions,
+            rawAttributes,
+            indices,
+            new List<string>(),
+            "UvSeam");
+
+        Assert.NotNull(asset.Payload);
+        var span = asset.Payload.Value.Span;
+        var header = MemoryMarshal.Read<MeshPageHeader>(span.Slice(0, MeshPageHeader.Size));
+        Assert.Equal(4u, header.TotalVertexCount);
+        Assert.Contains(
+            ReadHalf2Stream(span, header.AttributesOffset, header.TotalVertexCount),
+            static uv => Math.Abs(uv.X - 0.5f) < 0.01f && Math.Abs(uv.Y - 0.5f) < 0.01f);
+    }
+
+    [Fact]
+    public void ProcessRaw_ClusterBoundsContainDecodedQuantizedPositions()
+    {
+        var positions = new Vector3[]
+        {
+            new(0, 0, 0),
+            new(1.00002f, 0, 0),
+            new(0, 1.00002f, 0),
+        };
+        var indices = new uint[] { 0, 1, 2 };
+
+        var asset = ClusterBuilder.ProcessRaw(
+            positions,
+            new List<RawAttribute>(),
+            indices,
+            new List<string>(),
+            "QuantizedBounds");
+
+        Assert.NotNull(asset.Payload);
+        var span = asset.Payload.Value.Span;
+        var header = MemoryMarshal.Read<MeshPageHeader>(span.Slice(0, MeshPageHeader.Size));
+        var clusters = MemoryMarshal.Cast<byte, GPUCluster>(
+            span.Slice(
+                (int)header.ClustersOffset,
+                checked((int)header.ClusterCount * GPUCluster.SizeInBytes)));
+        var quantizedPositions = MemoryMarshal.Cast<byte, ushort>(
+            span.Slice(
+                (int)header.PositionsOffset,
+                checked((int)header.TotalVertexCount * 3 * sizeof(ushort))));
+        var origin = new Vector3(header.QuantOriginX, header.QuantOriginY, header.QuantOriginZ);
+
+        foreach (ref readonly var cluster in clusters)
+        {
+            uint vertexCount = cluster.PackedCounts & 0xFF;
+            for (uint local = 0; local < vertexCount; local++)
+            {
+                int wordOffset = checked(((int)cluster.VertexStart + (int)local) * 3);
+                var decoded = new Vector3(
+                    (cluster.IntBaseX + quantizedPositions[wordOffset + 0]) * header.QuantStep + origin.X,
+                    (cluster.IntBaseY + quantizedPositions[wordOffset + 1]) * header.QuantStep + origin.Y,
+                    (cluster.IntBaseZ + quantizedPositions[wordOffset + 2]) * header.QuantStep + origin.Z);
+
+                Assert.InRange(decoded.X, cluster.BoundMin.X, cluster.BoundMax.X);
+                Assert.InRange(decoded.Y, cluster.BoundMin.Y, cluster.BoundMax.Y);
+                Assert.InRange(decoded.Z, cluster.BoundMin.Z, cluster.BoundMax.Z);
+            }
+        }
+    }
+
+    [Fact]
     public void ProcessRaw_WritesMeshRegions_FromSourceSlots()
     {
         var positions = new Vector3[]
@@ -169,4 +301,21 @@ public class ClusterBuilderTests
         Assert.Single(asset.Regions);
         Assert.Equal("region_0", asset.Regions[0].Name);
     }
+
+    private static List<Vector2> ReadHalf2Stream(
+        ReadOnlySpan<byte> payload,
+        uint streamOffset,
+        uint vertexCount)
+    {
+        var values = new List<Vector2>(checked((int)vertexCount));
+        for (uint vertex = 0; vertex < vertexCount; vertex++)
+        {
+            int offset = checked((int)streamOffset + (int)vertex * 4);
+            values.Add(new Vector2(
+                (float)BitConverter.UInt16BitsToHalf(BitConverter.ToUInt16(payload.Slice(offset, 2))),
+                (float)BitConverter.UInt16BitsToHalf(BitConverter.ToUInt16(payload.Slice(offset + 2, 2)))));
+        }
+        return values;
+    }
+
 }

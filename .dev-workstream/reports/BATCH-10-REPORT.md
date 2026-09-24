@@ -16,7 +16,7 @@ The main outcome is that material pass entities now remain the single source of 
 - `src/SomeEngine.Render/Materials/BinSpace.cs`
 - `src/SomeEngine.Render/Systems/MaterialPassBaker.cs`
 - `src/SomeEngine.Render/Systems/RenderWorldExtractor.cs`
-- `src/SomeEngine.Render/Pipelines/ClusterRender/ClusterMaterialSlotPreparer.cs`
+- `src/SomeEngine.Render/Pipelines/ClusterRender/SlotPreparer.cs`
 - `src/SomeEngine.Render/Pipelines/ClusterRender/ClusterPipeline.cs`
 - `src/SomeEngine.Render/Pipelines/ClusterRender/Stages/ClusterShade.cs`
 - `src/SomeEngine.Render/Pipelines/ClusterRender/RasterPSOBuilder.cs`
@@ -38,7 +38,7 @@ The main outcome is that material pass entities now remain the single source of 
 ## Test Results
 
 - Passed: `dotnet build SomeEngine.slnx --no-restore -v minimal`
-- Passed: `dotnet test tests/SomeEngine.Tests/SomeEngine.Tests.csproj --no-restore --no-build --verbosity quiet --filter "FullyQualifiedName~MaterialPassBaker|FullyQualifiedName~RenderWorldExtractor|FullyQualifiedName~ClusterMaterialSlotPreparer|FullyQualifiedName~BinSpace|FullyQualifiedName~ShaderGroup|FullyQualifiedName~AssetDatabase|FullyQualifiedName~GeneratedAssetPipelineCatalog|FullyQualifiedName~MaterialAssetPipeline"`
+- Passed: `dotnet test tests/SomeEngine.Tests/SomeEngine.Tests.csproj --no-restore --no-build --verbosity quiet --filter "FullyQualifiedName~MaterialPassBaker|FullyQualifiedName~RenderWorldExtractor|FullyQualifiedName~SlotPreparer|FullyQualifiedName~BinSpace|FullyQualifiedName~ShaderGroup|FullyQualifiedName~AssetDatabase|FullyQualifiedName~GeneratedAssetPipelineCatalog|FullyQualifiedName~MaterialAssetPipeline"`
 
 Observed warnings:
 - Existing Runtime nullable warnings remain.
@@ -49,7 +49,7 @@ Observed warnings:
 - Used Friflo ECS `EntityStore.CopyEntity` as the only material pass extraction mechanism instead of introducing component clone registries, reflection, or per-feature copy lists.
 - Added explicit `CopyValue` declarations only to component types that hold references and are expected to be copied by ECS.
 - Replaced the previous baker class tree with three direct `IBaker<T>` implementations: tag entry, component entry, and shader attribute entry. This keeps the Baker layer but removes arrays of small baker classes and base classes.
-- Replaced the old hidden RenderWorld iteration-order dependency in `ClusterMaterialSlotPreparer` with an in-place sort by `(source entity, local material slot, pass index, entity id)`.
+- Replaced the old hidden RenderWorld iteration-order dependency in `SlotPreparer` with an in-place sort by `(source entity, local material slot, pass index, entity id)`.
 - Kept dictionaries in cache/setup paths, but not in the per-dispatch execution path.
 
 ## Issues Encountered

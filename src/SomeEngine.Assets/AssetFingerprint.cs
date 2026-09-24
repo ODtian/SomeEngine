@@ -20,7 +20,7 @@ public static class AssetFingerprint
         };
     }
 
-    public static DependencyEntryData? TryCreateFileDependency(string projectRoot, string fullPath)
+    public static DependencyEntryData? TryFileDep(string projectRoot, string fullPath)
     {
         fullPath = Path.GetFullPath(fullPath);
         if (!File.Exists(fullPath))
@@ -31,7 +31,7 @@ public static class AssetFingerprint
         return new DependencyEntryData
         {
             RelativePath = MakeRelativePath(projectRoot, fullPath),
-            ContentHash = ComputeFileSha256(fullPath),
+            ContentHash = FileSha256(fullPath),
         };
     }
 
@@ -60,7 +60,7 @@ public static class AssetFingerprint
         return ComputeSha256(builder.ToString());
     }
 
-    public static string ComputeFileSha256(string fullPath)
+    public static string FileSha256(string fullPath)
         => Convert.ToHexStringLower(SHA256.HashData(File.ReadAllBytes(fullPath)));
 
     public static string ComputeSha256(string value)

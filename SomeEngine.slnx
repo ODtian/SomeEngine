@@ -1,18 +1,37 @@
 <Solution>
+  <Folder Name="/external/SomeECS/">
+    <Project Path="../SomeECS/src/SomeECS.SourceGen/SomeECS.SourceGen.csproj" />
+    <Project Path="../SomeECS/src/SomeECS.Core/SomeECS.Core.csproj" />
+    <Project Path="../SomeECS/src/SomeECS.Systems/SomeECS.Systems.csproj" />
+    <Project Path="../SomeECS/src/SomeECS.Serialization/SomeECS.Serialization.csproj" />
+  </Folder>
+  <Folder Name="/external/SomeJob/">
+    <Project Path="../SomeJob/src/SomeJob/SomeJob.csproj" />
+    <Project Path="../SomeJob/src/SomeJob.Dots/SomeJob.Dots.csproj" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/SomeEngine.Animation/SomeEngine.Animation.csproj" />
     <Project Path="src/SomeEngine.Assets/SomeEngine.Assets.csproj" />
     <Project Path="src/SomeEngine.Core/SomeEngine.Core.csproj" />
+    <Project Path="src/SomeEngine.Generators/SomeEngine.Generators.csproj" />
     <Project Path="src/SomeEngine.Editor/SomeEngine.Editor.csproj" />
     <Project Path="src/SomeEngine.Physics/SomeEngine.Physics.csproj" />
+    <Project Path="src/SomeEngine.Rhi/SomeEngine.Rhi.csproj" />
+    <Project Path="src/SomeEngine.Rhi.D3D12/SomeEngine.Rhi.D3D12.csproj" />
     <Project Path="src/SomeEngine.Render/SomeEngine.Render.csproj" />
     <Project Path="src/SomeEngine.Runtime/SomeEngine.Runtime.csproj" />
     <Project Path="src/SomeEngine.UI/SomeEngine.UI.csproj" />
   </Folder>
-  <Folder Name="/tests/">
+  <Folder Name="/tests/">    <Project Path="tests/SomeEngine.Core.Tests/SomeEngine.Core.Tests.csproj" />
+
+    <Project Path="tests/SomeEngine.Rhi.Tests/SomeEngine.Rhi.Tests.csproj" />
     <Project Path="tests/SomeEngine.Tests/SomeEngine.Tests.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/SomeEngine.Rhi.Benchmarks/SomeEngine.Rhi.Benchmarks.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/DagVisualizer/SomeEngine.DagVisualizer.csproj" />
+    <Project Path="tools/SomeEngine.Rhi.WindowTests/SomeEngine.Rhi.WindowTests.csproj" />
   </Folder>
 </Solution>

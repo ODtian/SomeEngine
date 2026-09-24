@@ -18,8 +18,6 @@
 struct SWRasterUniforms
 {
     float4x4 ViewProj;
-    float3 QuantOrigin;
-    float QuantStep;
     uint ScreenWidth;
     uint ScreenHeight;
     uint MaxBins;
@@ -30,7 +28,10 @@ struct SWRasterUniforms
     uint _pad2;
 };
 
-ConstantBuffer<SWRasterUniforms> Uniforms;
+cbuffer PushConstants : register(b100, space0)
+{
+    SWRasterUniforms Uniforms;
+};
 
 ByteAddressBuffer PageHeap;
 // Instances is declared in cluster_common.slang (via vertex_evaluate.slang)
@@ -41,6 +42,9 @@ StructuredBuffer<RasterBinEntry> RasterBinMeta;
 Texture2D<float> DepthTarget;
 RWTexture2D<uint> VisBuffer;    // packed: (depth_high24 << 8) | unused for now; shade uses vis encoding
 RWTexture2D<uint> DepthUAV;
+
+ByteAddressBuffer DeformCache;
+StructuredBuffer<uint> CacheOffsets;
 
 // Debug: per-cluster SW raster dump. Layout:
 // [0]: atomic counter (uint)
@@ -57,6 +61,7 @@ RWByteAddressBuffer DebugSWOutput;
 static const uint SUBPIXEL_BITS  = 8;
 static const uint SUBPIXEL_SCALE = 1u << SUBPIXEL_BITS; // 256
 static const float SUBPIXEL_SCALE_F = float(SUBPIXEL_SCALE);
+static const uint SW_CACHE_OFFSET_INVALID = 0xFFFFFFFDu;
 
 // ─── FRasterTri ───
 struct FRasterTri
@@ -200,6 +205,58 @@ uint FetchVertexIndex(uint pageOffset, uint idxOffset, uint tStart, uint triIdx,
     return (PageHeap.Load(aligned) >> shift) & 0xFFu;
 }
 
+VertexEvalContext MakeSWRasterVertexEvalContext(
+    uint pageOffset,
+    uint posOffset,
+    uint attrOffset,
+    uint idxOffset,
+    uint totalVertexCount,
+    uint vStart,
+    int3 intBase,
+    uint localVertIdx,
+    uint instanceID,
+    GpuTransform transform)
+{
+    VertexEvalContext ctx;
+    ctx.pageHeap = PageHeap;
+    ctx.pageOffset = pageOffset;
+    ctx.posOffset = posOffset;
+    ctx.attrOffset = attrOffset;
+    ctx.idxOffset = idxOffset;
+    ctx.vStart = vStart;
+    ctx.totalVertexCount = totalVertexCount;
+    ctx.localVertIdx = localVertIdx;
+    ctx.intBase = intBase;
+    ctx.instanceID = instanceID;
+    ctx.transform = transform;
+    ctx.IsPreviousFrame = 0u;
+    return ctx;
+}
+
+float4 EvaluateSWRasterClipPosition<TVE : IVertexEvaluate>(
+    uniform TVE evaluator,
+    bool useDeformCache,
+    uint visibleClusterIndex,
+    uint vertexCount,
+    VertexEvalContext ctx)
+{
+    TVE.DeformedVertex vertex;
+    if (useDeformCache)
+    {
+        uint cacheBaseByte = CacheOffsets[visibleClusterIndex];
+        if (cacheBaseByte >= SW_CACHE_OFFSET_INVALID)
+            vertex = evaluator.evaluate(ctx);
+        else
+            vertex = evaluator.readCache(DeformCache, cacheBaseByte, vertexCount, ctx.localVertIdx);
+    }
+    else
+    {
+        vertex = evaluator.evaluate(ctx);
+    }
+
+    return mul(float4(evaluator.getPosition(vertex), 1.0), Uniforms.ViewProj);
+}
+
 // ─── Triangle Setup ───
 
 FRasterTri SetupTriangle(float4 clipVerts[3], int4 scissorRect)
@@ -303,7 +360,7 @@ void WritePixel(int2 pixel, float depth, uint visData)
     uint depthBits = asuint(depthReversed);
     // SW/HW debug view: set bit 31 to mark as SW-rasterized pixel
     if ((Uniforms.DebugDump & 0x2) != 0)
-        visData |= 0x80000000u;
+        visData = MarkVisBufferSWRaster(visData);
     uint oldDepth;
     InterlockedMax(DepthUAV[pixel], depthBits, oldDepth);
     if (depthBits > oldDepth)
@@ -373,7 +430,7 @@ struct PixelRasterTask : IWaveTask
         // SW/HW debug view: set bit 31 to mark as SW-rasterized pixel
         uint finalVisData = srcVisData;
         if ((Uniforms.DebugDump & 0x2) != 0)
-            finalVisData |= 0x80000000u;
+            finalVisData = MarkVisBufferSWRaster(finalVisData);
         InterlockedMax(DepthUAV[int2(px, py)], depthBits, oldDepth);
         if (depthBits > oldDepth)
         {
@@ -384,12 +441,10 @@ struct PixelRasterTask : IWaveTask
 
 
 // ─── Generic SW Rasterizer Kernel ───
-// VS : IVertexSource controls how vertices are fetched and transformed.
-// For inline evaluation, pass InlineSource<T>.
-// For cached evaluation, pass CachedSource<T> (future).
 
-void SWRasterKernel<VS : IVertexSource>(
-    VS vertexSource,
+void SWRasterKernel<TVE : IVertexEvaluate>(
+    uniform TVE evaluator,
+    bool useDeformCache,
     uint3 groupID,
     uint groupThreadIndex)
 {
@@ -467,7 +522,7 @@ void SWRasterKernel<VS : IVertexSource>(
             vertIndices.z = FetchVertexIndex(pageOffset, idxOffset, tStart, localTriIdx, 2);
         }
 
-        // ─── Stage 1: Vertex Dedup + Transform (via IVertexSource) ───
+        // ─── Stage 1: Vertex Dedup + Transform ───
         VertexDedup dedup = DeduplicateVertIndexes(vertIndices, waveLane, bTriValid);
 
         // --- DIAGNOSTIC: Check if we overflow the 32-lane limit for unique vertices ---
@@ -493,22 +548,23 @@ void SWRasterKernel<VS : IVertexSource>(
         float4 transformedPos = float4(0, 0, 0, 1);
         if (waveLane < min(dedup.numUniqueVerts, waveSize))
         {
-            VertexFetchArgs vfArgs;
-            vfArgs.pageHeap        = PageHeap;
-            vfArgs.pageOffset      = pageOffset;
-            vfArgs.posOffset       = posOffset;
-            vfArgs.attrOffset      = attrOffset;
-            vfArgs.totalVertexCount = totalVertexCount;
-            vfArgs.vStart          = vStart;
-            vfArgs.intBase         = intBase;
-            vfArgs.localVertIdx    = dedup.laneVertIndex;
-            vfArgs.instanceID      = realInstanceID;
-            vfArgs.transform       = transform;
-            vfArgs.quantOrigin     = Uniforms.QuantOrigin;
-            vfArgs.quantStep       = Uniforms.QuantStep;
-            vfArgs.viewProj        = Uniforms.ViewProj;
-            vfArgs.visibleClusterIndex = originalIndex;
-            transformedPos = vertexSource.fetchClipPosition(vfArgs);
+            VertexEvalContext ctx = MakeSWRasterVertexEvalContext(
+                pageOffset,
+                posOffset,
+                attrOffset,
+                idxOffset,
+                totalVertexCount,
+                vStart,
+                intBase,
+                dedup.laneVertIndex,
+                realInstanceID,
+                transform);
+            transformedPos = EvaluateSWRasterClipPosition(
+                evaluator,
+                useDeformCache,
+                originalIndex,
+                vertexCount,
+                ctx);
         }
 
         float4 clipVerts[3];
@@ -538,7 +594,7 @@ void SWRasterKernel<VS : IVertexSource>(
         pixelTask.tri = rasterTri;
         if (bTriValid && rasterTri.bIsValid)
         {
-            pixelTask.visData = (visibleIndexPlusOne << 7) | (localTriIdx & 0x7F);
+            pixelTask.visData = EncodeVisBuffer(visibleIndexPlusOne - 1u, localTriIdx);
             int bboxW = rasterTri.MaxPixel.x - rasterTri.MinPixel.x + 1;
             int bboxH = rasterTri.MaxPixel.y - rasterTri.MinPixel.y + 1;
             pixelTask.pixelCount = uint(bboxW * bboxH);
@@ -556,28 +612,22 @@ void SWRasterKernel<VS : IVertexSource>(
 
 // ─── Default Entry Point (Static mesh, inline vertex eval) ───
 
-[ClusterRaster("sw_inline")]
+[MaterialTarget("cluster.raster.sw")]
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void CSSWRaster(uint3 groupID : SV_GroupID, uint groupThreadIndex : SV_GroupThreadID)
 {
-    InlineSource<StaticVertexEval> source;
-    SWRasterKernel(source, groupID, groupThreadIndex);
+    StaticVertexEval eval;
+    SWRasterKernel(eval, false, groupID, groupThreadIndex);
 }
 
-// ── DeformCache resources (for cached entry points) ──
-ByteAddressBuffer DeformCache;
-StructuredBuffer<uint> CacheOffsets;
-
-[ClusterRaster("sw_cached")]
+[MaterialTarget("cluster.raster.sw.cached")]
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void CSSWRasterCached(uint3 groupID : SV_GroupID, uint groupThreadIndex : SV_GroupThreadID)
 {
-    CachedSource<StaticVertexEval> source;
-    source.deformCache = DeformCache;
-    source.cacheOffsets = CacheOffsets;
-    SWRasterKernel(source, groupID, groupThreadIndex);
+    StaticVertexEval eval;
+    SWRasterKernel(eval, true, groupID, groupThreadIndex);
 }
 
 #endif // SW_RASTER_SLANG

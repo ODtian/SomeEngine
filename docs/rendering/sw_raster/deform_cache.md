@@ -143,14 +143,14 @@ struct InlineSource<T : IVertexEvaluate> : IVertexSource { ... }  // inline 调�
 void RasterKernel<VS : IVertexSource>(...) { ... }
 ```
 
-编译出两套 PSO，运行时 toggle。
+编译出两套 PipelineState，运行时 toggle。
 
 ### Slang 死代码消除
 
 `VertexEvalContext` 可能很大（BoneBuffer、MaterialParams、HeightMap 等），但 Slang + 后端编译器会自动消除未使用的资源绑定：
 - 未使用的 Buffer/Texture：**从 shader reflection 中完全消失**，SRB 不需要绑定
 - ConstantBuffer 未读字段：不产生 GPU 指令开销
-- 前提：per-Bin PSO 是编译时特化，DCE 完全生效
+- 前提：per-bin PipelineState 是编译时特化，DCE 完全生效
 
 ## 5. 骨骼系统 GPU 布局（继承模型）
 

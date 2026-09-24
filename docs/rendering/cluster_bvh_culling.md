@@ -60,7 +60,7 @@ struct ClusterBVHNode
     *   **注册**：建立 `PageID -> List<BVHNodeIndex>` 的映射追踪表。
     *   **预上传**：如果包含永远驻留的粗粒度 LOD，直接填充其 `ChildPointer` 并设 `IsResident=1`。
 2.  **运行阶段 (Runtime)**:
-    *   **Page 流入**：Streamer 分配 `PageHeap` 空间后，通知 `ClusterResourceManager`。
+    *   **Page 流入**：Streamer 分配 `PageHeap` 空间后，通知 `ClusterMeshes`。
     *   **异步修补**：调度 `BVH_Patch` Compute Shader，根据该 PageID 对应的节点列表，批量更新 `ChildPointer` 为 `Resident | HeapOffset`。
     *   **Page 流出**：同理，将对应节点的 `IsResident` 位清零。
 
@@ -101,7 +101,7 @@ struct ClusterBVHNode
 ### 进行中/待办 (WIP & TODO)
 - [ ] **移除页表依赖**：正在重构着色器与 C# 端逻辑，将 `PageTable` 彻底删除，改用 `Leaf Node` 直接寻址。
 - [ ] **实现动态修补系统**：
-    - [ ] `ClusterResourceManager` 建立 `Page -> BVH Node` 追踪映射。
+    - [ ] `ClusterMeshes` 建立 `Page -> BVH Node` 追踪映射。
     - [ ] 编写 `bvh_patch.slang` 处理逻辑。
 - [ ] **多实例并发支持**：目前 `_queueA` 注入逻辑仍为单实例硬编码，需扩展为批量注入所有可见实例的根节点任务。
 - [ ] **鲁棒性优化**：处理 `GlobalBVHBuffer` 的溢出保护与碎片整理。

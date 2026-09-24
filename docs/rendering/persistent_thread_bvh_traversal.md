@@ -117,7 +117,7 @@ Cluster 通过 batch 协调读写同步，避免读到半写入的 cluster：
 
 | 文件 | 操作 | 说明 |
 |------|------|------|
-| `ClusterBVHTraversePass.cs` | 重写 | 去掉 ping-pong 双 buffer、UpdateArgs/ClearArgs PSO；新增 QueueState + ClusterBatches buffer；Execute 改为单次 DispatchCompute |
+| `ClusterBVHTraversePass.cs` | 重写 | 去掉 ping-pong 双 buffer、UpdateArgs/ClearArgs PipelineState；新增 QueueState + ClusterBatches buffer；Execute 改为单次 DispatchCompute |
 | `ClusterRenderFeature.cs` | 修改 | 删除 L893-L924 的 8 层循环，替换为单个 PersistentTraverse pass；删除 `hBvhQueueB`、`hBvhArgsB`；新增 `hQueueState`、`hClusterBatches` |
 | `ClusterGraphPasses.cs` | 修改 | 删除 `ClusterBVHTraverseDepthPass`、`ClusterBVHUpdateArgsPass`、`ClusterBVHClearArgsPass`；新增 `ClusterBVHPersistentPass` |
 

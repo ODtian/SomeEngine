@@ -118,7 +118,7 @@ public interface IEntityExtractor
 Where `ExtractContext` provides:
 
 - target runtime world/store
-- asset/resource resolvers
+- asset/resource handles or loader callbacks
 - entity mapping helpers
 - scratch buffers or command APIs if needed
 
@@ -138,9 +138,9 @@ In the current codebase:
   - `MaterialAsset`
 - runtime template:
   - `Material`
-  - `PassEntities[]`
+  - `MaterialPass[]`
 - runtime entity:
-  - RenderWorld pass entity
+  - RenderWorld instance state
 - extractor:
   - `RenderWorldExtractor`
 

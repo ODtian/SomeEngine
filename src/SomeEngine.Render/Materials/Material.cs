@@ -1,126 +1,111 @@
-using System;
-using Diligent;
-using Friflo.Engine.ECS;
 using SomeEngine.Assets;
-using SomeEngine.Assets.Schema;
+using System.Numerics;
+using SomeEngine.Render.RHI;
+using SomeEngine.Rhi;
 
 namespace SomeEngine.Render.Materials;
 
-/// <summary>
-/// 材质资产层 + 运行时 source。
-/// </summary>
-public class Material : IDisposable
+public sealed partial class Material
 {
-    public AssetGuid AssetGuid { get; set; }
+    public string Name { get; init; } = string.Empty;
+    public ScalarLayout ScalarRegionLayout { get; private set; } = ScalarLayout.Empty;
+    public MaterialPass[] Passes { get; private set; } = [];
+    public uint ScalarVersion { get; private set; } = 1;
+    public uint PassVersion { get; private set; } = 1;
+    public uint BindingVersion { get; private set; } = 1;
 
-    /// <summary>名称（调试/序列化用）。</summary>
-    public string Name { get; set; } = "";
+    [BindField("AlbedoMap")]
+    public Handle<Texture> AlbedoMap { get; internal set; }
 
-    /// <summary>所有贴图与 Buffer 参数。</summary>
-    public ShaderParamBag Params { get; private set; } = new();
+    [BindField("NormalMap")]
+    public Handle<Texture> NormalMap { get; internal set; }
 
-    public MaterialScalarRegionLayout ScalarRegionLayout { get; private set; } = MaterialScalarRegionLayout.Empty;
+    [BindField("ARMMap")]
+    public Handle<Texture> ArmMap { get; internal set; }
+
+    [BindField("EmissiveMap")]
+    public Handle<Texture> EmissiveMap { get; internal set; }
+
+    [ScalarField("BaseColorTint")]
+    public Vector4 BaseColorTint { get; internal set; } = Vector4.One;
+
+    [ScalarField("MetallicFactor")]
+    public float MetallicFactor { get; internal set; } = 1.0f;
+
+    [ScalarField("Roughness")]
+    public float Roughness { get; internal set; } = 1.0f;
+
+    [ScalarField("EmissiveFactor")]
+    public Vector4 EmissiveFactor { get; internal set; } = Vector4.Zero;
 
     public int ScalarRegionByteSize => ScalarRegionLayout.ByteSize;
 
-    /// <summary>该材质拥有的所有 pass 实体。</summary>
-    public Entity[] PassEntities { get; internal set; } = [];
+    public Material Clone()
+    {
+        var clone = (Material)MemberwiseClone();
+        clone.Passes = Copy(Passes);
+        clone.TouchScalars();
+        return clone;
+    }
 
-    internal EntityStore? PassStore { get; set; }
+    public void SetPasses(ReadOnlySpan<MaterialPass> passes)
+    {
+        Passes = passes.ToArray();
+        TouchPasses();
+    }
 
-    /// <summary>Revision used by extract/prepare caches to detect material-side changes.</summary>
-    public uint Version { get; private set; } = 1;
+    internal void SetScalarLayout(ScalarLayout layout)
+    {
+        ScalarRegionLayout = layout ?? ScalarLayout.Empty;
+        TouchScalars();
+    }
 
-    public void Touch()
+    internal void WriteScalarRegion(Span<byte> destination)
+    {
+        ScalarRegionLayout.WriteHeader(destination);
+        WriteFields(
+            ScalarRegionLayout,
+            destination.Slice(ScalarLayout.HeaderByteSize, (int)ScalarRegionLayout.PayloadByteSize));
+    }
+
+    internal partial bool ToBindSet(ReflectedBinding binding, AssetStore assets, out BindingResourceDesc resource);
+
+    internal partial void WriteFields(ScalarLayout layout, Span<byte> payload);
+
+    public void TouchScalars()
     {
         unchecked
         {
-            Version++;
+            ScalarVersion++;
         }
     }
 
-    /// <summary>
-    /// 克隆此材质。新实例 Params 独立副本，共享底层 GPU 资源引用。
-    /// </summary>
-    public Material Instantiate()
+    internal void TouchPasses()
     {
-        var passStore = PassStore ?? throw new InvalidOperationException("Material is not attached to a pass entity store.");
-        var inst = new Material
+        unchecked
         {
-            AssetGuid = AssetGuid,
-            Name = Name + " (Instance)",
-            Params = Params.Clone(),
-            ScalarRegionLayout = ScalarRegionLayout,
-        };
-
-        if (PassEntities.Length > 0)
-        {
-            Entity[] clonedPasses = new Entity[PassEntities.Length];
-            for (int i = 0; i < PassEntities.Length; i++)
-            {
-                Entity target = passStore.CreateEntity();
-                Entity source = PassEntities[i];
-                if (!source.IsNull)
-                {
-                    EntityStore.CopyEntity(source, target);
-                }
-
-                target.AddComponent(new Pipelines.MaterialRef { Owner = inst });
-                clonedPasses[i] = target;
-            }
-
-            inst.PassEntities = clonedPasses;
-        }
-        else
-        {
-            var entity = passStore.CreateEntity();
-            entity.AddComponent(new Pipelines.MaterialRef { Owner = inst });
-
-            inst.PassEntities = [entity];
-        }
-        inst.PassStore = passStore;
-        inst.Touch();
-
-        return inst;
-    }
-
-    public void SetTexture(string name, ITextureView? view)
-    {
-        Params.Set(name, view);
-        Touch();
-    }
-
-    public void SetScalarRegionLayout(MaterialScalarRegionLayout layout)
-    {
-        ScalarRegionLayout = layout ?? MaterialScalarRegionLayout.Empty;
-        Touch();
-    }
-
-    public void WriteScalarRegion(Span<byte> destination)
-        => ScalarRegionLayout.Write(Params, destination);
-
-    /// <summary>设置 Buffer 参数。</summary>
-    public void SetBuffer(string name, IBufferView? view)
-    {
-        Params.Set(name, view);
-        Touch();
-    }
-
-    public void Dispose()
-    {
-        PassStore = null;
-
-        if (PassEntities.Length > 0)
-        {
-            foreach (Entity passEntity in PassEntities)
-            {
-                if (!passEntity.IsNull && passEntity.StoreOwnership == StoreOwnership.attached)
-                {
-                    passEntity.DeleteEntity();
-                }
-            }
+            PassVersion++;
+            BindingVersion++;
         }
 
-        Params.Dispose();
+        TouchScalars();
+    }
+
+    internal void TouchBindings()
+    {
+        unchecked
+        {
+            BindingVersion++;
+        }
+    }
+
+    private static MaterialPass[] Copy(MaterialPass[] source)
+    {
+        if (source.Length == 0)
+            return [];
+
+        var copy = new MaterialPass[source.Length];
+        Array.Copy(source, copy, source.Length);
+        return copy;
     }
 }

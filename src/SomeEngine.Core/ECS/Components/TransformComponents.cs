@@ -1,6 +1,5 @@
-using System.Numerics;
-using Friflo.Engine.ECS;
 using SomeEngine.Core.Math;
+using SomeECS.Core.Components;
 
 namespace SomeEngine.Core.ECS.Components;
 
@@ -11,6 +10,5 @@ public struct LocalTransform : IComponent
 
 public struct WorldTransform : IComponent
 {
-    public Matrix4x4 Matrix; // 最终渲染通常需要矩阵
-    public TransformQvvs Qvvs; // 物理或其他系统可能需要世界空间的 QVVS
+    public TransformQvvs Qvvs;
 }

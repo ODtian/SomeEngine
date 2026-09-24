@@ -5,23 +5,20 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <EnumGenerator_EnableUsageAnalyzers>true</EnumGenerator_EnableUsageAnalyzers>
-    <UsesDiligentEngine>true</UsesDiligentEngine>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="NetEscapades.EnumGenerators" Version="1.0.0-beta21" PrivateAssets="all" />
     <PackageReference Include="Silk.NET.Windowing" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Input" Version="2.22.0" />
-    <PackageReference Include="DiligentGraphics.DiligentEngine.Core" Version="$(DiligentPackageVersion)" Condition="'$(DiligentUseLocalBuild)' != 'true'" />
-    <PackageReference Include="Diligent-SharpGen.Runtime" Version="$(DiligentSharpGenRuntimeVersion)" Condition="'$(DiligentUseLocalBuild)' == 'true'" />
     <PackageReference Include="ImGui.NET" Version="1.91.6.1" />
-    <PackageReference Include="StbImageSharp" Version="2.30.15" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\SomeEngine.Core\SomeEngine.Core.csproj" />
     <ProjectReference Include="..\SomeEngine.Assets\SomeEngine.Assets.csproj" />
+    <ProjectReference Include="..\SomeEngine.Rhi\SomeEngine.Rhi.csproj" />
+    <ProjectReference Include="..\..\..\SomeECS\src\SomeECS.Core\SomeECS.Core.csproj" />
+    <ProjectReference Include="..\..\..\SomeECS\src\SomeECS.Systems\SomeECS.Systems.csproj" />
     <ProjectReference Include="..\SomeEngine.Generators\SomeEngine.Generators.csproj"
                       OutputItemType="Analyzer"
                       ReferenceOutputAssembly="false" />

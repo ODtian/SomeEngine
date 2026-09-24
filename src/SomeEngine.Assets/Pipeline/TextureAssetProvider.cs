@@ -14,5 +14,5 @@ public sealed class TextureAssetProvider : AssetProvider<TextureAsset>
         => assetPath.EndsWith(".texture.asset", StringComparison.OrdinalIgnoreCase);
 
     public override TextureAsset Create(AssetGuid guid, string filePath)
-        => TextureAssetSerializer.Load(filePath);
+        => TextureAssetCodec.Load(filePath);
 }

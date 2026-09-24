@@ -69,3 +69,106 @@
 | TASK-309g | └ RenderWorld extract local-slot 重构 | DONE | BATCH-09b Task 2 |
 | TASK-309h | └ Cluster prepare zero-GC slot folding | DONE | BATCH-09b Task 3 |
 | TASK-309i | └ Host / Test / Docs / Legacy 清理与守护 | DONE | BATCH-09b Task 4 |
+
+## Phase 3: Render Pipeline Continuation
+
+| ID | Task | Status | Detail |
+|---|---|---|---|
+| TASK-312 | HDR SceneColor and Post Chain | DONE | [->](../../docs/TASK-DETAIL.md#task-312-hdr-scenecolor-and-post-chain) |
+| TASK-312a | BackBuffer / HDR SceneColor FrameTarget contract | DONE | BATCH-12 Task 1 |
+| TASK-312b | HDR Cluster shading output | DONE | BATCH-12 Task 2 |
+| TASK-312c | Minimal post tonemap pass | DONE | BATCH-12 Task 3 |
+| TASK-312d | Runtime / Editor adoption | DONE | BATCH-12 Task 4 |
+| TASK-313 | Motion Vectors and Temporal SceneColor History | DONE | [->](../../docs/TASK-DETAIL.md#task-313-motion-vectors-and-temporal-scenecolor-history) |
+| TASK-313a | MotionVectors / Temporal history target contract | DONE | BATCH-13 Task 1 |
+| TASK-313b | Cluster motion vector pass | DONE | BATCH-13 Task 2 |
+| TASK-313c | Temporal SceneColor history update | DONE | BATCH-13 Task 3 |
+| TASK-313d | Runtime / Editor adoption and tests | DONE | BATCH-13 Task 4 |
+| TASK-314 | Explicit Frame IO and Render History Simplification | DONE | [->](../../docs/TASK-DETAIL.md#task-314-explicit-frame-io-and-render-history-simplification) |
+| TASK-314a | Remove FrameTargetRegistry from frame IO | DONE | BATCH-14 Task 1 |
+| TASK-314b | Frame resource names and RenderGraph naming guard | DONE | BATCH-14 Task 2 |
+| TASK-314c | Independent RenderHistoryRegistry | DONE | BATCH-14 Task 3 |
+| TASK-314d | Pipeline / host migration | DONE | BATCH-14 Task 4 |
+| TASK-315 | Temporal Resolve and TAA Validation | DONE | [->](../../docs/TASK-DETAIL.md#task-315-temporal-resolve-and-taa-validation) |
+| TASK-315a | Temporal resolve contract | DONE | BATCH-15 Task 1 |
+| TASK-315b | Bounded temporal resolve shader | DONE | BATCH-15 Task 2 |
+| TASK-315c | Cluster pipeline integration | DONE | BATCH-15 Task 3 |
+| TASK-315d | Reset and host adoption | DONE | BATCH-15 Task 4 |
+| TASK-316 | Temporal Quality and Runtime Validation | DONE | [->](../../docs/TASK-DETAIL.md#task-316-temporal-quality-and-runtime-validation) |
+| TASK-316a | Temporal sample pattern and jitter contract | DONE | BATCH-16 Task 1 |
+| TASK-316b | Bounded quality resolve parameters | DONE | BATCH-16 Task 2 |
+| TASK-316c | Runtime and Editor validation adoption | DONE | BATCH-16 Task 3 |
+| TASK-316d | Tests, docs, report, and review | DONE | BATCH-16 Task 4 |
+| TASK-317 | Runtime Debug State and Validation Console Rework | DONE | [->](../../docs/TASK-DETAIL.md#task-317-runtime-debug-state-and-validation-console-rework) |
+| TASK-317a | Runtime debug state ownership | DONE | BATCH-17 Task 1 |
+| TASK-317b | Runtime Validation Console UI | DONE | BATCH-17 Task 2 |
+| TASK-317c | Host command routing | DONE | BATCH-17 Task 3 |
+| TASK-317d | Verification and artifacts | DONE | BATCH-17 Task 4 |
+| TASK-318 | Temporal Validation Hardening | DONE | [->](../../docs/TASK-DETAIL.md#task-318-temporal-validation-hardening) |
+| TASK-318a | Shared temporal validation presets | DONE | BATCH-18 Task 1 |
+| TASK-318b | Deterministic validation sequence | DONE | BATCH-18 Task 2 |
+| TASK-318c | Runtime capture artifacts and metrics | DONE | BATCH-18 Task 3 |
+| TASK-318d | Verification, report, and review | DONE | BATCH-18 Task 4 |
+| TASK-319 | Standalone RHI Core | DONE | [->](../../docs/TASK-DETAIL.md#task-319-standalone-rhi-core) |
+| TASK-319a | API spec and project shell | DONE | BATCH-19 Task 1 |
+| TASK-319b | Core contracts | DONE | BATCH-19 Task 2 |
+| TASK-319c | Strict Null backend | DONE | BATCH-19 Task 3 |
+| TASK-319d | RHI contract tests | DONE | BATCH-19 Task 4 |
+| TASK-319e | Review and hardening | DONE | BATCH-19 Task 5 |
+| TASK-320 | RHI D3D12 Vertical Slice | DONE | [->](../../docs/TASK-DETAIL.md#task-320-rhi-d3d12-vertical-slice) |
+| TASK-320a | Freeze-target core contract | DONE | BATCH-20 Task 1 |
+| TASK-320b | Null freeze-target validation | DONE | BATCH-20 Task 2 |
+| TASK-320c | D3D12 backend assembly | DONE | BATCH-20 Task 3 |
+| TASK-320d | D3D12 resource, memory, and commands | DONE | BATCH-20 Task 4 |
+| TASK-320e | Tests, review, and hardening | DONE | BATCH-20 Task 5 |
+| TASK-321 | Mature RHI Conformance Import | DONE | [->](../../docs/TASK-DETAIL.md#task-321-mature-rhi-conformance-import) |
+| TASK-321a | Source matrix | DONE | BATCH-21 Task 1 |
+| TASK-321b | Executable conformance slice | DONE | BATCH-21 Task 2 |
+| TASK-321c | Validation and report | DONE | BATCH-21 Task 3 |
+| TASK-322 | Mature RHI Corpus Expansion | DONE | [->](../../docs/TASK-DETAIL.md#task-322-mature-rhi-corpus-expansion) |
+| TASK-322a | Corpus inventory | DONE | BATCH-22 Task 1 |
+| TASK-322b | Executable matrix expansion | DONE | BATCH-22 Task 2 |
+| TASK-322c | Validation and review | DONE | BATCH-22 Task 3 |
+| TASK-323 | RHI D3D12 Execution Coverage | DONE | [->](../../docs/TASK-DETAIL.md#task-323-rhi-d3d12-execution-coverage) |
+| TASK-323a | GPU copy and render-target readback | DONE | BATCH-23 Task 1 |
+| TASK-323b | Draw, timestamp, and placed aliasing execution | DONE | BATCH-23 Task 2 |
+| TASK-323c | Validation and review | DONE | BATCH-23 Task 3 |
+| TASK-324 | RHI Advanced Capability Completion | DONE | [->](batches/BATCH-24-INSTRUCTIONS.md) |
+| TASK-324a | Advanced backend completion | DONE | BATCH-24 Task 1 |
+| TASK-324b | Generate mips utility | DONE | BATCH-24 Task 2 |
+| TASK-324c | Documentation, validation, and review | DONE | BATCH-24 Task 3 |
+| TASK-325 | RHI Visible Swapchain Automation | DONE | [->](batches/BATCH-25-INSTRUCTIONS.md) |
+| TASK-325a | Harness project | DONE | BATCH-25 Task 1 |
+| TASK-325b | Display-path scenarios | DONE | BATCH-25 Task 2 |
+| TASK-325c | Automation contract and records | DONE | BATCH-25 Task 3 |
+| TASK-326 | Engine Renderer RHI Migration | IN PROGRESS | [->](batches/BATCH-26-INSTRUCTIONS.md) |
+| TASK-326a | Build recovery and default Runtime RHI graph path | DONE | BATCH-26 Task 1 |
+| TASK-326b | Direct cluster RenderGraph RHI migration | TODO | BATCH-26 Task 2 |
+| TASK-326c | Build and validation | DONE | BATCH-26 Task 3 |
+| TASK-327 | RG Cluster Owner Repair | IN PROGRESS | [->](batches/BATCH-27-INSTRUCTIONS.md) |
+| TASK-327a | RG compile owner | DONE | BATCH-27 Task 1 |
+| TASK-327b | Frame entry | IN PROGRESS | BATCH-27 Task 2 |
+| TASK-327c | Bind and bin | IN PROGRESS | BATCH-27 Task 3 |
+| TASK-327d | Slots pages uploads | TODO | BATCH-27 Task 4 |
+| TASK-327e | Docs and gates | IN PROGRESS | BATCH-27 Task 5 |
+| TASK-328 | PipelineState Store Refactor | DONE | [->](batches/BATCH-28-INSTRUCTIONS.md) |
+| TASK-328a | Store model | DONE | BATCH-28 Task 1 |
+| TASK-328b | Native cache and modules | DONE | BATCH-28 Task 2 |
+| TASK-328c | Render integration | DONE | BATCH-28 Task 3 |
+| TASK-328d | Tests and docs | DONE | BATCH-28 Task 4 |
+| TASK-330 | RenderGraph RDG 模式完整重构 | DONE | [->](batches/BATCH-30-INSTRUCTIONS.md) |
+| TASK-330a | └ Public authoring contract rewrite | DONE | BATCH-30 Task 1 |
+| TASK-330b | └ Compiler rewrite | DONE | BATCH-30 Task 2 |
+| TASK-330c | └ Executor and runtime ownership split | DONE | BATCH-30 Task 3 |
+| TASK-330d | └ Frame data and history rewrite | DONE | BATCH-30 Task 4 |
+| TASK-330e | └ Binding and pass-data rewrite | DONE | BATCH-30 Task 5 |
+| TASK-330f | └ Cluster/material/post/host integration rewrite | DONE | BATCH-30 Task 6 |
+| TASK-330g | └ Delete legacy model | DONE | BATCH-30 Task 7 |
+| TASK-330h | └ Validation, simplify, report, and review | DONE | BATCH-30 Task 8 |
+| TASK-331 | RenderGraph Contract Retrofit | DONE | [->](batches/BATCH-31-INSTRUCTIONS.md) |
+| TASK-331a | └ Explicit Pass Access Contract | DONE | BATCH-31 Task 1 |
+| TASK-331b | └ Dependency, Culling, And Queue Closure | DONE | BATCH-31 Task 2 |
+| TASK-331c | └ Resource Class, Lifetime, And History Semantics | DONE | BATCH-31 Task 3 |
+| TASK-331d | └ Alias Allocation And Handoff Safety | DONE | BATCH-31 Task 4 |
+| TASK-331e | └ Barrier, Queue, And Execution Backend | DONE | BATCH-31 Task 5 |
+| TASK-331f | └ In-Repo Migration, Diagnostics, Report, And Review Inputs | DONE | BATCH-31 Task 6 |

@@ -27,6 +27,9 @@
     <FlatSharpSchema Include="..\..\assets\Schema\texture_asset.fbs" />
     <FlatSharpSchema Include="..\..\assets\Schema\mesh_asset.fbs" />
     <FlatSharpSchema Include="..\..\assets\Schema\shader_asset.fbs" />
+    <FlatSharpSchema Include="..\..\assets\Schema\cluster_render_asset.fbs">
+      <IncludePath>..\..\assets\Schema</IncludePath>
+    </FlatSharpSchema>
     <FlatSharpSchema Include="..\..\assets\Schema\material_asset.fbs">
       <IncludePath>..\..\assets\Schema</IncludePath>
     </FlatSharpSchema>

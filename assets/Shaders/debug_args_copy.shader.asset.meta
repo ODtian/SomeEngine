@@ -1,0 +1,13 @@
+{
+  "asset_guid": "c93cba86-7cff-5bb5-8aae-5932cc7d273c",
+  "source_guid": "9f9b2f7d-dbbf-42cf-8059-060b49711fb6",
+  "sub_asset_key": "shader:main",
+  "content_fingerprint": "bfe89b38325802d26d83357a28b1e577f8874be8da0784d09695713ae51fd0f5",
+  "dependencies": [
+    {
+      "path": "assets/Shaders/debug_args_copy.slang",
+      "hash": "a42564ec96f5f4b9c433f38a8ea14f178e1962742e985146df7b4423c34a0a2e"
+    }
+  ],
+  "importer_version": 15
+}

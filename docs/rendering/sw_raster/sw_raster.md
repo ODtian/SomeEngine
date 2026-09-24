@@ -278,8 +278,8 @@ SW Raster 的 CS: 同样 InterlockedMax 写同一个 UAV
 - [x] WaveQueue 泛型分发器实现（[wave_queue.slang](file:///f:/SomeEngine/assets/Shaders/wave_queue.slang)）
 - [x] `DeduplicateVertIndexes` 64-bit bitmask 版本实现（[sw_raster.slang](file:///f:/SomeEngine/assets/Shaders/sw_raster.slang)）
 - [x] VRB build-time：`ReorderForVRB` 贪心重排 + degenerate padding（[ClusterBuilder.cs](file:///f:/SomeEngine/src/SomeEngine.Assets/Importers/ClusterBuilder.cs)）
-- [x] Raster Binning 基础设施（[cluster_binning.slang](file:///f:/SomeEngine/assets/Shaders/cluster_binning.slang) + [ClusterRasterBinStage.cs](file:///f:/SomeEngine/src/SomeEngine.Render/Pipelines/ClusterRender/Stages/ClusterRasterBinStage.cs)）
-- [x] BinSpace / MaterialSlotBuffer / BinQueue 系统
+- [x] Raster Binning 基础设施（[cluster_binning.slang](file:///f:/SomeEngine/assets/Shaders/cluster_binning.slang) + `RasterBinPass` / `ClusterRasterStage`）
+- [x] SlotBuffer / MaterialItems 系统
 
 ## 11. 待完成工作
 

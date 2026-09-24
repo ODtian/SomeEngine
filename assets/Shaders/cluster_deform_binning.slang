@@ -6,6 +6,10 @@ struct BinningUniforms
     uint SlotCapacity;
     uint BinFieldIndex;
     uint MaxVisibleClusters;
+    uint ResetCacheAllocationState;
+    uint Pad0;
+    uint Pad1;
+    uint Pad2;
 };
 
 ConstantBuffer<BinningUniforms> Uniforms;
@@ -17,21 +21,20 @@ ByteAddressBuffer DrawArgs;
 RWByteAddressBuffer DeformBinningDispatchArgs;
 RWStructuredBuffer<DeformBinEntry> DeformBinMeta;
 RWStructuredBuffer<uint2> BinnedClusterIndexBuffer;
-StructuredBuffer<uint> MaterialSlotBuffer;
+RWStructuredBuffer<uint> CacheOffsetsWrite;
+RWStructuredBuffer<uint> CacheAllocationCounter;
+StructuredBuffer<uint> SlotBuffer;
 ByteAddressBuffer PageHeap;
 RWStructuredBuffer<uint> ReserveCounters;
 
-DispatchArgs MakeIndirectDispatchArgs(uint groupCount)
-{
-    uint dispatchX = min(groupCount, 65535u);
-    uint dispatchY = max(1u, (groupCount + 65534u) / 65535u);
-    return DispatchArgs(dispatchX, dispatchY, 1);
-}
+static const uint CACHE_OFFSET_UNINITIALIZED = 0xFFFFFFFEu;
+
+#include "cluster_bin_io.slang"
 
 void DecodeVisibleIndex(uint logicalIdx, out uint visibleIndex, out bool isSW)
 {
-    CullDrawArgs args = DrawArgs.Load<CullDrawArgs>(0);
-    CullDrawArgs readOffset = ReadOffsetArgs.Load<CullDrawArgs>(0);
+    CullDrawArgs args = LoadCullDrawArgs(DrawArgs, 0u);
+    CullDrawArgs readOffset = LoadCullDrawArgs(ReadOffsetArgs, 0u);
     uint swCount = args.SWCount;
     uint hwCount = args.HWCount;
     uint swBase = readOffset.SWCount;
@@ -86,79 +89,88 @@ void ReadClusterVRB(uint4 entry, out uint vrbInfo, out uint triangleCount)
     vrbInfo = PageHeap.Load(pageOffset + clustersOff + clusterID * GPU_CLUSTER_STRIDE_BYTES + 60);
 }
 
-uint ReadDeformBinKey(uint instanceID)
+uint DeformKey(uint instanceID)
 {
-    uint slotOffset = GetInstanceMaterialSlotOffset(instanceID);
-    return GetSlotField(MaterialSlotBuffer, slotOffset, Uniforms.BinFieldIndex, Uniforms.SlotCapacity);
+    return SlotBin(
+        SlotBuffer,
+        instanceID,
+        Uniforms.BinFieldIndex,
+        Uniforms.SlotCapacity,
+        Uniforms.MaxBins);
+}
+
+void ClearBin(uint tid)
+{
+    ClearDeform(DeformBinMeta, tid, Uniforms.MaxBins);
+}
+
+void WriteArgs()
+{
+    CullDrawArgs args = LoadCullDrawArgs(DrawArgs, 0u);
+    uint totalVisible = args.SWCount + args.HWCount;
+    StoreDispatchArgs(DeformBinningDispatchArgs, 0u, DispatchArgs((totalVisible + 63) / 64, 1, 1));
 }
 
 [numthreads(64, 1, 1)]
 void CSDeformBinClear(uint3 dtid : SV_DispatchThreadID)
 {
-    uint tid = dtid.x;
-    if (tid >= Uniforms.MaxBins) return;
-
-    DeformBinMeta[tid].ClusterOffset = 0;
-    DeformBinMeta[tid].BinCount = 0;
-    DeformBinMeta[tid].Cursor = 0;
-    DeformBinMeta[tid].Pad = 0;
+    ClearBin(dtid.x);
 }
 
 [numthreads(1, 1, 1)]
 void CSDeformBinPrepare(uint3 dtid : SV_DispatchThreadID)
 {
-    CullDrawArgs args = DrawArgs.Load<CullDrawArgs>(0);
-    uint totalVisible = args.SWCount + args.HWCount;
-    DeformBinningDispatchArgs.Store<DispatchArgs>(0, DispatchArgs((totalVisible + 63) / 64, 1, 1));
+    WriteArgs();
 }
 
-void EmitDeformBinEntry(uint binKey, uint visibleIndex, uint triStart, uint triEnd, bool doScatter)
+[numthreads(64, 1, 1)]
+void CSDeformBinClearPrepare(uint3 dtid : SV_DispatchThreadID)
 {
-    if (binKey >= Uniforms.MaxBins) binKey = 0;
+    ClearBin(dtid.x);
 
+    if (dtid.x == 0)
+    {
+        WriteArgs();
+        ReserveCounters[0] = 0;
+        if (Uniforms.ResetCacheAllocationState != 0u)
+            CacheAllocationCounter[0] = 0;
+    }
+}
+
+void EmitDeform(uint binKey, uint visibleIndex, bool doScatter)
+{
     if (!doScatter)
     {
-        uint unused;
-        InterlockedAdd(DeformBinMeta[binKey].BinCount, 1, unused);
+        CountDeform(DeformBinMeta, binKey);
         return;
     }
 
-    uint offset = DeformBinMeta[binKey].ClusterOffset;
-    uint localIdx;
-    InterlockedAdd(DeformBinMeta[binKey].Cursor, 1, localIdx);
-    BinnedClusterIndexBuffer[offset + localIdx] = uint2(visibleIndex, (triStart << 16) | triEnd);
+    ScatterDeform(
+        DeformBinMeta,
+        BinnedClusterIndexBuffer,
+        CacheOffsetsWrite,
+        binKey,
+        visibleIndex,
+        CACHE_OFFSET_UNINITIALIZED);
 }
 
-void ProcessClusterRanges(uint visibleIndex, bool doScatter)
+void ProcessCluster(uint visibleIndex, bool doScatter)
 {
     uint4 entry = VisibleClusters[visibleIndex];
 
     uint vrbInfo, triangleCount;
     ReadClusterVRB(entry, vrbInfo, triangleCount);
-    VRBDecoded vrb = DecodeVRB(vrbInfo, triangleCount);
+    if (triangleCount == 0u)
+        return;
 
-    uint triStart = 0;
-    for (uint b = 0; b < vrb.batchCount; b++)
-    {
-        uint triEnd = min(triStart + vrb.triCounts[b], triangleCount);
-        uint binKey = ReadDeformBinKey(entry.z);
-        EmitDeformBinEntry(binKey, visibleIndex, triStart, triEnd, doScatter);
-        triStart = triEnd;
-    }
-
-    while (triStart < triangleCount)
-    {
-        uint triEnd = min(triStart + 32, triangleCount);
-        uint binKey = ReadDeformBinKey(entry.z);
-        EmitDeformBinEntry(binKey, visibleIndex, triStart, triEnd, doScatter);
-        triStart = triEnd;
-    }
+    uint binKey = DeformKey(entry.z);
+    EmitDeform(binKey, visibleIndex, doScatter);
 }
 
 [numthreads(64, 1, 1)]
 void CSDeformBinCount(uint3 dtid : SV_DispatchThreadID)
 {
-    CullDrawArgs args = DrawArgs.Load<CullDrawArgs>(0);
+    CullDrawArgs args = LoadCullDrawArgs(DrawArgs, 0u);
     uint totalVisible = args.SWCount + args.HWCount;
     uint idx = dtid.x;
     if (idx >= totalVisible) return;
@@ -167,7 +179,7 @@ void CSDeformBinCount(uint3 dtid : SV_DispatchThreadID)
     bool isSW;
     DecodeVisibleIndex(idx, visibleIndex, isSW);
 
-    ProcessClusterRanges(visibleIndex, false);
+    ProcessCluster(visibleIndex, false);
 }
 
 #define DEFORM_BIN_RESERVE_BLOCK_SIZE 128
@@ -203,8 +215,14 @@ void CSDeformBinReserve(uint3 dtid : SV_DispatchThreadID, uint groupIndex : SV_G
 
     if (bin >= Uniforms.MaxBins) return;
 
-    DeformBinMeta[bin].ClusterOffset = DeformReserveBlockBase + inclusiveOffset - count;
-    DeformBinMeta[bin].Cursor = 0;
+    ReserveDeform(
+        DeformBinMeta,
+        DeformBinningDispatchArgs,
+        bin,
+        Uniforms.MaxBins,
+        DeformReserveBlockBase,
+        inclusiveOffset,
+        count);
 }
 
 [numthreads(64, 1, 1)]
@@ -214,13 +232,13 @@ void CSDeformBinReserveDispatchWrite(uint3 dtid : SV_DispatchThreadID)
     if (tid >= Uniforms.MaxBins) return;
 
     uint count = DeformBinMeta[tid].BinCount;
-    DeformBinningDispatchArgs.Store<DispatchArgs>(tid * 12, MakeIndirectDispatchArgs(count));
+    WriteDispatch(DeformBinningDispatchArgs, tid, count);
 }
 
 [numthreads(64, 1, 1)]
 void CSDeformBinScatter(uint3 dtid : SV_DispatchThreadID)
 {
-    CullDrawArgs args = DrawArgs.Load<CullDrawArgs>(0);
+    CullDrawArgs args = LoadCullDrawArgs(DrawArgs, 0u);
     uint totalVisible = args.SWCount + args.HWCount;
     uint idx = dtid.x;
     if (idx >= totalVisible) return;
@@ -229,5 +247,5 @@ void CSDeformBinScatter(uint3 dtid : SV_DispatchThreadID)
     bool isSW;
     DecodeVisibleIndex(idx, visibleIndex, isSW);
 
-    ProcessClusterRanges(visibleIndex, true);
+    ProcessCluster(visibleIndex, true);
 }

@@ -55,20 +55,17 @@ Standard targets and custom targets now use the same `FrameTargetRegistry` decla
 
 | Task | Result |
 |---|---|
-| TASK-311a | Added `FrameTargetRegistry`, `FrameTargetKey`, `FrameTargetHandle`, declarations, lifetimes, compatible merge, override, freeze, invalidation, and standard keys as presets only. |
+| TASK-311a | Added a trimmed `FrameTargetRegistry` for texture targets, imported targets, history textures, compatible merge, and standard keys as presets only. |
 | TASK-311b | Added `QueueTextureExtraction` and `QueueBufferExtraction`; extraction resources are sink resources and keep producer passes alive under DCE. |
 | TASK-311c | Migrated the main HiZ path to registry-backed history when a registry is supplied; legacy `PingPongHandle` remains only for compatibility with old `IRenderFeature.AddPasses(RenderGraph)` callers. |
 | TASK-311d | Added deterministic material fallback binding policy and renderer-owned fallback GPU resources for white, black, flat-normal, default buffer, and default sampler. |
-| TASK-311e | Runtime and Editor now import/declare SceneColor and SceneDepth through `FrameTargetRegistry`; `ClusterPipeline` resolves them from the registry. |
+| TASK-311e | Runtime and Editor now import/create SceneColor and SceneDepth through `FrameTargetRegistry`; `ClusterPipeline` reads them from the registry. |
 
 ## Public API Shape
 
 - `FrameTargetRegistry.BeginFrame(RenderGraph, FrameTargetContext)`
-- `DeclareTexture`, `DeclareBuffer`, `ImportTexture`, `ImportBuffer`
-- `OverrideTexture`, `OverrideImportedTexture`
-- `ResolveTexture`, `ResolveBuffer`
-- `ResolveHistoryTexture`, `ResolveHistoryBuffer`
-- `Invalidate`
+- `Texture`, `ImportTexture`, `GetTexture`
+- `HistoryTexture`, `ResetHistory`
 - `RenderGraph.QueueTextureExtraction`
 - `RenderGraph.QueueBufferExtraction`
 - `ShaderParamBag.ApplyFallbacks`
@@ -77,7 +74,8 @@ Standard targets and custom targets now use the same `FrameTargetRegistry` decla
 ## Design Decisions
 
 - The registry does not expose built-in/user split APIs. A standard target and a custom target differ only by key value.
-- `FrameTargetHandle` is semantic and stable within the renderer contract. `RenderGraphHandle` remains single-frame and graph-local.
+- The registry intentionally stays texture-first for now. Buffer targets can be added later when a real pass needs them.
+- `RenderGraphHandle` remains single-frame and graph-local; `FrameTargetKey` is the stable semantic name across frame setup and pipeline code.
 - RenderGraph extraction is intentionally key-agnostic. It only knows graph handles and physical resource sinks.
 - HiZ history uses ping-pong resource names internally through the registry-backed history state so the previous frame and current frame never alias the same cached texture.
 - The old cluster `AddPasses(RenderGraph)` path falls back to `SceneColor`/`ColorTarget` and `SceneDepth`/`DepthTarget` names for compatibility, but Runtime/Editor now exercise the registry path.

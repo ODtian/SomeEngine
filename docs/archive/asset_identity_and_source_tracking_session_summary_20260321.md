@@ -38,8 +38,8 @@
 ### 2.2 `.meta` 读写基础设施
 已新增：
 
-- `src/SomeEngine.Assets/Meta/SourceMetaManager.cs`
-- `src/SomeEngine.Assets/Meta/AssetMetaManager.cs`
+- `src/SomeEngine.Assets/Meta/SourceMetaFiles.cs`
+- `src/SomeEngine.Assets/Meta/AssetMetaFiles.cs`
 
 实现内容：
 
@@ -98,8 +98,8 @@
 已落地的功能：
 
 - 保留兼容入口 `Import(path)`
-- 自动调用 `SourceMetaManager.GetOrCreate(...)`
-- 自动读取 `AssetMetaManager.TryLoad(...)`
+- 自动调用 `SourceMetaFiles.GetOrCreate(...)`
+- 自动读取 `AssetMetaFiles.TryLoad(...)`
 - 写入 `ShaderAsset.asset_guid`
 - 写入 `ShaderAsset.import_trace`
 - 写出 `.asset` 与 `.asset.meta`

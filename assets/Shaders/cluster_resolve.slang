@@ -8,8 +8,6 @@ struct ResolveUniforms
     uint DebugMode;
     uint ScreenWidth;
     uint ScreenHeight;
-    float3 QuantOrigin;
-    float QuantStep;
 };
 
 ConstantBuffer<ResolveUniforms> Uniforms;
@@ -34,17 +32,14 @@ void CSResolve(uint3 dispatchThreadID : SV_DispatchThreadID)
     uint visData = VisBuffer[pixelCoord];
 
     // 0 means no geometry (clear value)
-    if (visData == 0)
+    if (IsVisBufferEmpty(visData))
     {
         OutputColor[pixelCoord] = float4(0, 0, 0, 1);
         return;
     }
 
-    // Decode VisBuffer: (VisibleClusterIndex + 1) in high 25 bits, TriangleID in low 7 bits
-    // Strip bit 31 (used as SW/HW debug marker when DebugMode==3, always 0 otherwise)
-    uint visDataClean = visData & 0x7FFFFFFFu;
-    uint visibleClusterIndex = (visDataClean >> 7) - 1;
-    uint triangleID = visDataClean & 0x7F;
+    uint visibleClusterIndex = DecodeVisBufferVisibleClusterIndex(visData);
+    uint triangleID = DecodeVisBufferTriangleID(visData);
 
     // Look up the draw request
     DrawRequest req = VisibleClusters[visibleClusterIndex];
@@ -72,9 +67,9 @@ void CSResolve(uint3 dispatchThreadID : SV_DispatchThreadID)
     uint vi2 = FetchVertexIndex(PageHeap, pageOffset, idxOffset, tStart, triangleID, 2);
 
     // Fetch 3 vertex positions (object space, dequantized)
-    float3 pos0 = FetchVertexPosition(PageHeap, pageOffset, posOffset, vStart, vi0, intBase, Uniforms.QuantOrigin, Uniforms.QuantStep);
-    float3 pos1 = FetchVertexPosition(PageHeap, pageOffset, posOffset, vStart, vi1, intBase, Uniforms.QuantOrigin, Uniforms.QuantStep);
-    float3 pos2 = FetchVertexPosition(PageHeap, pageOffset, posOffset, vStart, vi2, intBase, Uniforms.QuantOrigin, Uniforms.QuantStep);
+    float3 pos0 = FetchVertexPosition(PageHeap, pageOffset, posOffset, vStart, vi0, intBase);
+    float3 pos1 = FetchVertexPosition(PageHeap, pageOffset, posOffset, vStart, vi1, intBase);
+    float3 pos2 = FetchVertexPosition(PageHeap, pageOffset, posOffset, vStart, vi2, intBase);
 
     // Transform to world space
     GpuTransform t = Instances[realInstanceID];
@@ -101,7 +96,7 @@ void CSResolve(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
     else if (Uniforms.DebugMode == 3) // SW/HW raster debug view
     {
-        bool isSW = (visData & 0x80000000u) != 0;
+        bool isSW = IsVisBufferSWRaster(visData);
         // Pure classification color: blue = SW rasterized, red = HW rasterized.
         color = isSW ? float3(0.05, 0.25, 1.0) : float3(1.0, 0.10, 0.05);
     }
@@ -111,8 +106,8 @@ void CSResolve(uint3 dispatchThreadID : SV_DispatchThreadID)
     }
     else
     {
-        // Debug modes >= 4 are handled by the material shade pass.
-        // Don't write here — let the shade pass handle them.
+        // Material debug modes are handled by the material shade pass.
+        // Don't write here; let the shade pass handle them.
         return;
     }
 

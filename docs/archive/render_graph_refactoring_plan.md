@@ -40,7 +40,7 @@
     - 插入独立的 `UploadUniformsPass` 完成 CPU 到 GPU 的数据更新。
 2.  **复杂 Immediate Dispatch 改造（核心痛点）**：
     - **现状**：`ClusterResourceManager.ExecutePatchBVHLeafNodes` 直接 `CreateBuffer`、Map、`DispatchCompute`。
-    - **重构**：将其拆解。CPU 侧只积累需要 Patch 的列表（`PendingPatch`）。在图构建时，动态申请 `PatchNodeIndices` Buffer，插入正规的 `ClusterBVHPatchPass`。利用 Graph 在该 Pass 和后续的 TraversePass 之间自动推导并插入 `Transition`。
+    - **重构**：将其拆解。CPU 侧只积累需要 Patch 的列表（`PendingPatch`）。在图构建时，动态申请 `PatchNodeIndices` Buffer，插入正规的 `BvhPatchPass`。利用 Graph 在该 Pass 和后续的 TraversePass 之间自动推导并插入 `Transition`。
 
 ### Phase 3: ECS 前端与 RG 后端的界限划定 (Data Extraction 层引入)
 目标：确立 ECS 为逻辑侧权威数据源，RenderGraph 为纯粹的后端执行器，规范化两者之间的数据流向与隔离。

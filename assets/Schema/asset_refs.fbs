@@ -1,0 +1,7 @@
+// Common asset reference value objects.
+// This file is only consumed via `include` -- do not add to FlatSharpSchema input list.
+namespace SomeEngine.Assets.Schema;
+
+table ShaderAssetRef {
+    shader_guid: string;
+}

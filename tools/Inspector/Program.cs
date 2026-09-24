@@ -1,6 +1,8 @@
-﻿using System;
+using System;
+using System.Linq;
 using System.Reflection;
-using Friflo.Engine.ECS;
+using SomeECS.Core;
+using SomeECS.Core.Components;
 
 struct TestComp : IComponent { }
 
@@ -8,10 +10,12 @@ class Program
 {
     static void Main()
     {
-        Console.WriteLine("\nInspecting ComponentTypes:");
-        foreach (var method in typeof(ComponentTypes).GetMethods(BindingFlags.Public | BindingFlags.Static))
+        Console.WriteLine("\nInspecting SomeECS World component API:");
+        foreach (var method in typeof(World)
+            .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Where(method => method.Name is "Add" or "Set" or "Read" or "ReadWrite" or "Has"))
         {
-             Console.WriteLine("Method: " + method.Name);
+            Console.WriteLine("Method: " + method.Name);
         }
     }
 }

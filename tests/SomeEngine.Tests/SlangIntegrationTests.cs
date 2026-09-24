@@ -3,7 +3,6 @@ using System.Linq;
 using SomeEngine.Assets;
 using SomeEngine.Assets.Importers;
 using SomeEngine.Assets.Schema;
-
 namespace SomeEngine.Tests;
 
 public class SlangIntegrationTests
@@ -139,9 +138,9 @@ public class SlangIntegrationTests
             Assert.True(AssetGuid.TryParse(asset1.AssetGuid, out var guid1));
             Assert.True(AssetGuid.TryParse(asset2.AssetGuid, out var guid2));
             Assert.Equal(guid2, guid1);
-            Assert.True(File.Exists(SourceMetaManager.GetMetaPath(slangFile)));
+            Assert.True(File.Exists(SourceMetaFiles.GetMetaPath(slangFile)));
             string assetPath = Path.ChangeExtension(Path.GetFullPath(slangFile), ".shader.asset");
-            Assert.True(File.Exists(AssetMetaManager.GetMetaPath(assetPath)));
+            Assert.True(File.Exists(AssetMetaFiles.GetMetaPath(assetPath)));
             Assert.NotNull(asset1.ImportTrace);
             Assert.NotEmpty(asset1.ImportTrace!.SourceGuid);
         }

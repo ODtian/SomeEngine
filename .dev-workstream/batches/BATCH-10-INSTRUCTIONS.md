@@ -41,7 +41,7 @@
 4. `src/SomeEngine.Render/Systems/MaterialPassBaker.cs`
 5. `src/SomeEngine.Render/Systems/RenderWorldExtractor.cs`
 6. `src/SomeEngine.Render/Materials/BinSpace.cs`
-7. `src/SomeEngine.Render/Pipelines/ClusterRender/ClusterMaterialSlotPreparer.cs`
+7. `src/SomeEngine.Render/Pipelines/ClusterRender/SlotPreparer.cs`
 8. `src/SomeEngine.Render/Pipelines/ClusterRender/ClusterPipeline.cs`
 9. `src/SomeEngine.Render/Pipelines/ClusterRender/Stages/ClusterShade.cs`
 10. `src/SomeEngine.Render/Pipelines/ClusterRender/RasterPSOBuilder.cs`
@@ -68,7 +68,7 @@
 
 ```bash
 dotnet build SomeEngine.slnx --no-restore -v minimal
-dotnet test tests/SomeEngine.Tests/SomeEngine.Tests.csproj --no-restore --verbosity quiet --filter "FullyQualifiedName~MaterialPassBaker|FullyQualifiedName~RenderWorldExtractor|FullyQualifiedName~ClusterMaterialSlotPreparer|FullyQualifiedName~BinSpace|FullyQualifiedName~ShaderGroup|FullyQualifiedName~AssetDatabase|FullyQualifiedName~GeneratedAssetPipelineCatalog"
+dotnet test tests/SomeEngine.Tests/SomeEngine.Tests.csproj --no-restore --verbosity quiet --filter "FullyQualifiedName~MaterialPassBaker|FullyQualifiedName~RenderWorldExtractor|FullyQualifiedName~SlotPreparer|FullyQualifiedName~BinSpace|FullyQualifiedName~ShaderGroup|FullyQualifiedName~AssetDatabase|FullyQualifiedName~GeneratedAssetPipelineCatalog"
 ```
 
 Per project instruction, run `dotnet build/test` outside the sandbox if restore or SDK setup is needed.
@@ -82,7 +82,7 @@ Per project instruction, run `dotnet build/test` outside the sandbox if restore 
 - `MaterialPassBaker` 只创建空 render entity，导致材质 pass 上的 ECS tags/components 没有进入 render world。
 - `Material.Instantiate()` 只复制 `MaterialRef`，实例材质丢失父材质 pass feature。
 - `RenderWorldExtractor` 只 hash source/material guid/pass count，不感知 material/pass version，热更新或 feature 变化可能不触发 extract。
-- `ClusterMaterialSlotPreparer` 把所有 bin field 指向第一个 pass entity，raster/shade/deform 语义丢失。
+- `SlotPreparer` 把所有 bin field 指向第一个 pass entity，raster/shade/deform 语义丢失。
 - `BinSpace.RebuildIfDirty()` 实际每次强制 rebuild，`AddPasses` 仍在做 CPU prepare 工作。
 - `ClusterPipeline.RebuildPSOGroups()` 当前清空 PSO groups，管线无法从 render world query 消费 feature 集合。
 - `GlobalPsoCache` / `SRBPool` 生命周期不清晰，host 侧创建的 PSO cache 没有统一释放。
@@ -122,7 +122,7 @@ Per project instruction, run `dotnet build/test` outside the sandbox if restore 
 
 ### Task 2: PrepareFrame Owns Derived CPU Data (TASK-310b)
 
-**Files:** `BinSpace.cs`, `ClusterMaterialSlotPreparer.cs`, `ClusterPipeline.cs`
+**Files:** `BinSpace.cs`, `SlotPreparer.cs`, `ClusterPipeline.cs`
 
 **Requirements:**
 - `BinSpace.RebuildIfDirty()` 只在 dirty 时 rebuild。

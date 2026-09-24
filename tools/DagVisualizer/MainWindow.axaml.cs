@@ -36,7 +36,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            var meshAsset = MeshAssetSerializer.Load(path);
+            var meshAsset = MeshAssetCodec.Load(path);
             if (meshAsset.Payload == null) return;
 
             var clusters = new List<GPUCluster>();

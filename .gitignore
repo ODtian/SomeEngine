@@ -41,6 +41,9 @@ logs/
 project.lock.json
 project.fragment.lock.json
 artifacts/
+BenchmarkDotNet.Artifacts/
+benchmarks/**/BenchmarkDotNet.Artifacts/
+benchmarks/**/*.log
 
 # Unit tests
 TestResults/
@@ -83,7 +86,10 @@ external/dxc/
 # Local tool/runtime artifacts
 .dotnet-cli/
 .dotnet_home/
+.tmp/
 Library/
 external/UnrealEnigne/
 src/SomeEngine.Runtime/imgui.ini
 tests/SomeEngine.Tests/dotnet_test.log
+
+profiles/

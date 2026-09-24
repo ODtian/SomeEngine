@@ -12,7 +12,7 @@
 - RenderWorld 提交组件从 `RenderRegionBinding` 收敛为 `RenderMaterialSlotBinding`
 - `RenderWorldExtractor` 改为展开 `(source entity, local material slot, material pass)`，并加入 steady-state no-op 帧签名，避免结构未变时重复重建
 - 删除 `RenderWorldMaterialSlotSynchronizer` 与 `ClusterPipelineSlotBindingBuilder`
-- 新增 pipeline-owned 的 `ClusterMaterialSlotPreparer`，把 slot folding 收到 cluster pipeline 自己的 prepare 路径
+- 新增 pipeline-owned 的 `SlotPreparer`，把 slot folding 收到 cluster pipeline 自己的 prepare 路径
 - Runtime / Editor 不再显式持有 extractor/synchronizer，而是统一调用 `ClusterPipeline.PrepareFrame(...)`
 - Runtime 每帧材质解析缓存从 `Dictionary` 改为线性 `List<(AssetGuid, Material)>` 查找，满足 no-Dictionary 约束
 - 新增两条 steady-state allocation regression 测试，验证 extractor 和 cluster prepare 热路径在结构不变时为 0 bytes
@@ -24,7 +24,7 @@
 - `src/SomeEngine.Render/Components/MeshMaterialBindingsComponent.cs`
 - `src/SomeEngine.Render/Components/RenderWorldComponents.cs`
 - `src/SomeEngine.Render/Systems/RenderWorldExtractor.cs`
-- `src/SomeEngine.Render/Pipelines/ClusterRender/ClusterMaterialSlotPreparer.cs` (new)
+- `src/SomeEngine.Render/Pipelines/ClusterRender/SlotPreparer.cs` (new)
 - `src/SomeEngine.Render/Pipelines/ClusterRender/ClusterPipeline.cs`
 - `src/SomeEngine.Render/Materials/MaterialEntityUtility.cs`
 - `src/SomeEngine.Render/Materials/MaterialSlotCache.cs`
@@ -41,7 +41,7 @@
 - `tests/SomeEngine.Tests/Assets/AssetResolverTests.cs`
 - `tests/SomeEngine.Tests/Systems/RenderWorldExtractorTests.cs`
 - `tests/SomeEngine.Tests/Pipelines/ClusterPipelineEntityQueriesTests.cs`
-- `tests/SomeEngine.Tests/Pipelines/ClusterMaterialSlotPreparerTests.cs` (new)
+- `tests/SomeEngine.Tests/Pipelines/SlotPreparerTests.cs` (new)
 - `tests/SomeEngine.Tests/Pipelines/ClusterPipelineSlotBindingSelectorTests.cs` (deleted)
 - `tests/SomeEngine.Tests/Pipelines/RenderWorldMaterialSlotSynchronizerTests.cs` (deleted)
 
@@ -68,14 +68,14 @@
 Focused hot-path verification:
 
 ```text
-dotnet test ... --filter "FullyQualifiedName~RenderWorld|FullyQualifiedName~ClusterMaterialSlotPreparer|FullyQualifiedName~ClusterPipelineQueryCache|FullyQualifiedName~LoaderDelegateIntegration"
+dotnet test ... --filter "FullyQualifiedName~RenderWorld|FullyQualifiedName~SlotPreparer|FullyQualifiedName~ClusterPipelineQueryCache|FullyQualifiedName~LoaderDelegateIntegration"
 Passed: 11, Failed: 0
 ```
 
 Zero-allocation regression verification:
 
 ```text
-dotnet test ... --filter "FullyQualifiedName~RenderWorldExtractorTests.Rebuild_SteadyState_DoesNotAllocateManagedMemory|FullyQualifiedName~ClusterMaterialSlotPreparerTests.Prepare_SteadyState_DoesNotAllocateManagedMemory"
+dotnet test ... --filter "FullyQualifiedName~RenderWorldExtractorTests.Rebuild_SteadyState_DoesNotAllocateManagedMemory|FullyQualifiedName~SlotPreparerTests.Prepare_SteadyState_DoesNotAllocateManagedMemory"
 Passed: 2, Failed: 0
 ```
 
@@ -125,19 +125,19 @@ Build warnings still present:
 
 ## Deviations
 
-- BATCH-09b 指令里“slot folding 直接收敛到 cluster pipeline 自己的 prepare 路径”在实现上落成了 `ClusterPipeline` 持有的 `ClusterMaterialSlotPreparer`。这是 pipeline-owned 的内部 prepare 状态对象，不再是跨层桥接器。
+- BATCH-09b 指令里“slot folding 直接收敛到 cluster pipeline 自己的 prepare 路径”在实现上落成了 `ClusterPipeline` 持有的 `SlotPreparer`。这是 pipeline-owned 的内部 prepare 状态对象，不再是跨层桥接器。
 - 没有额外跑交互式 runtime smoke。当前批次的完成证据来自 full build、full test、focused suite 和 zero-allocation regression。
 
 ## Edge Cases
 
 - 某个 local material slot 没有可解析的 material 或没有对应 pass 时，prepare 仍会保留空 slot 占位，避免破坏 GPU 侧 `MaterialSlotOffset + localMatIdx` 的寻址语义。
-- 多 pass 材质里如果同时出现 primary shade 和 overlay shade，`ClusterMaterialSlotPreparer` 会优先把 primary shade 填进 shading field，overlay 不会覆盖 primary。
+- 多 pass 材质里如果同时出现 primary shade 和 overlay shade，`SlotPreparer` 会优先把 primary shade 填进 shading field，overlay 不会覆盖 primary。
 - 当 source entity / bindings 未变化时，extract 与 prepare 都会直接 no-op，避免 steady-state 触碰 ECS/slot 分配路径。
 
 ## Weak Points / Improvement Opportunities
 
 - 当前 local material slot 的 canonical 语义已经稳定，但 import/authoring 层仍然保留 region/section 元数据。后续可以进一步把 asset 层和 runtime 层的命名边界写得更清楚，避免再次混淆。
-- `ClusterMaterialSlotPreparer` 目前用线性扫描 source cache 和 RenderWorld pass buffer，steady-state 已经满足无 GC，但在极大规模场景下可能还需要进一步优化扫描成本。
+- `SlotPreparer` 目前用线性扫描 source cache 和 RenderWorld pass buffer，steady-state 已经满足无 GC，但在极大规模场景下可能还需要进一步优化扫描成本。
 - Runtime `Program.cs` 里仍有若干可空 warning，没有在本批顺手清理。
 
 ## Known Issues

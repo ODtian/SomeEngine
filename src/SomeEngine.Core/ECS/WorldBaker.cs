@@ -1,10 +1,13 @@
-using Friflo.Engine.ECS;
+using SomeECS.Core;
+using SomeECS.Core.Entities;
+using SomeECS.Core.Queries;
 
 namespace SomeEngine.Core.ECS;
 
 public sealed class WorldBaker
 {
     private readonly IWorldBaker[] _bakers;
+    private readonly List<EntityId> _clearScratch = [];
 
     public WorldBaker(params IWorldBaker[] bakers)
     {
@@ -12,31 +15,29 @@ public sealed class WorldBaker
         _bakers = bakers;
     }
 
-    public void Rebuild(EntityStore authoringStore, EntityStore runtimeStore)
+    public void Rebuild(World authoringWorld, World runtimeWorld)
     {
-        ArgumentNullException.ThrowIfNull(authoringStore);
-        ArgumentNullException.ThrowIfNull(runtimeStore);
+        ArgumentNullException.ThrowIfNull(authoringWorld);
+        ArgumentNullException.ThrowIfNull(runtimeWorld);
 
-        Clear(runtimeStore);
+        Clear(runtimeWorld, _clearScratch);
 
-        var context = new BakeContext(authoringStore, runtimeStore);
+        var context = new BakeContext(authoringWorld, runtimeWorld);
         foreach (IWorldBaker baker in _bakers)
         {
             baker.Bake(context);
         }
     }
 
-    private static void Clear(EntityStore runtimeStore)
+    private static void Clear(World runtimeWorld, List<EntityId> scratch)
     {
-        List<Entity> entities = [];
-        foreach (Entity entity in runtimeStore.Entities)
-        {
-            entities.Add(entity);
-        }
+        QueryHandle query = runtimeWorld.AllEntities();
+        runtimeWorld.CollectEntities(query, scratch);
 
-        foreach (Entity entity in entities)
+        foreach (EntityId entity in scratch)
         {
-            entity.DeleteEntity();
+            if (runtimeWorld.IsAlive(entity))
+                runtimeWorld.DestroyEntity(entity);
         }
     }
 }

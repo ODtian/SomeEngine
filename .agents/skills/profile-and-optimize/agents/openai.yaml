@@ -1,0 +1,4 @@
+interface:
+  display_name: "Profile and Optimize"
+  short_description: "Profiler-led optimization workflow"
+  default_prompt: "Use $profile-and-optimize to locate and optimize a real bottleneck using external profiler evidence."

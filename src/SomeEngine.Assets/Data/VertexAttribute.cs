@@ -3,7 +3,6 @@ using System.Runtime.InteropServices;
 
 namespace SomeEngine.Assets.Data;
 
-// Matching Diligent::VALUE_TYPE
 public enum ValueType : byte
 {
     Undefined = 0,

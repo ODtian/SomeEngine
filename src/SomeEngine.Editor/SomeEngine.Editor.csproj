@@ -6,19 +6,15 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <UsesDiligentEngine>true</UsesDiligentEngine>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\SomeEngine.Render\SomeEngine.Render.csproj" />
     <ProjectReference Include="..\SomeEngine.Core\SomeEngine.Core.csproj" />
     <ProjectReference Include="..\SomeEngine.Assets\SomeEngine.Assets.csproj" />
+    <ProjectReference Include="..\SomeEngine.Rhi\SomeEngine.Rhi.csproj" />
+    <ProjectReference Include="..\SomeEngine.Rhi.D3D12\SomeEngine.Rhi.D3D12.csproj" />
+    <ProjectReference Include="..\..\..\SomeECS\src\SomeECS.Core\SomeECS.Core.csproj" />
+    <ProjectReference Include="..\..\..\SomeECS\src\SomeECS.Systems\SomeECS.Systems.csproj" />
   </ItemGroup>
-
-  <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.3" />
-    <PackageReference Include="DiligentGraphics.DiligentEngine.Core" Version="$(DiligentPackageVersion)" Condition="'$(DiligentUseLocalBuild)' != 'true'" />
-    <PackageReference Include="Diligent-SharpGen.Runtime" Version="$(DiligentSharpGenRuntimeVersion)" Condition="'$(DiligentUseLocalBuild)' == 'true'" />
-  </ItemGroup>
-
 </Project>

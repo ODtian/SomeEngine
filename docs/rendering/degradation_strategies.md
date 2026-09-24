@@ -114,7 +114,7 @@ VRB-Bin 下 Deform 和 Raster 能否共享同一个 `BinnedClusterIndex[]`？
 ### 关键观察：Material 同时决定 VertexEval 和 RasterPath
 
 ```
-MaterialSlotBuffer[slot]:
+Pipeline SlotBuffer[slot]:
   .RasterBinKey    → 决定 SW/HW 分流 + alpha test 等
   .VertexEvalKey   → 决定顶点变形函数 (Static/Skinned/WPO)
   .ShadeBinKey     → 决定着色 bin
@@ -277,7 +277,7 @@ CullOutput → RasterBin ─┤
 | 模式 | Shade 读顶点方式 | Shade ↔ VertexEval |
 |------|-----------------|-------------------|
 | **Cache** | 读 DeformCache | ✅ **解耦**——Shade 不需要知道 VertexEval |
-| **Inline** | 读 PageHeap + 重新 eval | ❌ **耦合**——Shade PSO 泛型参数包含 VertexEval |
+| **Inline** | 读 PageHeap + 重新 eval | ❌ **耦合**——Shade PipelineState 泛型参数包含 VertexEval |
 
 ### VertexEval × RasterPath × ShadeGroup 自由度
 
@@ -314,7 +314,7 @@ CullOutput → RasterBin ─┤
 **不存预组合的 composite key**——存原子属性值，binning shader 按管线模式组合：
 
 ```
-MaterialSlotBuffer (SoA, 3 fields):
+Pipeline-owned SlotBuffer (SoA, 3 fields):
   field[0]: VertexEvalType   (uint: 0=Static, 1=Skinned, 2=WPO)
   field[1]: RasterFlags      (uint: bit0=AlphaTest, bit1=TwoSided, ...)
   field[2]: ShadeGroupID     (uint: 0=PBR, 1=Unlit, 2=SSS, ...)

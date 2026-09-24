@@ -2,28 +2,36 @@
   "asset_guid": "0d7961b6-3c1f-5768-ab39-f545225d4e81",
   "source_guid": "02ebc9e4-3745-4902-937e-f89c53eb0c9c",
   "sub_asset_key": "shader:main",
-  "content_fingerprint": "5a33866cce42aff6209d342f0b83a04ab0df560f52dd61332429f591822b9fd4",
+  "content_fingerprint": "0c46d03ae60feb793e23f0c2df068b05af99e8bf4387511263d94220c25c9121",
   "dependencies": [
     {
+      "path": "assets/Shaders/cluster_bin_io.slang",
+      "hash": "feb05ffbc4d608a46f12e644df70fb646b96e7ac9ffd6fd3ed710019d4bf8fdb"
+    },
+    {
       "path": "assets/Shaders/cluster_binning.slang",
-      "hash": "88bae52173cf6051a45bcca3fbaf9aaad7a5d111d75b3abab07e406dd56222e1"
+      "hash": "1049c69e98a8cf13a3695fe01ccae510534e0595bbb81819e68440507e2146b6"
     },
     {
       "path": "assets/Shaders/cluster_common.slang",
-      "hash": "386666769386237c388c623c611341170505536c8d5d32d94acca68d212d8d9c"
+      "hash": "84478ea7c9237edea3020e049f13b314779860a8add90da2cb9ab5c77aa2dda0"
     },
     {
       "path": "assets/Shaders/cluster_structures.slang",
-      "hash": "9b2a65aacbb7ac8400d74cd1f74b24b0e904a3c38d2a884d9b83c6c1710426e4"
+      "hash": "2f1ac580b574b8f58413f488143ce9a52859c0f2126508f2ef41fd1fbdd6651d"
     },
     {
       "path": "assets/Shaders/common.slang",
-      "hash": "8d6c13488dec6ded178f1c73f93ddf8de3124d808426e7974f3fdeae0112a625"
+      "hash": "a40161bc79252d542bd62f09fe4a9f828e9c84a20b2ccc63609c9c49bbef37bd"
     },
     {
       "path": "assets/Shaders/generated/instance_header_layout.slang",
-      "hash": "2c118aca994b1a69f4d81a89838f156e5639b6989414cba21bba2c00b219e8d0"
+      "hash": "2b3e33696675e1dae139a69ea3cf32b451c755889a0df862c6190d7a4125d98d"
+    },
+    {
+      "path": "assets/Shaders/visbuffer_encoding.slang",
+      "hash": "892f4220f921406aaf9fc82b0c454bf0a747636fe0a183cd72a0dce3d5115204"
     }
   ],
-  "importer_version": 6
+  "importer_version": 15
 }

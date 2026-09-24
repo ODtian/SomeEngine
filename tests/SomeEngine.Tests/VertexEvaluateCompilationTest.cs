@@ -9,46 +9,20 @@ public class VertexEvaluateCompilationTest
     [Fact]
     public void SWRaster_WithInlineVertexEval_CompilesSuccessfully()
     {
-        // Test that CSSWRaster using InlineSource<StaticVertexEval> compiles.
-        // This validates the IVertexEvaluate + IVertexSource interface chain.
-        string source = """
-            #include "sw_raster.slang"
-        """;
+        var asset = SlangShaderImporter.Import(TestProjectPaths.ShaderPath("sw_raster.slang"));
 
-        string shaderDir = Path.GetFullPath(Path.Combine(
-            AppContext.BaseDirectory,
-            "..", "..", "..", "..", "..", "..", "assets", "Shaders"));
+        Assert.NotNull(asset);
+        Assert.NotNull(asset.Variants);
+        Assert.NotEmpty(asset.Variants!);
 
-        string slangFile = Path.Combine(shaderDir, "_test_vertex_evaluate.slang");
-        File.WriteAllText(slangFile, source);
+        var csSpirv = asset.Variants!.FirstOrDefault(v => v.EntryPoint == "CSSWRaster" && v.Backend == "spirv");
+        Assert.NotNull(csSpirv);
+        Assert.True(csSpirv!.Data.HasValue && csSpirv.Data.Value.Length > 0, "SPIR-V bytecode should be non-empty");
 
-        try
+        Console.WriteLine($"VertexEvaluate compilation OK: {asset.Variants.Count} variants");
+        foreach (var v in asset.Variants)
         {
-            var asset = SlangShaderImporter.Import(slangFile, source);
-
-            Assert.NotNull(asset);
-            Assert.NotNull(asset.Variants);
-            Assert.NotEmpty(asset.Variants!);
-
-            var csSpirv = asset.Variants!.FirstOrDefault(v => v.EntryPoint == "CSSWRaster" && v.Backend == "spirv");
-            Assert.NotNull(csSpirv);
-            Assert.True(csSpirv!.Data.HasValue && csSpirv.Data.Value.Length > 0, "SPIR-V bytecode should be non-empty");
-
-            Console.WriteLine($"VertexEvaluate compilation OK: {asset.Variants.Count} variants");
-            foreach (var v in asset.Variants)
-            {
-                Console.WriteLine($"  {v.Backend} / {v.Stage} / {v.EntryPoint}: {v.Data?.Length ?? 0} bytes");
-            }
-        }
-        finally
-        {
-            if (File.Exists(slangFile)) File.Delete(slangFile);
-            string metaFile = slangFile + ".meta";
-            if (File.Exists(metaFile)) File.Delete(metaFile);
-            string assetFile = Path.ChangeExtension(slangFile, ".shader.asset");
-            if (File.Exists(assetFile)) File.Delete(assetFile);
-            string assetMetaFile = assetFile + ".meta";
-            if (File.Exists(assetMetaFile)) File.Delete(assetMetaFile);
+            Console.WriteLine($"  {v.Backend} / {v.Stage} / {v.EntryPoint}: {v.Data?.Length ?? 0} bytes");
         }
     }
 
@@ -56,8 +30,9 @@ public class VertexEvaluateCompilationTest
     public void CustomVertexEvaluate_CompilesSuccessfully()
     {
         // Test a custom IVertexEvaluate with a StructuredBuffer field.
-        string source = """
-            #include "sw_raster.slang"
+        string swRasterPath = TestProjectPaths.ShaderPath("sw_raster.slang").Replace('\\', '/');
+        string source = $$"""
+            #include "{{swRasterPath}}"
 
             struct WPODeformedVertex
             {
@@ -75,7 +50,7 @@ public class VertexEvaluateCompilationTest
                 {
                     DeformedVertex v;
                     float3 offset = float3(0, NoiseData[ctx.instanceID].x * 0.1, 0);
-                    v.position = ctx.worldPos + offset;
+                    v.position = EvalWorldPosition(ctx) + offset;
                     v.normal = float3(0, 1, 0);
                     return v;
                 }
@@ -85,17 +60,44 @@ public class VertexEvaluateCompilationTest
                     return v.position;
                 }
 
-                // Cache: pack pos as half3 (8B), ignore normal for cache
-                uint getCacheStride() { return 8; }
-                void writeCache(RWByteAddressBuffer buf, uint addr, DeformedVertex v)
+                uint getCacheByteSize(uint vertexCount) { return vertexCount * 16; }
+                void writeCache(
+                    RWByteAddressBuffer buf,
+                    uint cacheBaseByte,
+                    uint vertexCount,
+                    uint localVertIdx,
+                    DeformedVertex current,
+                    DeformedVertex previous)
                 {
-                    buf.Store(addr,     f32tof16(v.position.x) | (f32tof16(v.position.y) << 16));
-                    buf.Store(addr + 4, f32tof16(v.position.z));
+                    uint addr = cacheBaseByte + localVertIdx * 16;
+                    buf.Store(addr,      f32tof16(current.position.x) | (f32tof16(current.position.y) << 16));
+                    buf.Store(addr + 4,  f32tof16(current.position.z));
+                    buf.Store(addr + 8,  f32tof16(previous.position.x) | (f32tof16(previous.position.y) << 16));
+                    buf.Store(addr + 12, f32tof16(previous.position.z));
                 }
-                DeformedVertex readCache(ByteAddressBuffer buf, uint addr)
+                DeformedVertex readCache(
+                    ByteAddressBuffer buf,
+                    uint cacheBaseByte,
+                    uint vertexCount,
+                    uint localVertIdx)
                 {
+                    uint addr = cacheBaseByte + localVertIdx * 16;
                     uint xy = buf.Load(addr);
                     uint z_ = buf.Load(addr + 4);
+                    DeformedVertex v;
+                    v.position = float3(f16tof32(xy), f16tof32(xy >> 16), f16tof32(z_));
+                    v.normal = float3(0, 1, 0);
+                    return v;
+                }
+                DeformedVertex readPreviousCache(
+                    ByteAddressBuffer buf,
+                    uint cacheBaseByte,
+                    uint vertexCount,
+                    uint localVertIdx)
+                {
+                    uint addr = cacheBaseByte + localVertIdx * 16;
+                    uint xy = buf.Load(addr + 8);
+                    uint z_ = buf.Load(addr + 12);
                     DeformedVertex v;
                     v.position = float3(f16tof32(xy), f16tof32(xy >> 16), f16tof32(z_));
                     v.normal = float3(0, 1, 0);
@@ -106,19 +108,17 @@ public class VertexEvaluateCompilationTest
             [shader("compute")]
             [numthreads(32, 1, 1)]
             void CSCustomRaster(
-                uniform InlineSource<WPOVertexEval> source,
+                uniform WPOVertexEval eval,
                 uint3 groupID : SV_GroupID,
                 uint groupThreadIndex : SV_GroupThreadID)
             {
-                SWRasterKernel(source, groupID, groupThreadIndex);
+                SWRasterKernel(eval, false, groupID, groupThreadIndex);
             }
         """;
 
-        string shaderDir = Path.GetFullPath(Path.Combine(
-            AppContext.BaseDirectory,
-            "..", "..", "..", "..", "..", "..", "assets", "Shaders"));
-
-        string slangFile = Path.Combine(shaderDir, "_test_custom_vertex_eval.slang");
+        string tempDir = Path.Combine(Path.GetTempPath(), "SomeEngine.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        string slangFile = Path.Combine(tempDir, "custom_vertex_eval.slang");
         File.WriteAllText(slangFile, source);
 
         try
@@ -142,13 +142,8 @@ public class VertexEvaluateCompilationTest
         }
         finally
         {
-            if (File.Exists(slangFile)) File.Delete(slangFile);
-            string metaFile = slangFile + ".meta";
-            if (File.Exists(metaFile)) File.Delete(metaFile);
-            string assetFile = Path.ChangeExtension(slangFile, ".shader.asset");
-            if (File.Exists(assetFile)) File.Delete(assetFile);
-            string assetMetaFile = assetFile + ".meta";
-            if (File.Exists(assetMetaFile)) File.Delete(assetMetaFile);
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
         }
     }
 }

@@ -14,6 +14,11 @@ using ValueType = SomeEngine.Assets.Data.ValueType;
 
 namespace SomeEngine.Assets.Importers;
 
+public sealed class ClusterBuilderOptions
+{
+    public bool GenerateMissingTangents { get; init; }
+}
+
 public struct ClusterLodConfig
 {
     public int MaxVertices;
@@ -71,7 +76,7 @@ public static class ClusterBuilder
     private const int GroupSize = 4;
     private const float SimplifyRatio = 0.5f;
     private const int PageSize = 128 * 1024; // 128KB
-    private const int PageHeaderSize = 44; // New header with quant params
+    private const int PageHeaderSize = MeshPageHeader.Size;
     private const int MaxEncodedTriangleStart = ushort.MaxValue;
 
     private struct BuilderMeshlet
@@ -97,7 +102,7 @@ public static class ClusterBuilder
         public byte Range0End;
         public byte Range1End;
 
-        // VRB batch info (packed uint, see BuildVRBBatches)
+        // VRB batch info (packed uint, see BuildVrb)
         public uint VRBBatchInfo;
     }
 
@@ -149,7 +154,7 @@ public static class ClusterBuilder
         return ExpandBits((uint)p.X) * 4 + ExpandBits((uint)p.Y) * 2 + ExpandBits((uint)p.Z);
     }
 
-    private static List<ClusterBVHNode> BuildBVH(List<ClusterInfo> clusters)
+    private static List<ClusterBVHNode> BuildBvh(List<ClusterInfo> clusters)
     {
         var nodes = new List<ClusterBVHNode>();
         if (clusters.Count == 0)
@@ -159,7 +164,6 @@ public static class ClusterBuilder
 
         // 1. Create Leaf Nodes
         var currentLevelIndices = new List<int>();
-        int leafSize = 16;
         int i = 0;
 
         while (i < clusters.Count)
@@ -293,18 +297,70 @@ public static class ClusterBuilder
         return ProcessMesh(mesh, materialSlots, mesh.Name ?? "Unnamed");
     }
 
-    public static MeshAsset ProcessMesh(Mesh mesh, IReadOnlyList<MeshMaterialSlot> materialSlots, string name)
+    public static MeshAsset ProcessMesh(
+        Mesh mesh,
+        IReadOnlyList<MeshMaterialSlot> materialSlots,
+        string name,
+        ClusterBuilderOptions? options = null)
     {
-        static float[] ReadAccessorAsFloatArray(Accessor accessor)
+        static float[] ReadFloats(Accessor accessor)
         {
             return accessor.Dimensions switch
             {
                 DimensionType.SCALAR => accessor.AsScalarArray().ToArray(),
-                DimensionType.VEC2 => accessor.AsVector2Array().SelectMany(v => new[] { v.X, v.Y }).ToArray(),
-                DimensionType.VEC3 => accessor.AsVector3Array().SelectMany(v => new[] { v.X, v.Y, v.Z }).ToArray(),
-                DimensionType.VEC4 => accessor.AsVector4Array().SelectMany(v => new[] { v.X, v.Y, v.Z, v.W }).ToArray(),
+                DimensionType.VEC2 => ReadVector2Array(accessor),
+                DimensionType.VEC3 => ReadVector3Array(accessor),
+                DimensionType.VEC4 => ReadVector4Array(accessor),
                 _ => throw new NotSupportedException($"Unsupported accessor dimension: {accessor.Dimensions}"),
             };
+        }
+
+        static float[] ReadVector2Array(Accessor accessor)
+        {
+            var values = accessor.AsVector2Array();
+            float[] result = new float[checked(values.Count * 2)];
+            for (int i = 0; i < values.Count; i++)
+            {
+                Vector2 value = values[i];
+                int offset = i * 2;
+                result[offset + 0] = value.X;
+                result[offset + 1] = value.Y;
+            }
+
+            return result;
+        }
+
+        static float[] ReadVector3Array(Accessor accessor)
+        {
+            var values = accessor.AsVector3Array();
+            float[] result = new float[checked(values.Count * 3)];
+            for (int i = 0; i < values.Count; i++)
+            {
+                Vector3 value = values[i];
+                int offset = i * 3;
+                result[offset + 0] = value.X;
+                result[offset + 1] = value.Y;
+                result[offset + 2] = value.Z;
+            }
+
+            return result;
+        }
+
+        static float[] ReadVector4Array(Accessor accessor)
+        {
+            var values = accessor.AsVector4Array();
+            float[] result = new float[checked(values.Count * 4)];
+            for (int i = 0; i < values.Count; i++)
+            {
+                Vector4 value = values[i];
+                int offset = i * 4;
+                result[offset + 0] = value.X;
+                result[offset + 1] = value.Y;
+                result[offset + 2] = value.Z;
+                result[offset + 3] = value.W;
+            }
+
+            return result;
         }
 
         var allPos = new List<Vector3>();
@@ -354,7 +410,7 @@ public static class ClusterBuilder
                 // Fallback to zeros if primitive missing attribute (though invalid GLTF normally)
                 if (primitive.VertexAccessors.TryGetValue(def.Name, out var accessor))
                 {
-                    combinedAttributes[def.Name].AddRange(ReadAccessorAsFloatArray(accessor));
+                    combinedAttributes[def.Name].AddRange(ReadFloats(accessor));
                 }
                 else
                 {
@@ -381,9 +437,18 @@ public static class ClusterBuilder
             rawAttributes.Add(new RawAttribute(def.Name, combinedAttributes[def.Name].ToArray(), def.Dimension, def.TargetType, def.NumComponents, def.Normalized));
         }
 
+        Vector3[]? positionArray = null;
+        uint[]? indexArray = null;
+        if (options?.GenerateMissingTangents == true
+            && !rawAttributes.Any(static attribute => attribute.Name == "TANGENT"))
+        {
+            positionArray = allPos.ToArray();
+            indexArray = allIndices.ToArray();
+            rawAttributes.Add(GenerateTangentAttribute(positionArray, indexArray, rawAttributes, name));
+        }
+
         // Add _MATERIAL_INDEX. Values are integer floats (0.0f, 1.0f...). We will store them as UInt8.
         rawAttributes.Add(new RawAttribute("_MATERIAL_INDEX", combinedMaterialIndices.ToArray(), 1, ValueType.UInt8, 1, false));
-
         static int AttributeOrder(string name) => name switch
         {
             "NORMAL" => 0,
@@ -403,7 +468,134 @@ public static class ClusterBuilder
             return string.Compare(a.Name, b.Name, StringComparison.Ordinal);
         });
 
-        return ProcessRaw(allPos.ToArray(), rawAttributes, allIndices.ToArray(), normalizedMaterialSlots, name);
+        return ProcessRaw(positionArray ?? allPos.ToArray(), rawAttributes, indexArray ?? allIndices.ToArray(), normalizedMaterialSlots, name);
+    }
+
+    private static RawAttribute GenerateTangentAttribute(
+        Vector3[] positions,
+        uint[] indices,
+        IReadOnlyList<RawAttribute> rawAttributes,
+        string meshName)
+    {
+        RawAttribute normal = FindRequiredAttribute(rawAttributes, "NORMAL", meshName);
+        RawAttribute uv = FindRequiredAttribute(rawAttributes, "TEXCOORD_0", meshName);
+        if (normal.Dimension != 3 || normal.Data.Length != positions.Length * 3)
+        {
+            throw new InvalidOperationException(
+                $"Cannot generate TANGENT for mesh '{meshName}': NORMAL must be vec3 and match vertex count.");
+        }
+
+        if (uv.Dimension != 2 || uv.Data.Length != positions.Length * 2)
+        {
+            throw new InvalidOperationException(
+                $"Cannot generate TANGENT for mesh '{meshName}': TEXCOORD_0 must be vec2 and match vertex count.");
+        }
+
+        Vector3[] tan1 = new Vector3[positions.Length];
+        Vector3[] tan2 = new Vector3[positions.Length];
+        for (int index = 0; index < indices.Length; index += 3)
+        {
+            int i0 = checked((int)indices[index + 0]);
+            int i1 = checked((int)indices[index + 1]);
+            int i2 = checked((int)indices[index + 2]);
+            if ((uint)i0 >= positions.Length || (uint)i1 >= positions.Length || (uint)i2 >= positions.Length)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot generate TANGENT for mesh '{meshName}': triangle index references a missing vertex.");
+            }
+
+            Vector3 p0 = positions[i0];
+            Vector3 p1 = positions[i1];
+            Vector3 p2 = positions[i2];
+            Vector2 w0 = ReadVector2(uv.Data, i0);
+            Vector2 w1 = ReadVector2(uv.Data, i1);
+            Vector2 w2 = ReadVector2(uv.Data, i2);
+
+            float x1 = p1.X - p0.X;
+            float x2 = p2.X - p0.X;
+            float y1 = p1.Y - p0.Y;
+            float y2 = p2.Y - p0.Y;
+            float z1 = p1.Z - p0.Z;
+            float z2 = p2.Z - p0.Z;
+            float s1 = w1.X - w0.X;
+            float s2 = w2.X - w0.X;
+            float t1 = w1.Y - w0.Y;
+            float t2 = w2.Y - w0.Y;
+            float denominator = s1 * t2 - s2 * t1;
+            if (denominator == 0.0f)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot generate TANGENT for mesh '{meshName}': triangle {index / 3} has degenerate TEXCOORD_0 parameterization.");
+            }
+
+            float r = 1.0f / denominator;
+            Vector3 sdir = new(
+                (t2 * x1 - t1 * x2) * r,
+                (t2 * y1 - t1 * y2) * r,
+                (t2 * z1 - t1 * z2) * r);
+            Vector3 tdir = new(
+                (s1 * x2 - s2 * x1) * r,
+                (s1 * y2 - s2 * y1) * r,
+                (s1 * z2 - s2 * z1) * r);
+
+            tan1[i0] += sdir;
+            tan1[i1] += sdir;
+            tan1[i2] += sdir;
+            tan2[i0] += tdir;
+            tan2[i1] += tdir;
+            tan2[i2] += tdir;
+        }
+
+        float[] tangents = new float[positions.Length * 4];
+        for (int vertex = 0; vertex < positions.Length; vertex++)
+        {
+            Vector3 n = ReadVector3(normal.Data, vertex);
+            if (n.LengthSquared() == 0.0f)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot generate TANGENT for mesh '{meshName}': vertex {vertex} has zero NORMAL.");
+            }
+
+            n = Vector3.Normalize(n);
+            Vector3 tangent = tan1[vertex] - n * Vector3.Dot(n, tan1[vertex]);
+            if (tangent.LengthSquared() == 0.0f)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot generate TANGENT for mesh '{meshName}': vertex {vertex} has no non-zero tangent contribution.");
+            }
+
+            tangent = Vector3.Normalize(tangent);
+            float handedness = Vector3.Dot(Vector3.Cross(n, tangent), tan2[vertex]) < 0.0f
+                ? -1.0f
+                : 1.0f;
+            int offset = vertex * 4;
+            tangents[offset + 0] = tangent.X;
+            tangents[offset + 1] = tangent.Y;
+            tangents[offset + 2] = tangent.Z;
+            tangents[offset + 3] = handedness;
+        }
+
+        return new RawAttribute("TANGENT", tangents, 4, ValueType.Int8, 4, true);
+    }
+
+    private static RawAttribute FindRequiredAttribute(
+        IReadOnlyList<RawAttribute> rawAttributes,
+        string name,
+        string meshName)
+        => rawAttributes.FirstOrDefault(attribute => attribute.Name == name)
+            ?? throw new InvalidOperationException(
+                $"Cannot generate TANGENT for mesh '{meshName}': required attribute '{name}' is missing.");
+
+    private static Vector2 ReadVector2(float[] values, int vertex)
+    {
+        int offset = checked(vertex * 2);
+        return new Vector2(values[offset + 0], values[offset + 1]);
+    }
+
+    private static Vector3 ReadVector3(float[] values, int vertex)
+    {
+        int offset = checked(vertex * 3);
+        return new Vector3(values[offset + 0], values[offset + 1], values[offset + 2]);
     }
 
     public static MeshAsset ProcessRaw(
@@ -447,10 +639,6 @@ public static class ClusterBuilder
 
             Clusterize(config, indices, positions, materialIndicesArray, clusters, globalIndices);
             int nextGroupId = 0;
-            var globalSpan = CollectionsMarshal.AsSpan(globalIndices); // Only valid if list doesn't resize?
-            // WARNING: globalIndices grows inside the loop. The span will be
-            // invalidated. We must re-get the span or access via List indexer.
-            // Accessing via list indexer is safe.
 
             for (int i = 0; i < clusters.Count; i++)
             {
@@ -653,11 +841,11 @@ public static class ClusterBuilder
 
         try
         {
-            nuint vertexCount = Meshopt.GenerateVertexRemap(
+            nuint vertexCount = BuildRemap(
                 remap.AsSpan(0, rawPos.Length),
                 rawIndices.AsSpan(),
-                rawPos.AsSpan()
-            );
+                rawPos,
+                rawAttributes);
 
             pPos = ArrayPool<Vector3>.Shared.Rent((int)vertexCount);
             pInd = ArrayPool<uint>.Shared.Rent(rawIndices.Length);
@@ -816,7 +1004,6 @@ public static class ClusterBuilder
                 vertexStride += size;
                 descriptors.Add(desc);
             }
-
             void FlushPage()
             {
                 if (currentClusters.Count == 0)
@@ -925,14 +1112,9 @@ public static class ClusterBuilder
                 int minGx = int.MaxValue, minGy = int.MaxValue, minGz = int.MaxValue;
                 int maxGx = int.MinValue, maxGy = int.MinValue, maxGz = int.MinValue;
 
-                Vector3 cMin = new Vector3(float.MaxValue);
-                Vector3 cMax = new Vector3(float.MinValue);
-
                 foreach (var globalIdx in mIndices)
                 {
                     Vector3 p = pPos[(int)globalIdx];
-                    cMin = Vector3.Min(cMin, p);
-                    cMax = Vector3.Max(cMax, p);
 
                     int gx = (int)MathF.Round((p.X - quantOrigin.X) / quantStep);
                     int gy = (int)MathF.Round((p.Y - quantOrigin.Y) / quantStep);
@@ -948,6 +1130,8 @@ public static class ClusterBuilder
                 int clusterIntBaseX = minGx;
                 int clusterIntBaseY = minGy;
                 int clusterIntBaseZ = minGz;
+                Vector3 decodedMin = new(float.MaxValue);
+                Vector3 decodedMax = new(float.MinValue);
 
                 // --- Phase 2: Encode vertices as local u16 offsets from IntBase ---
                 foreach (var globalIdx in mIndices)
@@ -963,13 +1147,26 @@ public static class ClusterBuilder
                         int gy = (int)MathF.Round((p.Y - quantOrigin.Y) / quantStep);
                         int gz = (int)MathF.Round((p.Z - quantOrigin.Z) / quantStep);
 
-                        ushort qx = (ushort)(gx - clusterIntBaseX);
-                        ushort qy = (ushort)(gy - clusterIntBaseY);
-                        ushort qz = (ushort)(gz - clusterIntBaseZ);
+                        int lx = gx - clusterIntBaseX;
+                        int ly = gy - clusterIntBaseY;
+                        int lz = gz - clusterIntBaseZ;
+                        if ((uint)lx > ushort.MaxValue || (uint)ly > ushort.MaxValue || (uint)lz > ushort.MaxValue)
+                            throw new InvalidOperationException(
+                                $"Cluster local quantized position exceeds encoded range: ({lx}, {ly}, {lz}).");
+
+                        ushort qx = (ushort)lx;
+                        ushort qy = (ushort)ly;
+                        ushort qz = (ushort)lz;
 
                         localPos.Add(qx);
                         localPos.Add(qy);
                         localPos.Add(qz);
+                        var decoded = new Vector3(
+                            gx * quantStep + quantOrigin.X,
+                            gy * quantStep + quantOrigin.Y,
+                            gz * quantStep + quantOrigin.Z);
+                        decodedMin = Vector3.Min(decodedMin, decoded);
+                        decodedMax = Vector3.Max(decodedMax, decoded);
 
                         for (int i = 0; i < finalAttributes.Count; ++i)
                         {
@@ -1104,10 +1301,10 @@ public static class ClusterBuilder
                         IntBaseX = clusterIntBaseX,
                         IntBaseY = clusterIntBaseY,
                         IntBaseZ = clusterIntBaseZ,
-                        PackedCenterXY = GPUCluster.PackU16Pair(centerOffX, centerOffY),
+                        PackedCenterXY = GPUCluster.PackU16(centerOffX, centerOffY),
                         LODCenter = m.SelfLodCenter,
                         LODRadius = m.SelfLodRadius,
-                        PackedCenterZRadius = GPUCluster.PackU16Pair(centerOffZ, radiusQuant),
+                        PackedCenterZRadius = GPUCluster.PackU16(centerOffZ, radiusQuant),
                         LODErrorHalf = lodErrorHalf,
                         VertexStart = (ushort)vStart,
                         TriangleStart = (ushort)tStart,
@@ -1117,16 +1314,16 @@ public static class ClusterBuilder
                         PackedRanges = packedRanges,
                         MaterialTableOffset = 0xFFFFFFFF, // fast path (≤3 materials)
                         VRBBatchInfo = m.VRBBatchInfo,
-                        BoundMin = cMin,
-                        BoundMax = cMax,
+                        BoundMin = decodedMin,
+                        BoundMax = decodedMax,
                     }
                 );
 
                 clusterInfos.Add(
                     new ClusterInfo
                     {
-                        BoundMin = cMin,
-                        BoundMax = cMax,
+                        BoundMin = decodedMin,
+                        BoundMax = decodedMax,
                         LODSphere = new Vector4(
                             m.LodCenter.X,
                             m.LodCenter.Y,
@@ -1143,7 +1340,7 @@ public static class ClusterBuilder
 
             FlushPage();
 
-            var bvhNodes = BuildBVH(clusterInfos);
+            var bvhNodes = BuildBvh(clusterInfos);
             long bvhOffset = fs.Position;
             var bvhSpan = CollectionsMarshal.AsSpan(bvhNodes);
             var bvhBytes = MemoryMarshal.Cast<ClusterBVHNode, byte>(bvhSpan);
@@ -1270,6 +1467,61 @@ public static class ClusterBuilder
         }
     }
 
+    private static unsafe nuint BuildRemap(
+        Span<uint> destination,
+        ReadOnlySpan<uint> indices,
+        Vector3[] positions,
+        IReadOnlyList<RawAttribute> attributes)
+    {
+        if (destination.Length < positions.Length)
+            throw new ArgumentException("Vertex remap destination is smaller than the source vertex count.", nameof(destination));
+
+        var streams = new MeshOptimizer.Stream[checked(attributes.Count + 1)];
+        var handles = new GCHandle[streams.Length];
+
+        try
+        {
+            handles[0] = GCHandle.Alloc(positions, GCHandleType.Pinned);
+            streams[0] = new MeshOptimizer.Stream(
+                handles[0].AddrOfPinnedObject().ToPointer(),
+                (nuint)Unsafe.SizeOf<Vector3>(),
+                (nuint)Unsafe.SizeOf<Vector3>());
+
+            for (int i = 0; i < attributes.Count; i++)
+            {
+                RawAttribute attribute = attributes[i];
+                int requiredLength = checked(positions.Length * attribute.Dimension);
+                if (attribute.Data.Length < requiredLength)
+                {
+                    throw new ArgumentException(
+                        $"Attribute '{attribute.Name}' has {attribute.Data.Length} values, but {requiredLength} are required for {positions.Length} vertices.",
+                        nameof(attributes));
+                }
+
+                handles[i + 1] = GCHandle.Alloc(attribute.Data, GCHandleType.Pinned);
+                nuint stride = checked((nuint)(attribute.Dimension * sizeof(float)));
+                streams[i + 1] = new MeshOptimizer.Stream(
+                    handles[i + 1].AddrOfPinnedObject().ToPointer(),
+                    stride,
+                    stride);
+            }
+
+            return Meshopt.GenerateVertexRemapMulti<byte>(
+                destination,
+                indices,
+                (nuint)positions.Length,
+                streams);
+        }
+        finally
+        {
+            for (int i = 0; i < handles.Length; i++)
+            {
+                if (handles[i].IsAllocated)
+                    handles[i].Free();
+            }
+        }
+    }
+
     private struct TempTri
     {
         public uint v0, v1, v2;
@@ -1283,7 +1535,7 @@ public static class ClusterBuilder
     )
     {
         // Build VRB batch info (linear scan, no reorder)
-        uint vrbBatchInfo = BuildVRBBatches(tris);
+        uint vrbBatchInfo = BuildVrb(tris);
 
         int startIndex = globalIndices.Count;
         var uniqueMats = new List<byte>();
@@ -1336,7 +1588,7 @@ public static class ClusterBuilder
     /// Returns a packed uint encoding up to 5 batch tri-counts.
     /// Triangles beyond the 5th batch are implicitly a "slow residual" at runtime.
     /// </summary>
-    private static uint BuildVRBBatches(ReadOnlySpan<TempTri> tris)
+    private static uint BuildVrb(ReadOnlySpan<TempTri> tris)
     {
         const int MaxUniqueVerts = 32;
         const int MaxBatchesEncoded = 5;
@@ -1755,10 +2007,6 @@ public static class ClusterBuilder
         if (targetCount >= indices.Length)
         {
             error = 0;
-            // outputIndices.AddRange(indices); // Add range span...
-            // Assuming we want to copy indices to output.
-            var span = CollectionsMarshal.AsSpan(outputIndices);
-            // Wait, AddRange(Span) is not available on List<T> standard
             foreach (var i in indices)
                 outputIndices.Add(i);
             return;

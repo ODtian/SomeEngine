@@ -1,0 +1,17 @@
+{
+  "asset_guid": "cca9261e-f108-5127-9b2a-a7a2dfe367a7",
+  "source_guid": "87cc90ab-01b3-45c5-ae07-92e4c4ca7c53",
+  "sub_asset_key": "shader:main",
+  "content_fingerprint": "6558628d6fe3b473a7e82fda87d8354853de8c5775790773de20e0b005851ccf",
+  "dependencies": [
+    {
+      "path": "assets/Shaders/fullscreen_triangle.slang",
+      "hash": "a379eb11e577feb64d5fa47621d9ecad73fc1708619af7c527677c7f53055e1c"
+    },
+    {
+      "path": "assets/Shaders/temporal_resolve.slang",
+      "hash": "915f84f8603043f471d08efe1a8f2861aa6d04b08efaa697ee5086848b1074b8"
+    }
+  ],
+  "importer_version": 15
+}

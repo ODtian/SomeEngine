@@ -251,7 +251,7 @@ BinQueue 内部改为 Entity-based。`RegisterRegion` 改为 `RegisterGroup`。�
 - Rebuild 逻辑：执行所有 group query → 按 orderKey 分组 → 每组内按 signature 去重 → region 按 key 升序排列
 - `GetRanges()` 返回所有 region 的有序 `BinRange[]`
 - `GetEntity(int binIndex)` 返回该 bin 的代表 Entity（等价于旧的 `GetPass`）
-- `GetBinForEntity(Entity)` 反向查找
+- `BinOf(Entity)` 反向查找
 - `_argsBinMap[bin]` 支持 overlay → primary IndirectArgs 映射：
   - `GetArgsBin(int bin)` 返回 overlay bin 对应的 primary bin index
   - primary bin → 返回自身

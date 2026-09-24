@@ -1,4 +1,4 @@
-# 资产身份与事实来源
+# 资产身份与来源
 
 本文只记录当前实现中的事实来源。历史迁移说明放入 archive 或任务记录，不再作为运行时设计依据。
 
@@ -11,9 +11,9 @@
 | 手写 asset 身份 | `.asset` payload 中的 `AssetGuid` | `AssetDatabase.Import()` 注册进 manifest |
 | 运行时查找 | `AssetManifest` | `AssetDatabase.Load<T>(guid)` 会校验 payload guid 与 manifest guid |
 | 导入过期判断 | `AssetMeta.ContentFingerprint + Dependencies + ImporterVersion` | 不再用旧 meta guid 决定 import 产物身份 |
-| MaterialInstance parent | `MaterialInstanceAsset.ParentGuid` | loader 只接受 `ParentGuid -> Material` resolver |
-| Mesh 材质绑定 | ECS authoring 的 `MeshMaterialBindings.MaterialAssetGuids[]` | 数组下标就是 canonical local material slot |
-| RenderWorld 材质提交 | `RenderMaterialSlotBinding.LocalMaterialSlot + PassIndex` | GPU `MaterialSlotOffset` 是 prepare 阶段派生结果 |
+| MaterialInstance parent | `MaterialInstanceAsset.ParentGuid` | loader 在加载边界把 parent GUID 转成 `Handle<Material>` |
+| Mesh 材质绑定 | ECS authoring 的 `MeshMaterialBindings.Materials[]` | 数组下标就是 canonical local material slot |
+| RenderWorld 材质提交 | `RenderMaterials.Materials[]` | `InstanceHeaderLayout.SlotOffset` 是 pipeline prepare 阶段派生结果 |
 | Transform | `LocalTransform -> TransformSystem -> WorldTransform` | `TransformQvvs` 是数学值，不是 ECS component |
 
 ## AssetGuid
@@ -81,12 +81,12 @@ MaterialAsset
 
 GameWorld source entity
   ├─ MeshInstance
-  └─ MeshMaterialBindings.MaterialAssetGuids[]
+  └─ MeshMaterialBindings.Materials[]
 ```
 
-`MeshMaterialBindings.MaterialAssetGuids[i]` 的 `i` 就是 local material slot。RenderWorld extract 会把每个 local slot 中的 material 展开为 pass entities，并在 `RenderMaterialSlotBinding.LocalMaterialSlot` 中保留该 slot。
+`MeshMaterialBindings.Materials[i]` 的 `i` 就是 local material slot。RenderWorld extract 会把 source entity 的 material handle 列表复制到 `RenderMaterials.Materials`，cluster material owner 再按 material 的 `MaterialPass` 展开 raster/shade/deform bins。
 
-Cluster prepare 阶段按 instance 聚合 local slots，写入 GPU `MaterialSlotBuffer`，再把起始位置写入 `GpuInstanceHeader.MaterialSlotOffset`。GPU header 是提交派生数据，不是 authoring 数据。
+Cluster prepare 阶段按 instance 聚合 local slots，写入 pipeline-owned `SlotBuffer`，再把起始位置写入 instance header 的 `InstanceHeaderLayout.SlotOffset`。GPU header 是提交派生数据，不是 authoring 数据。
 
 ## Transform Authoring
 

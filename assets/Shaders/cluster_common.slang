@@ -4,6 +4,7 @@
 #include "common.slang"
 #include "cluster_structures.slang"
 #include "generated/instance_header_layout.slang"
+#include "visbuffer_encoding.slang"
 
 // ── Shared structures ──
 
@@ -17,6 +18,23 @@ struct DrawRequest
 
 // ── Page Heap helpers ──
 // These require a `ByteAddressBuffer PageHeap` to be declared in the calling shader.
+
+struct PageQuant
+{
+    float3 Origin;
+    float Step;
+};
+
+PageQuant LoadPageQuant(ByteAddressBuffer pageHeap, uint pageOffset)
+{
+    PageQuant quant;
+    quant.Origin = float3(
+        asfloat(pageHeap.Load(pageOffset + 12u)),
+        asfloat(pageHeap.Load(pageOffset + 32u)),
+        asfloat(pageHeap.Load(pageOffset + 36u)));
+    quant.Step = asfloat(pageHeap.Load(pageOffset + 40u));
+    return quant;
+}
 
 /// Load cluster IntBase, VertexStart, TriangleStart, and PackedCounts from the page heap.
 void LoadClusterInfo(ByteAddressBuffer pageHeap, uint pageOffset, uint clusterId,
@@ -42,8 +60,7 @@ void LoadClusterInfo(ByteAddressBuffer pageHeap, uint pageOffset, uint clusterId
 
 /// Fetch a quantized vertex position from the page heap and dequantize to object space.
 float3 FetchVertexPosition(ByteAddressBuffer pageHeap, uint pageOffset, uint posOffset,
-                           uint vStart, uint localVIdx, int3 intBase,
-                           float3 quantOrigin, float quantStep)
+                           uint vStart, uint localVIdx, int3 intBase)
 {
     uint posByteAddr = pageOffset + posOffset + (vStart + localVIdx) * 6;
     uint alignedPosAddr = posByteAddr & ~3;
@@ -70,7 +87,8 @@ float3 FetchVertexPosition(ByteAddressBuffer pageHeap, uint pageOffset, uint pos
     }
 
     int3 globalIntPos = int3(int(p0), int(p1), int(p2)) + intBase;
-    return float3(globalIntPos) * quantStep + quantOrigin;
+    PageQuant quant = LoadPageQuant(pageHeap, pageOffset);
+    return float3(globalIntPos) * quant.Step + quant.Origin;
 }
 
 /// Fetch a single uint8 vertex index from the page heap.
@@ -94,9 +112,9 @@ uint GetInstanceBVHRootIndex(uint instanceID)
     return LoadInstanceBVHRootIndex(InstanceHeaders, instanceID);
 }
 
-uint GetInstanceMaterialSlotOffset(uint instanceID)
+uint GetInstanceSlotOffset(uint instanceID)
 {
-    return LoadInstanceMaterialSlotOffset(InstanceHeaders, instanceID);
+    return LoadInstanceSlotOffset(InstanceHeaders, instanceID);
 }
 
 float GetInstanceBoundsExpansion(uint instanceID)
@@ -128,6 +146,27 @@ float3 ProjectToScreen(float3 worldPos, float4x4 viewProj, uint screenWidth, uin
     return float3(screen, ndc.z);
 }
 
+struct ScreenProjection
+{
+    float2 Pixel;
+    float InvW;
+    float Depth;
+};
+
+ScreenProjection ProjectToScreenProjection(float3 worldPos, float4x4 viewProj, uint screenWidth, uint screenHeight)
+{
+    float4 clip = mul(float4(worldPos, 1.0), viewProj);
+    float invW = 1.0 / clip.w;
+    float2 ndc = clip.xy * invW;
+
+    ScreenProjection projection;
+    projection.Pixel.x = (ndc.x * 0.5 + 0.5) * float(screenWidth);
+    projection.Pixel.y = (1.0 - (ndc.y * 0.5 + 0.5)) * float(screenHeight);
+    projection.InvW = invW;
+    projection.Depth = clip.z * invW;
+    return projection;
+}
+
 /// Compute barycentric coordinates from 2D screen positions.
 float3 ComputeBarycentric(float2 p, float2 v0, float2 v1, float2 v2)
 {
@@ -146,6 +185,16 @@ float3 ComputeBarycentric(float2 p, float2 v0, float2 v1, float2 v2)
     float v = (d00 * dp1 - d01 * dp0) * invDenom;
 
     return float3(1.0 - u - v, u, v);
+}
+
+float3 ComputePerspectiveBarycentric(float2 p, ScreenProjection v0, ScreenProjection v1, ScreenProjection v2)
+{
+    float3 bary = ComputeBarycentric(p, v0.Pixel, v1.Pixel, v2.Pixel);
+    float3 weighted = bary * float3(v0.InvW, v1.InvW, v2.InvW);
+    float denom = weighted.x + weighted.y + weighted.z;
+    if (abs(denom) < 1e-8)
+        return float3(0.0, 0.0, 0.0);
+    return weighted / denom;
 }
 
 // ── Debug / visualization ──

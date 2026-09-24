@@ -2,13 +2,9 @@
 #define COMMON_SLANG
 
 [__AttributeUsage(_AttributeTargets.Function)]
-struct ClusterShadeAttribute {};
+struct MaterialTargetAttribute { string target; };
 
 [__AttributeUsage(_AttributeTargets.Function)]
-struct ClusterRasterAttribute { string variant; };
-
-[__AttributeUsage(_AttributeTargets.Function)]
-struct ClusterDeformAttribute {};
 
 struct GpuTransform
 {

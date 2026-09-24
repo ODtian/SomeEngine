@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using SomeEngine.Assets;
 using SomeEngine.Assets.Schema;
+using static SomeEngine.Tests.TestProjectPaths;
 
 namespace SomeEngine.Tests.Assets;
 
@@ -28,7 +29,7 @@ public class AssetManifestTests
 
             AssetManifest loaded = AssetManifest.Load(dir);
 
-            Assert.True(loaded.TryGetSourcePath(sourceGuid, out string? sourcePath));
+            Assert.True(loaded.TrySourcePath(sourceGuid, out string? sourcePath));
             Assert.Equal("assets/Shaders/test.slang", sourcePath);
             Assert.True(loaded.TryGetAsset(shaderGuid, out AssetManifestRecord shaderRecord));
             Assert.Equal("TestShader", shaderRecord.Name);
@@ -53,13 +54,13 @@ public class AssetManifestTests
         manifest.AddAsset(mainGuid, "Main", "assets/Shaders/shared.shader.asset", nameof(ShaderAsset), sourceGuid, "shader:main");
         manifest.AddAsset(shadowGuid, "Shadow", "assets/Shaders/shared.shadow.shader.asset", nameof(ShaderAsset), sourceGuid, "shader:shadow");
 
-        Assert.True(manifest.TryGetSourceGuid("assets/Shaders/shared.slang", out SourceGuid resolvedSourceGuid));
+        Assert.True(manifest.TrySourceGuid("assets/Shaders/shared.slang", out SourceGuid resolvedSourceGuid));
         Assert.Equal(sourceGuid, resolvedSourceGuid);
-        Assert.True(manifest.TryGetAssetByPath("assets/Shaders/shared.shader.asset", out AssetManifestRecord assetRecord));
+        Assert.True(manifest.TryAssetPath("assets/Shaders/shared.shader.asset", out AssetManifestRecord assetRecord));
         Assert.Equal(mainGuid, assetRecord.Guid);
-        Assert.True(manifest.TryGetAssetBySourceAndSubAssetKey(sourceGuid, "shader:shadow", out AssetManifestRecord subAssetRecord));
+        Assert.True(manifest.TrySourceAsset(sourceGuid, "shader:shadow", out AssetManifestRecord subAssetRecord));
         Assert.Equal(shadowGuid, subAssetRecord.Guid);
-        AssertEquivalent(manifest.GetAssetsBySource(sourceGuid), new[] { mainGuid, shadowGuid });
+        AssertEquivalent(manifest.AssetsBySource(sourceGuid), new[] { mainGuid, shadowGuid });
     }
 
     [Fact]
@@ -96,13 +97,6 @@ public class AssetManifestTests
         Assert.Single(materials);
         Assert.Equal(materialGuid, materials[0].Guid);
         Assert.Equal("Material", materials[0].Name);
-    }
-
-    private static string CreateTempDir()
-    {
-        string dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(dir);
-        return dir;
     }
 
     private static void AssertEquivalent(IEnumerable<AssetGuid> actual, IEnumerable<AssetGuid> expected)

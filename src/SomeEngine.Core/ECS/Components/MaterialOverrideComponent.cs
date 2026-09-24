@@ -1,5 +1,5 @@
 using System.Numerics;
-using Friflo.Engine.ECS;
+using SomeECS.Core.Components;
 
 namespace SomeEngine.Core.ECS.Components;
 

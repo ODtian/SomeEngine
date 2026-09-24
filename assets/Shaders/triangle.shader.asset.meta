@@ -1,0 +1,13 @@
+{
+  "asset_guid": "84c8c701-58c5-5649-b2b5-dab23410d667",
+  "source_guid": "ba33a5f2-f579-4d2f-a028-ce12ca50b761",
+  "sub_asset_key": "shader:main",
+  "content_fingerprint": "198f9566e8f3af05644aef659fa2b7b71453970a542fbd831d86f982ada4a407",
+  "dependencies": [
+    {
+      "path": "assets/Shaders/triangle.slang",
+      "hash": "1745c95aace67027cdf28425e1c7a8ac3e2da238e5c5bf5f1bab6424534eef5d"
+    }
+  ],
+  "importer_version": 15
+}

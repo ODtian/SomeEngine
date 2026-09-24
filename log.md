@@ -1,5 +1,21 @@
 # Development Log
 
+## [2026-06-21] BATCH-31: RenderGraph Contract Retrofit
+- **Explicit Pass Access Contract**: `RenderGraphAccess` 枚举改为 `ReadOnly`/`WriteOnly`/`ReadWrite`；旧的 `Access(...)` 方法从公共 builder 表面删除，`Use(...)` 降级为 `internal`；反射 `*ReadWrite` 绑定不再塌缩为纯写。
+- **Dependency, Culling, And Queue Closure**: 编译输出最终化重连 resolves、queue batches、queue waits、frame sync；culling 确定性地跟踪保留/裁剪原因（`PassKeepReasons`/`PassCullReasons`）；WriteOnly 声明正确消费被覆写资源的需求。
+- **Resource Class, Lifetime, And History Semantics**: Imported/Transient/Extracted 资源合约完整；Imported 写保护 + 防别名；Exported 防别名；State trust 按来源/复用场景细粒度设置；跨帧历史走 Extract→Import 模式。
+- **Alias Allocation And Handoff Safety**: `CanAlias()` 检查 Live/Exported/Reusable/Imported/DeviceLocal/BufferInitialData；贪心 first-fit 分配按 FirstPass 排序；alias handoff 插入 `AliasingBarrier` 使前内容 undefined；独立 async queue batch 间 alias 生命周期已 padding。
+- **Barrier, Queue, And Execution Backend**: WriteOnly UAV 跳过 false prior dependency（`RequiresUavDependency` 中 `!IsWriteOnly(currentAccess)`）；执行时验证覆盖声明/access/state/range 四重检查；`PassBindings`/`PassParameters` 跨帧拒绝；新增 `IDevice.TryGetTextureViewOwner/BufferViewOwner`。
+- **In-Repo Migration**: `ShadeBinPass` 显式分类 `BinIndirectArgs`/`PixelCoordBuffer` 为 `WriteOnly`；`ClusterDeformPass` 的 DeformCache/CacheOffsets 使用 `builder.Write()`；行为测试覆盖 binding-step access 分类。
+- **验证**: RenderGraph 专项 198 通过；广泛渲染特性 169 通过；构建 0 错误。
+
+## [2026-05-10] BATCH-18: Temporal Validation Hardening
+- **Temporal validation is now automatable**: Runtime accepts `--temporal-validation`, runs shared presets, warms up each preset, captures backbuffer artifacts, and writes `summary.json`.
+- **Shared presets**: Runtime UI and automation now use the same Off / Resolve Only / Jitter + Resolve / Stable History / High Rejection definitions.
+- **Deterministic motion**: validation captures use a deterministic non-static camera path so motion-vector/history failures are harder to hide behind a static shot.
+- **Artifacts and metrics**: captures are written as uncompressed `.tga`; JSON records preset settings, frame metadata, jitter, and image-diff metrics against the temporal-off baseline.
+- **Verification**: focused temporal tests passed 29 / 29; `dotnet build SomeEngine.slnx --no-restore -v minimal -m:1` passed with only the existing `tools/DagVisualizer` NU1903 warning.
+
 ## [2026-03-28] BATCH-01: 文档同步与清理
 - **Workstream 转换**：完成 Full Conversion，产出 BASELINE-REVIEW / DESIGN / TASK-DETAIL / TASK-TRACKER / DEBT-TRACKER / ONBOARDING / BATCH-01-INSTRUCTIONS
 - **文档修正 8 处 DRIFT**：cluster_pipeline.md (GPUCluster 64B / MaterialSlotOffset / 9 Stage)、materials/architecture.md (SOA)、overview.md (BVH 双架构)
@@ -702,3 +718,17 @@
 - `AssetPipelineCatalogGenerator` 更新：自动发现 `IAssetProvider` 替代 `IAssetTypeHandler`。
 - `docs/assets/pipeline_overview.md` 重写：删除过期的 `IAssetTypeHandler` / `AssetTypeRegistry` 段落，替换为 `AssetProvider<T>` 模型、Providers 表、Default Textures 段落。
 - 验证结果：`140 passed, 0 failed, 1 skipped`；`dotnet build` 0 errors, 17 warnings (pre-existing)。
+
+## [2026-05-05] BATCH-16 Temporal Quality And Runtime Validation
+- Added deterministic temporal jitter via `TemporalJitter`: 8-sample Halton pixel offsets, pixel-to-NDC conversion, and projection application without mutating camera state.
+- Extended temporal resolve settings from a single history weight to explicit bounded controls for history weight, neighborhood clamp scale/minimum, and motion rejection.
+- Updated `temporal_resolve.hlsl` to clamp previous HDR history against a small current-frame neighborhood and reduce history under high motion.
+- Runtime and Editor now apply temporal jitter when temporal resolve is enabled. Runtime exposes F7 reset, F8 jitter toggle, F9 resolve toggle, and an ImGui temporal validation panel.
+- Verification: focused temporal tests `20 passed`; full solution build `0 errors` with existing DagVisualizer NU1903 warning; full tests `225 passed, 0 failed`.
+
+## [2026-05-09] BATCH-17 Runtime Debug State And Validation Console Rework
+- Replaced scattered Runtime debug locals with `RuntimeDebugState`, `RuntimeDebugInputState`, `RuntimeHiZPreviewCache`, and `RuntimeFrameTimings`.
+- Reimplemented the monolithic `Engine Debug` ImGui block as a bounded `Runtime Validation Console` with Frame, Rendering, Temporal, Scene, and Assets tabs.
+- Added `RuntimeDebugCommand` routing so reset/dump/load/import/spawn/evict actions are executed by `Program.cs`, not directly by UI drawing code.
+- Removed the old generic per-entity transform inspector from Runtime UI; scene controls remain validation helpers rather than editor features.
+- Verification: `dotnet build SomeEngine.slnx --no-restore -v minimal -m:1` passed with 0 errors and the existing DagVisualizer NU1903 warning; `dotnet test tests/SomeEngine.Tests/SomeEngine.Tests.csproj --no-restore --verbosity quiet` passed `243/243`.

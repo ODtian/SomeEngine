@@ -9,10 +9,10 @@ using Microsoft.CodeAnalysis;
 namespace SomeEngine.Generators;
 
 [Generator]
-public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
+public sealed class HeaderLayoutGen : IIncrementalGenerator
 {
-    private const string HeaderFieldAttributeName = "SomeEngine.Render.Data.GpuInstanceHeaderFieldAttribute";
-    private const string DataFlagAttributeName = "SomeEngine.Render.Data.GpuInstanceDataFlagAttribute";
+    private const string HeaderFieldAttributeName = "SomeEngine.Render.Data.HeaderFieldAttribute";
+    private const string DataFlagAttributeName = "SomeEngine.Render.Data.InstanceFlagAttribute";
     private const int HeaderStrideAlignment = 16;
     private const int MinHeaderStrideBytes = 32;
 
@@ -82,6 +82,8 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
                 field.CSharpName,
                 field.SlangName,
                 field.LoadFunctionSuffix,
+                field.InstanceMember,
+                field.Source,
                 field.Type,
                 offset,
                 size));
@@ -108,17 +110,20 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
             return null;
         }
 
-        string slangName = GetNamedString(attribute, "SlangName") ?? ToHeaderFieldSlangName(csharpName);
-        string loadFunctionSuffix = GetNamedString(attribute, "LoadFunctionSuffix") ?? ToLoadFunctionSuffix(csharpName);
+        string slangName = GetNamedString(attribute, "SlangName") ?? FieldSlang(csharpName);
+        string loadFunctionSuffix = GetNamedString(attribute, "LoadFunctionSuffix") ?? LoadSuffix(csharpName);
+        string instanceMember = GetNamedString(attribute, "InstanceMember") ?? csharpName;
+        bool source = GetNamedBool(attribute, "Source") ?? true;
 
         if (string.IsNullOrWhiteSpace(csharpName)
             || string.IsNullOrWhiteSpace(slangName)
-            || string.IsNullOrWhiteSpace(loadFunctionSuffix))
+            || string.IsNullOrWhiteSpace(loadFunctionSuffix)
+            || (source && string.IsNullOrWhiteSpace(instanceMember)))
         {
             return null;
         }
 
-        return new FieldInfo(csharpName, slangName, loadFunctionSuffix, (HeaderFieldType)type, order);
+        return new FieldInfo(csharpName, slangName, loadFunctionSuffix, instanceMember, source, (HeaderFieldType)type, order);
     }
 
     private static FlagInfo? ReadFlag(AttributeData attribute)
@@ -135,7 +140,7 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
             return null;
         }
 
-        string slangName = GetNamedString(attribute, "SlangName") ?? ToDataFlagSlangName(csharpName);
+        string slangName = GetNamedString(attribute, "SlangName") ?? FlagSlang(csharpName);
 
         if (string.IsNullOrWhiteSpace(csharpName) || string.IsNullOrWhiteSpace(slangName) || bit < 0 || bit >= 32)
         {
@@ -158,13 +163,27 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
         return null;
     }
 
-    private static string ToHeaderFieldSlangName(string csharpName)
+    private static bool? GetNamedBool(AttributeData attribute, string name)
+    {
+        foreach (KeyValuePair<string, TypedConstant> named in attribute.NamedArguments)
+        {
+            if (string.Equals(named.Key, name, StringComparison.Ordinal)
+                && named.Value.Value is bool value)
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static string FieldSlang(string csharpName)
         => "IH_" + ToUpperSnake(csharpName);
 
-    private static string ToDataFlagSlangName(string csharpName)
+    private static string FlagSlang(string csharpName)
         => "INSTANCE_DATA_FLAG_" + ToUpperSnake(csharpName);
 
-    private static string ToLoadFunctionSuffix(string csharpName)
+    private static string LoadSuffix(string csharpName)
     {
         const string implicitPrefix = "Instance";
         if (csharpName.StartsWith(implicitPrefix, StringComparison.Ordinal)
@@ -228,7 +247,7 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
         sb.AppendLine("namespace SomeEngine.Render.Data;");
         sb.AppendLine();
         sb.AppendLine("[System.Flags]");
-        sb.AppendLine("public enum GpuInstanceDataFlags : uint");
+        sb.AppendLine("public enum InstanceFlags : uint");
         sb.AppendLine("{");
         sb.AppendLine("    None = 0,");
         foreach (FlagInfo flag in layout.Flags)
@@ -261,8 +280,37 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
         sb.AppendLine("ul;");
         sb.AppendLine();
         sb.Append("    public const string SlangSource = ");
-        sb.Append(ToCSharpStringLiteral(slangSource));
+        sb.Append(CsString(slangSource));
         sb.AppendLine(";");
+        sb.AppendLine();
+        sb.AppendLine("    public static void Write(System.Span<byte> header, in SomeEngine.Render.Components.RenderInstance instance)");
+        sb.AppendLine("    {");
+        sb.AppendLine("        if (header.Length < StrideBytes)");
+        sb.AppendLine("            throw new System.ArgumentException(\"Instance header span is smaller than the generated layout stride.\", nameof(header));");
+        sb.AppendLine();
+        sb.AppendLine("        header = header[..StrideBytes];");
+        sb.AppendLine("        header.Clear();");
+        foreach (PlacedFieldInfo field in layout.Fields)
+        {
+            if (!field.Source)
+                continue;
+
+            sb.Append("        ");
+            sb.Append(field.Type == HeaderFieldType.Float32 ? "WriteFloat32" : "WriteU32");
+            sb.Append("(header, ");
+            sb.Append(field.CSharpName);
+            sb.Append(", ");
+            if (field.Type == HeaderFieldType.UInt32)
+            {
+                sb.Append("(uint)");
+            }
+
+            sb.Append("instance.");
+            sb.Append(field.InstanceMember);
+            sb.AppendLine(");");
+        }
+
+        sb.AppendLine("    }");
         sb.AppendLine("}");
 
         return sb.ToString();
@@ -343,7 +391,7 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
         return sb.ToString();
     }
 
-    private static string ToCSharpStringLiteral(string value)
+    private static string CsString(string value)
     {
         var sb = new StringBuilder(value.Length + 32);
         sb.Append('"');
@@ -393,22 +441,22 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
     {
         ulong hash = 14695981039346656037ul;
         HashString(ref hash, "InstanceHeaderLayout/v1");
-        HashUInt32(ref hash, (uint)strideBytes);
+        HashU32(ref hash, (uint)strideBytes);
 
         foreach (PlacedFieldInfo field in fields)
         {
             HashString(ref hash, field.CSharpName);
             HashString(ref hash, field.SlangName);
-            HashUInt32(ref hash, (uint)field.Type);
-            HashUInt32(ref hash, (uint)field.Offset);
-            HashUInt32(ref hash, (uint)field.Size);
+            HashU32(ref hash, (uint)field.Type);
+            HashU32(ref hash, (uint)field.Offset);
+            HashU32(ref hash, (uint)field.Size);
         }
 
         foreach (FlagInfo flag in flags)
         {
             HashString(ref hash, flag.CSharpName);
             HashString(ref hash, flag.SlangName);
-            HashUInt32(ref hash, (uint)flag.Bit);
+            HashU32(ref hash, (uint)flag.Bit);
         }
 
         return hash;
@@ -424,7 +472,7 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
         HashByte(ref hash, 0);
     }
 
-    private static void HashUInt32(ref ulong hash, uint value)
+    private static void HashU32(ref ulong hash, uint value)
     {
         HashByte(ref hash, (byte)value);
         HashByte(ref hash, (byte)(value >> 8));
@@ -464,12 +512,16 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
             string csharpName,
             string slangName,
             string loadFunctionSuffix,
+            string instanceMember,
+            bool source,
             HeaderFieldType type,
             int order)
         {
             CSharpName = csharpName;
             SlangName = slangName;
             LoadFunctionSuffix = loadFunctionSuffix;
+            InstanceMember = instanceMember;
+            Source = source;
             Type = type;
             Order = order;
         }
@@ -477,6 +529,8 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
         public string CSharpName { get; }
         public string SlangName { get; }
         public string LoadFunctionSuffix { get; }
+        public string InstanceMember { get; }
+        public bool Source { get; }
         public HeaderFieldType Type { get; }
         public int Order { get; }
     }
@@ -487,6 +541,8 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
             string csharpName,
             string slangName,
             string loadFunctionSuffix,
+            string instanceMember,
+            bool source,
             HeaderFieldType type,
             int offset,
             int size)
@@ -494,6 +550,8 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
             CSharpName = csharpName;
             SlangName = slangName;
             LoadFunctionSuffix = loadFunctionSuffix;
+            InstanceMember = instanceMember;
+            Source = source;
             Type = type;
             Offset = offset;
             Size = size;
@@ -502,6 +560,8 @@ public sealed class InstanceHeaderLayoutGenerator : IIncrementalGenerator
         public string CSharpName { get; }
         public string SlangName { get; }
         public string LoadFunctionSuffix { get; }
+        public string InstanceMember { get; }
+        public bool Source { get; }
         public HeaderFieldType Type { get; }
         public int Offset { get; }
         public int Size { get; }

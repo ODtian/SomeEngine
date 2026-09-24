@@ -23,9 +23,62 @@ public struct TransformQvvs(Vector3 position, Quaternion rotation, float scale =
 
     public readonly Matrix4x4 ToMatrix()
     {
-        return Matrix4x4.CreateScale(Stretch * Scale)
-            * Matrix4x4.CreateFromQuaternion(Rotation)
-            * Matrix4x4.CreateTranslation(Position);
+        if (Rotation.X == 0.0f
+            && Rotation.Y == 0.0f
+            && Rotation.Z == 0.0f
+            && Rotation.W == 1.0f
+            && Stretch.X == 1.0f
+            && Stretch.Y == 1.0f
+            && Stretch.Z == 1.0f)
+        {
+            return new Matrix4x4(
+                Scale,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                Scale,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f,
+                Scale,
+                0.0f,
+                Position.X,
+                Position.Y,
+                Position.Z,
+                1.0f);
+        }
+
+        Vector3 scale = Stretch * Scale;
+        Quaternion q = Rotation;
+        float xx = q.X * q.X;
+        float yy = q.Y * q.Y;
+        float zz = q.Z * q.Z;
+        float xy = q.X * q.Y;
+        float zw = q.Z * q.W;
+        float xz = q.X * q.Z;
+        float yw = q.Y * q.W;
+        float yz = q.Y * q.Z;
+        float xw = q.X * q.W;
+
+        return new Matrix4x4(
+            scale.X * (1.0f - (2.0f * (yy + zz))),
+            scale.X * (2.0f * (xy + zw)),
+            scale.X * (2.0f * (xz - yw)),
+            0.0f,
+            scale.Y * (2.0f * (xy - zw)),
+            scale.Y * (1.0f - (2.0f * (xx + zz))),
+            scale.Y * (2.0f * (yz + xw)),
+            0.0f,
+            scale.Z * (2.0f * (xz + yw)),
+            scale.Z * (2.0f * (yz - xw)),
+            scale.Z * (1.0f - (2.0f * (xx + yy))),
+            0.0f,
+            Position.X,
+            Position.Y,
+            Position.Z,
+            1.0f);
     }
 
     public static TransformQvvs Combine(in TransformQvvs parent, in TransformQvvs local)

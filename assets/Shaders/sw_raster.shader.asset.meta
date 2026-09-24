@@ -2,36 +2,40 @@
   "asset_guid": "70cd2572-fa34-5f52-9676-f355f8f8b6db",
   "source_guid": "15e99d38-e308-4494-90cb-c2da6fc73450",
   "sub_asset_key": "shader:main",
-  "content_fingerprint": "eae58a6660e5dd86e36022eb5f30fb7992769124aff8e613ff46202a2c83dea5",
+  "content_fingerprint": "076d326f99933e77a5bbe449f5719cc3c427e789362b36b90bd4b0e804116d42",
   "dependencies": [
     {
       "path": "assets/Shaders/cluster_common.slang",
-      "hash": "386666769386237c388c623c611341170505536c8d5d32d94acca68d212d8d9c"
+      "hash": "84478ea7c9237edea3020e049f13b314779860a8add90da2cb9ab5c77aa2dda0"
     },
     {
       "path": "assets/Shaders/cluster_structures.slang",
-      "hash": "9b2a65aacbb7ac8400d74cd1f74b24b0e904a3c38d2a884d9b83c6c1710426e4"
+      "hash": "2f1ac580b574b8f58413f488143ce9a52859c0f2126508f2ef41fd1fbdd6651d"
     },
     {
       "path": "assets/Shaders/common.slang",
-      "hash": "8d6c13488dec6ded178f1c73f93ddf8de3124d808426e7974f3fdeae0112a625"
+      "hash": "a40161bc79252d542bd62f09fe4a9f828e9c84a20b2ccc63609c9c49bbef37bd"
     },
     {
       "path": "assets/Shaders/generated/instance_header_layout.slang",
-      "hash": "2c118aca994b1a69f4d81a89838f156e5639b6989414cba21bba2c00b219e8d0"
+      "hash": "2b3e33696675e1dae139a69ea3cf32b451c755889a0df862c6190d7a4125d98d"
     },
     {
       "path": "assets/Shaders/sw_raster.slang",
-      "hash": "6ff709814cb4221ad423121800c69f94c9aa85fa558c4985460b1703595ace83"
+      "hash": "021a523ac7ca6ed20e47582c835384bcebc56b5e0e95091b3f86f42d46dbd4b7"
     },
     {
       "path": "assets/Shaders/vertex_evaluate.slang",
-      "hash": "611b83635d80a3d3ae8d364dcd02db1bdcfe5a9480d66c170f8413bacf7648f5"
+      "hash": "93e7b2e42c76e496ddb5c5f65bf61ca1ceb235d75469794eaaf54552e1ce91ff"
+    },
+    {
+      "path": "assets/Shaders/visbuffer_encoding.slang",
+      "hash": "892f4220f921406aaf9fc82b0c454bf0a747636fe0a183cd72a0dce3d5115204"
     },
     {
       "path": "assets/Shaders/wave_queue.slang",
       "hash": "c0a17eb718faf70f81b097baab565b67ea436c946456462f7ca023950df13cc9"
     }
   ],
-  "importer_version": 5
+  "importer_version": 15
 }

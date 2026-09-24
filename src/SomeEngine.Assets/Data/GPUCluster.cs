@@ -52,7 +52,7 @@ public struct GPUCluster
     // 56: uint MaterialTableOffset — slow path (>3 materials) external table byte offset within page (0xFFFFFFFF = fast path)
     public uint MaterialTableOffset;
 
-    // 60: uint VRBBatchInfo — VRB batch encoding (fast path: ≤5 batches packed, see BuildVRBBatches)
+    // 60: uint VRBBatchInfo — VRB batch encoding (fast path: ≤5 batches packed, see BuildVrb)
     public uint VRBBatchInfo;
 
     // 64: object-space cluster AABB min
@@ -64,6 +64,6 @@ public struct GPUCluster
     public const int SizeInBytes = 88;
 
     // Helper to pack CenterOffset and RadiusQuant
-    public static uint PackU16Pair(ushort a, ushort b) => (uint)a | ((uint)b << 16);
-    public static (ushort, ushort) UnpackU16Pair(uint packed) => ((ushort)(packed & 0xFFFF), (ushort)(packed >> 16));
+    public static uint PackU16(ushort a, ushort b) => (uint)a | ((uint)b << 16);
+    public static (ushort, ushort) UnpackU16(uint packed) => ((ushort)(packed & 0xFFFF), (ushort)(packed >> 16));
 }

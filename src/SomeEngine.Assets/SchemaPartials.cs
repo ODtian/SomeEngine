@@ -27,6 +27,19 @@ public partial class MaterialAsset : global::SomeEngine.Assets.IMutableAsset
         => AssetGuid = guid.ToFlatString();
 }
 
+public partial class ClusterRenderAsset : global::SomeEngine.Assets.IMutableAsset
+{
+    global::SomeEngine.Assets.AssetGuid global::SomeEngine.Assets.IAsset.AssetGuid
+        => global::SomeEngine.Assets.AssetGuid.TryParse(AssetGuid, out global::SomeEngine.Assets.AssetGuid guid)
+            ? guid
+            : global::SomeEngine.Assets.AssetGuid.Empty;
+
+    string global::SomeEngine.Assets.IAsset.Name => Name ?? string.Empty;
+
+    void global::SomeEngine.Assets.IMutableAsset.SetAssetGuid(global::SomeEngine.Assets.AssetGuid guid)
+        => AssetGuid = guid.ToFlatString();
+}
+
 public partial class MaterialInstanceAsset : global::SomeEngine.Assets.IMutableAsset
 {
     global::SomeEngine.Assets.AssetGuid global::SomeEngine.Assets.IAsset.AssetGuid

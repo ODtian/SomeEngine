@@ -1,6 +1,6 @@
 # 光栅化管线设计文档
 
-> 合并自 `raster.md`、`raster_impl.md`、`plan/hw_sw_raster_merge.md`。
+> 合并自 `raster.md`、`raster_impl.md`、`hw_sw_raster_merge` notes。
 >
 > **SW 光栅 + HW/SW 融合：✅ 已实施**
 

@@ -1,25 +1,31 @@
 using SomeEngine.Render.Data;
+using SomeEngine.Render.Components;
 
-[assembly: GpuInstanceHeaderField(
+[assembly: HeaderField(
     "BVHRootIndex",
-    GpuInstanceHeaderFieldType.UInt32,
-    0)]
-[assembly: GpuInstanceHeaderField(
-    "MaterialSlotOffset",
-    GpuInstanceHeaderFieldType.UInt32,
-    1)]
-[assembly: GpuInstanceHeaderField(
+    HeaderFieldType.UInt32,
+    0,
+    Source = false)]
+[assembly: HeaderField(
+    "SlotOffset",
+    HeaderFieldType.UInt32,
+    1,
+    Source = false)]
+[assembly: HeaderField(
     "InstanceDataOffset",
-    GpuInstanceHeaderFieldType.UInt32,
-    2)]
-[assembly: GpuInstanceHeaderField(
+    HeaderFieldType.UInt32,
+    2,
+    InstanceMember = nameof(RenderInstance.DataOffset))]
+[assembly: HeaderField(
     "InstanceDataFlags",
-    GpuInstanceHeaderFieldType.UInt32,
-    3)]
-[assembly: GpuInstanceHeaderField(
+    HeaderFieldType.UInt32,
+    3,
+    InstanceMember = nameof(RenderInstance.DataFlags))]
+[assembly: HeaderField(
     "BoundsExpansionWorld",
-    GpuInstanceHeaderFieldType.Float32,
-    4)]
-[assembly: GpuInstanceDataFlag(
+    HeaderFieldType.Float32,
+    4,
+    InstanceMember = nameof(RenderInstance.BoundsExpansion))]
+[assembly: InstanceFlag(
     "MaterialOverride",
     0)]

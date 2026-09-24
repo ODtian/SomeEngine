@@ -2,6 +2,8 @@
 #define CLUSTER_STRUCTURES_SLANG
 
 static const uint GPU_CLUSTER_STRIDE_BYTES = 88;
+static const uint SLOT_INVALID = 0xFFFFu;
+static const uint BIN_INVALID = 0xFFFFFFFFu;
 
 struct GPUPageHeader
 {
@@ -127,17 +129,42 @@ struct ClusterBVHNode
     uint NodeType; // 0=Internal, 1=Leaf
 };
 
-// ─── MaterialSlotBuffer SOA access ───
+// ─── SlotBuffer SOA access ───
 // GPU buffer is StructuredBuffer<uint>, SOA layout:
 //   field0: [slot0,slot1,...] | field1: [slot0,slot1,...] | ...
+// CPU slot address: slot offset + local material index.
 // Each pair of ushort slots packs into one uint.
 // slotCapacity is always even.
-uint GetSlotField(StructuredBuffer<uint> slotBuffer, uint slotOffset, uint fieldIndex, uint slotCapacity)
+uint GetSlotField(
+    StructuredBuffer<uint> slotBuffer,
+    uint slotOffset,
+    uint localMaterialIndex,
+    uint fieldIndex,
+    uint slotCapacity)
 {
+    uint slotIndex = slotOffset + localMaterialIndex;
+    if (slotIndex >= slotCapacity)
+        return SLOT_INVALID;
+
     uint fieldBaseUint = fieldIndex * (slotCapacity / 2);
-    uint wordIdx = fieldBaseUint + (slotOffset / 2);
+    uint wordIdx = fieldBaseUint + (slotIndex / 2);
     uint packed = slotBuffer[wordIdx];
-    return (slotOffset % 2 == 0) ? (packed & 0xFFFF) : (packed >> 16);
+    return (slotIndex % 2 == 0) ? (packed & 0xFFFF) : (packed >> 16);
+}
+
+uint LocalMaterial(uint packedMaterials, uint packedRanges, uint triStart)
+{
+    uint range0End = packedRanges & 0xFFu;
+    uint range1End = (packedRanges >> 8) & 0xFFu;
+    uint lane = triStart < range0End ? 0u : (triStart < range1End ? 1u : 2u);
+    return (packedMaterials >> (lane * 8u)) & 0xFFu;
+}
+
+uint MaterialEnd(uint packedRanges, uint triStart, uint triangleCount)
+{
+    uint range0End = min(packedRanges & 0xFFu, triangleCount);
+    uint range1End = min((packedRanges >> 8) & 0xFFu, triangleCount);
+    return triStart < range0End ? range0End : (triStart < range1End ? range1End : triangleCount);
 }
 
 struct AABB
@@ -182,6 +209,78 @@ struct BVHDispatchArgs
     uint GroupZ;
     uint NodeCount;
 };
+
+DispatchArgs LoadDispatchArgs(ByteAddressBuffer buffer, uint byteOffset)
+{
+    return DispatchArgs(
+        buffer.Load(byteOffset + 0u),
+        buffer.Load(byteOffset + 4u),
+        buffer.Load(byteOffset + 8u));
+}
+
+DispatchArgs LoadDispatchArgs(RWByteAddressBuffer buffer, uint byteOffset)
+{
+    return DispatchArgs(
+        buffer.Load(byteOffset + 0u),
+        buffer.Load(byteOffset + 4u),
+        buffer.Load(byteOffset + 8u));
+}
+
+void StoreDispatchArgs(RWByteAddressBuffer buffer, uint byteOffset, DispatchArgs value)
+{
+    buffer.Store(byteOffset + 0u, value.GroupX);
+    buffer.Store(byteOffset + 4u, value.GroupY);
+    buffer.Store(byteOffset + 8u, value.GroupZ);
+}
+
+DrawInstancedArgs LoadDrawInstancedArgs(ByteAddressBuffer buffer, uint byteOffset)
+{
+    return DrawInstancedArgs(
+        buffer.Load(byteOffset + 0u),
+        buffer.Load(byteOffset + 4u),
+        buffer.Load(byteOffset + 8u),
+        buffer.Load(byteOffset + 12u));
+}
+
+DrawInstancedArgs LoadDrawInstancedArgs(RWByteAddressBuffer buffer, uint byteOffset)
+{
+    return DrawInstancedArgs(
+        buffer.Load(byteOffset + 0u),
+        buffer.Load(byteOffset + 4u),
+        buffer.Load(byteOffset + 8u),
+        buffer.Load(byteOffset + 12u));
+}
+
+void StoreDrawInstancedArgs(RWByteAddressBuffer buffer, uint byteOffset, DrawInstancedArgs value)
+{
+    buffer.Store(byteOffset + 0u, value.VertexCount);
+    buffer.Store(byteOffset + 4u, value.InstanceCount);
+    buffer.Store(byteOffset + 8u, value.StartVertex);
+    buffer.Store(byteOffset + 12u, value.StartInstance);
+}
+
+CullDrawArgs LoadCullDrawArgs(ByteAddressBuffer buffer, uint byteOffset)
+{
+    return CullDrawArgs(
+        buffer.Load(byteOffset + 0u),
+        buffer.Load(byteOffset + 4u),
+        buffer.Load(byteOffset + 8u));
+}
+
+CullDrawArgs LoadCullDrawArgs(RWByteAddressBuffer buffer, uint byteOffset)
+{
+    return CullDrawArgs(
+        buffer.Load(byteOffset + 0u),
+        buffer.Load(byteOffset + 4u),
+        buffer.Load(byteOffset + 8u));
+}
+
+void StoreCullDrawArgs(RWByteAddressBuffer buffer, uint byteOffset, CullDrawArgs value)
+{
+    buffer.Store(byteOffset + 0u, value.VertexCountPerCluster);
+    buffer.Store(byteOffset + 4u, value.SWCount);
+    buffer.Store(byteOffset + 8u, value.HWCount);
+}
 
 // Raster Bin metadata (32B = 8×uint)
 struct RasterBinEntry

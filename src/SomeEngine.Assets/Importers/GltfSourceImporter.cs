@@ -8,7 +8,7 @@ namespace SomeEngine.Assets.Importers;
 public sealed class GltfSourceImporter : IAssetImporter
 {
     private static readonly string[] Extensions = [".gltf", ".glb"];
-    public const uint ImporterVersion = 2;
+    public const uint ImporterVersion = 3;
 
     public string ImporterName => nameof(GltfSourceImporter);
     public IReadOnlyList<string> SourceExtensions => Extensions;
@@ -24,22 +24,18 @@ public sealed class GltfSourceImporter : IAssetImporter
         SourceMeta sourceMeta
     )
     {
-        string fullPath = Path.IsPathRooted(sourcePath)
-            ? Path.GetFullPath(sourcePath)
-            : Path.GetFullPath(Path.Combine(projectRoot, sourcePath));
+        string fullPath = GltfDeps.FullPath(projectRoot, sourcePath);
         GltfImporterSettings settings = LoadSettings(sourceMeta, fullPath);
-        return ComputeFingerprint(projectRoot, fullPath, sourceMeta, settings);
+        return GltfDeps.Fingerprint(projectRoot, fullPath, sourceMeta, settings);
     }
 
     public IReadOnlyList<ImportedAsset> Import(string projectRoot, string sourcePath)
     {
-        string fullPath = Path.IsPathRooted(sourcePath)
-            ? Path.GetFullPath(sourcePath)
-            : Path.GetFullPath(Path.Combine(projectRoot, sourcePath));
-        SourceMeta sourceMeta = SourceMetaManager.GetOrCreate(fullPath, ImporterName);
+        string fullPath = GltfDeps.FullPath(projectRoot, sourcePath);
+        SourceMeta sourceMeta = SourceMetaFiles.GetOrCreate(fullPath, ImporterName);
         GltfImporterSettings settings = LoadSettings(sourceMeta, fullPath);
         AssetImportFingerprint fingerprint =
-            ComputeFingerprint(projectRoot, fullPath, sourceMeta, settings)
+            GltfDeps.Fingerprint(projectRoot, fullPath, sourceMeta, settings)
             ?? throw new FileNotFoundException(
                 $"One or more GLTF dependencies for '{fullPath}' could not be found."
             );
@@ -59,6 +55,7 @@ public sealed class GltfSourceImporter : IAssetImporter
             projectRoot,
             fullPath,
             sourceMeta,
+            settings,
             fingerprint,
             model,
             importedMaterials
@@ -107,11 +104,11 @@ public sealed class GltfSourceImporter : IAssetImporter
         List<ImportedAsset> importedTextures
     )
     {
-        MaterialAsset litTemplate = MaterialAssetSerializer.Load(
-            ToProjectFullPath(projectRoot, settings.LitMaterialTemplate)
+        MaterialAsset litTemplate = MaterialAssetCodec.Load(
+            GltfDeps.FullPath(projectRoot, settings.LitMaterialTemplate)
         );
-        MaterialAsset unlitTemplate = MaterialAssetSerializer.Load(
-            ToProjectFullPath(projectRoot, settings.UnlitMaterialTemplate)
+        MaterialAsset unlitTemplate = MaterialAssetCodec.Load(
+            GltfDeps.FullPath(projectRoot, settings.UnlitMaterialTemplate)
         );
         string sourceStem = Path.GetFileNameWithoutExtension(fullSourcePath);
         string sourceDirectory = Path.GetDirectoryName(fullSourcePath)!;
@@ -131,7 +128,7 @@ public sealed class GltfSourceImporter : IAssetImporter
             string subAssetKey = $"material:{index}:{safeName}";
 
             MaterialAsset template = material.Unlit ? unlitTemplate : litTemplate;
-            AssetGuid assetGuid = ResolveImportedAssetGuid(sourceMeta.SourceGuid, subAssetKey);
+            AssetGuid assetGuid = AssetGuid.FromSource(sourceMeta.SourceGuid, subAssetKey);
             MaterialAsset asset = CloneMaterial(template, materialName, assetGuid);
 
             ApplyMaterialSemantics(
@@ -143,8 +140,8 @@ public sealed class GltfSourceImporter : IAssetImporter
                 fingerprint,
                 importedTextures
             );
-            MaterialAssetSerializer.Save(asset, outputPath);
-            SaveImportedAssetMeta(
+            MaterialAssetCodec.Save(asset, outputPath);
+            GltfDeps.SaveMeta(
                 outputPath,
                 asset.AssetGuid,
                 sourceMeta.SourceGuid,
@@ -168,6 +165,7 @@ public sealed class GltfSourceImporter : IAssetImporter
         string projectRoot,
         string fullSourcePath,
         SourceMeta sourceMeta,
+        GltfImporterSettings settings,
         AssetImportFingerprint fingerprint,
         ModelRoot model,
         IReadOnlyList<ImportedMaterialInfo> importedMaterials
@@ -199,12 +197,19 @@ public sealed class GltfSourceImporter : IAssetImporter
                 )
                 .ToArray();
 
-            MeshAsset meshAsset = ClusterBuilder.ProcessMesh(mesh, materialSlots, meshName);
-            AssetGuid assetGuid = ResolveImportedAssetGuid(sourceMeta.SourceGuid, subAssetKey);
+            MeshAsset meshAsset = ClusterBuilder.ProcessMesh(
+                mesh,
+                materialSlots,
+                meshName,
+                new ClusterBuilderOptions
+                {
+                    GenerateMissingTangents = settings.GenerateTangents,
+                });
+            AssetGuid assetGuid = AssetGuid.FromSource(sourceMeta.SourceGuid, subAssetKey);
             meshAsset.AssetGuid = assetGuid.ToFlatString();
 
-            MeshAssetSerializer.Save(meshAsset, outputPath);
-            SaveImportedAssetMeta(
+            MeshAssetCodec.Save(meshAsset, outputPath);
+            GltfDeps.SaveMeta(
                 outputPath,
                 meshAsset.AssetGuid,
                 sourceMeta.SourceGuid,
@@ -458,7 +463,7 @@ public sealed class GltfSourceImporter : IAssetImporter
             imageBytes = content.Content.ToArray();
         }
 
-        AssetGuid assetGuid = ResolveImportedAssetGuid(sourceMeta.SourceGuid, subAssetKey);
+        AssetGuid assetGuid = AssetGuid.FromSource(sourceMeta.SourceGuid, subAssetKey);
 
         // Width/Height are unknown at import time because the payload stays compressed.
         var textureAsset = new TextureAsset
@@ -471,8 +476,8 @@ public sealed class GltfSourceImporter : IAssetImporter
             Payload = imageBytes,
         };
 
-        TextureAssetSerializer.Save(textureAsset, outputPath);
-        SaveImportedAssetMeta(
+        TextureAssetCodec.Save(textureAsset, outputPath);
+        GltfDeps.SaveMeta(
             outputPath,
             textureAsset.AssetGuid,
             sourceMeta.SourceGuid,
@@ -551,219 +556,6 @@ public sealed class GltfSourceImporter : IAssetImporter
     {
         return new ScalarParam { Name = scalar.Name, Value = scalar.Value };
     }
-
-    private static AssetGuid ResolveImportedAssetGuid(SourceGuid sourceGuid, string subAssetKey)
-    {
-        return AssetGuid.FromSource(sourceGuid, subAssetKey);
-    }
-
-    private static AssetImportFingerprint? ComputeFingerprint(
-        string projectRoot,
-        string fullSourcePath,
-        SourceMeta sourceMeta,
-        GltfImporterSettings settings
-    )
-    {
-        List<DependencyEntryData> dependencies = [];
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (!TryAddDependency(projectRoot, fullSourcePath, dependencies, seen))
-        {
-            return null;
-        }
-
-        if (
-            !TryAddProjectDependency(projectRoot, settings.LitMaterialTemplate, dependencies, seen)
-            || !TryAddProjectDependency(
-                projectRoot,
-                settings.UnlitMaterialTemplate,
-                dependencies,
-                seen
-            )
-        )
-        {
-            return null;
-        }
-
-        if (
-            string.Equals(
-                Path.GetExtension(fullSourcePath),
-                ".gltf",
-                StringComparison.OrdinalIgnoreCase
-            ) && !TryAddGltfUriDependencies(projectRoot, fullSourcePath, dependencies, seen)
-        )
-        {
-            return null;
-        }
-
-        string settingsFingerprint = sourceMeta.ImporterSettings?.GetRawText() ?? string.Empty;
-        return AssetFingerprint.Create(dependencies, ImporterVersion, settingsFingerprint);
-    }
-
-    private static bool TryAddProjectDependency(
-        string projectRoot,
-        string projectRelativePath,
-        List<DependencyEntryData> dependencies,
-        HashSet<string> seen
-    )
-    {
-        if (string.IsNullOrWhiteSpace(projectRelativePath))
-        {
-            return false;
-        }
-
-        return TryAddDependency(
-            projectRoot,
-            ToProjectFullPath(projectRoot, projectRelativePath),
-            dependencies,
-            seen
-        );
-    }
-
-    private static bool TryAddDependency(
-        string projectRoot,
-        string fullPath,
-        List<DependencyEntryData> dependencies,
-        HashSet<string> seen
-    )
-    {
-        DependencyEntryData? dependency = AssetFingerprint.TryCreateFileDependency(
-            projectRoot,
-            fullPath
-        );
-        if (dependency == null)
-        {
-            return false;
-        }
-
-        if (seen.Add(dependency.RelativePath))
-        {
-            dependencies.Add(dependency);
-        }
-
-        return true;
-    }
-
-    private static bool TryAddGltfUriDependencies(
-        string projectRoot,
-        string fullSourcePath,
-        List<DependencyEntryData> dependencies,
-        HashSet<string> seen
-    )
-    {
-        using JsonDocument document = JsonDocument.Parse(File.ReadAllText(fullSourcePath));
-        JsonElement root = document.RootElement;
-        string sourceDirectory = Path.GetDirectoryName(fullSourcePath)!;
-
-        if (
-            !TryAddUriArrayDependencies(
-                projectRoot,
-                sourceDirectory,
-                root,
-                "buffers",
-                dependencies,
-                seen
-            )
-            || !TryAddUriArrayDependencies(
-                projectRoot,
-                sourceDirectory,
-                root,
-                "images",
-                dependencies,
-                seen
-            )
-        )
-        {
-            return false;
-        }
-
-        return true;
-    }
-
-    private static bool TryAddUriArrayDependencies(
-        string projectRoot,
-        string sourceDirectory,
-        JsonElement root,
-        string propertyName,
-        List<DependencyEntryData> dependencies,
-        HashSet<string> seen
-    )
-    {
-        if (
-            !root.TryGetProperty(propertyName, out JsonElement array)
-            || array.ValueKind != JsonValueKind.Array
-        )
-        {
-            return true;
-        }
-
-        foreach (JsonElement item in array.EnumerateArray())
-        {
-            if (
-                !item.TryGetProperty("uri", out JsonElement uriElement)
-                || uriElement.ValueKind != JsonValueKind.String
-            )
-            {
-                continue;
-            }
-
-            string? uri = uriElement.GetString();
-            if (
-                string.IsNullOrWhiteSpace(uri)
-                || uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase)
-            )
-            {
-                continue;
-            }
-
-            string dependencyPath = Uri.UnescapeDataString(uri);
-            if (
-                !TryAddDependency(
-                    projectRoot,
-                    Path.Combine(sourceDirectory, dependencyPath),
-                    dependencies,
-                    seen
-                )
-            )
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static void SaveImportedAssetMeta(
-        string outputPath,
-        string? assetGuid,
-        SourceGuid sourceGuid,
-        string subAssetKey,
-        AssetImportFingerprint fingerprint
-    )
-    {
-        if (!AssetGuid.TryParse(assetGuid, out AssetGuid parsedGuid) || parsedGuid.IsEmpty)
-        {
-            return;
-        }
-
-        AssetMetaManager.Save(
-            outputPath,
-            new AssetMeta
-            {
-                AssetGuid = parsedGuid,
-                SourceGuid = sourceGuid,
-                SubAssetKey = subAssetKey,
-                ContentFingerprint = fingerprint.ContentFingerprint,
-                Dependencies = fingerprint.Dependencies,
-                ImporterVersion = fingerprint.ImporterVersion,
-                AssetPath = Path.GetFullPath(outputPath),
-            }
-        );
-    }
-
-    private static string ToProjectFullPath(string projectRoot, string path) =>
-        Path.IsPathRooted(path)
-            ? Path.GetFullPath(path)
-            : Path.GetFullPath(Path.Combine(projectRoot, path));
 
     private static string SanitizeSegment(string? value, string fallback)
     {

@@ -11,5 +11,12 @@ public sealed class ShaderAssetProvider : AssetProvider<ShaderAsset>
             || assetPath.EndsWith(".slang.asset", StringComparison.OrdinalIgnoreCase);
 
     public override ShaderAsset Create(AssetGuid guid, string filePath)
-        => ShaderAssetSerializer.Load(filePath);
+    {
+        ShaderAsset asset = ShaderAssetCodec.Load(filePath);
+        if (asset.EntryPointReflections?.Count > 0)
+            return asset;
+
+        throw new InvalidOperationException(
+            $"Shader asset '{asset.Name ?? Path.GetFileName(filePath)}' has no serialized entry-point reflection. Runtime shader loading does not compile or reflect source files; reimport '{filePath}' with the current Slang importer.");
+    }
 }

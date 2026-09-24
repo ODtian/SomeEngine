@@ -1,32 +1,43 @@
-using Friflo.Engine.ECS;
-using Friflo.Engine.ECS.Systems;
+using SomeEngine.Core.Diagnostics;
 using SomeEngine.Core.ECS.Systems;
-using SomeEngine.Core.Jobs;
+using SomeJob;
+using SomeECS.Core;
+using SomeECS.Systems;
 
 namespace SomeEngine.Core.ECS;
 
-public class GameWorld
+public sealed class GameWorld : IDisposable
 {
-    public EntityStore EntityStore { get; }
-    public SystemRoot SystemRoot { get; }
+    public World World { get; }
+    public SystemGroup<EngineSystemContext> Systems { get; }
     public SystemContext SystemContext { get; }
 
     public GameWorld()
     {
-        EntityStore = new EntityStore();
+        World = new World();
         SystemContext = new SystemContext();
-
-        SystemRoot = new SystemRoot(EntityStore) {
-            new HierarchySystem(EntityStore), new TransformSystem(SystemContext)
-        };
+        Systems = new SystemGroup<EngineSystemContext>(new EngineDriver(World, SystemContext));
+        Systems.Add(new TransformSystem());
     }
 
     public void Update(double deltaTime)
     {
+        using var scope = Profiler.BeginScope("GameWorld.Update");
         SystemContext.GlobalDependency = default;
 
-        SystemRoot.Update(default);
+        using (Profiler.BeginScope("GameWorld.Systems.Update"))
+        {
+            Systems.Update();
+        }
 
-        SystemContext.GlobalDependency.Complete();
+        using (Profiler.BeginScope("GameWorld.DependencyComplete"))
+        {
+            SystemContext.GlobalDependency.Complete();
+        }
+    }
+
+    public void Dispose()
+    {
+        Systems.Dispose();
     }
 }

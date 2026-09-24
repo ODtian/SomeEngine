@@ -52,7 +52,7 @@ Passed! - Failed: 0, Passed: 188, Skipped: 0, Total: 188
 - `ClusterShadeSig1Tests.BuildSig1Resources_AddsUniforms_First_And_SortsRemainingResources` — 验证 descriptor 构建稳定
 - `ClusterShadeSig1Tests.GetOrAddSig1CacheEntry_ReusesCachedValue_ForSameLayout` — 验证 cache reuse
 - `DeformCacheTests.AllocateCacheOffsets_AssignsSequentialBaseOffsets` — 验证 offset 分配
-- `DeformCacheTests.CanUseCachedPath_ExactFit_ReturnsTrue` — 验证 cached-path 边界
+- `DeformCacheTests.CacheFits` — 验证 cached-path 边界
 
 ---
 

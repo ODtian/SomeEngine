@@ -7,11 +7,13 @@ public sealed class GltfImporterSettings
 
     public string LitMaterialTemplate { get; set; } = string.Empty;
     public string UnlitMaterialTemplate { get; set; } = string.Empty;
+    public bool GenerateTangents { get; set; }
 
     public static GltfImporterSettings Default()
         => new()
         {
             LitMaterialTemplate = DefaultLitMaterialTemplate,
             UnlitMaterialTemplate = DefaultUnlitMaterialTemplate,
+            GenerateTangents = false,
         };
 }

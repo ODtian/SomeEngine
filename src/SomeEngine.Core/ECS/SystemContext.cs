@@ -1,4 +1,4 @@
-using SomeEngine.Core.Jobs;
+using SomeJob;
 
 namespace SomeEngine.Core.ECS;
 

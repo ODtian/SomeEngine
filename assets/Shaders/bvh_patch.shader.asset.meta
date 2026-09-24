@@ -2,7 +2,7 @@
   "asset_guid": "e63d2cf9-1f91-577b-8b28-6cc666abb702",
   "source_guid": "524e8fc3-8e06-4745-b497-ff06fd331be8",
   "sub_asset_key": "shader:main",
-  "content_fingerprint": "0d0ce6da8f9a6efd4342df9aa81d3ee60f71b7e0537088f3cb05e04d2c3993d7",
+  "content_fingerprint": "d7a7753de69c0c0cf2acd793a40f9f503ae8e9f8ab69fb77dcf4df5cb1dabee8",
   "dependencies": [
     {
       "path": "assets/Shaders/bvh_patch.slang",
@@ -10,12 +10,12 @@
     },
     {
       "path": "assets/Shaders/cluster_structures.slang",
-      "hash": "9b2a65aacbb7ac8400d74cd1f74b24b0e904a3c38d2a884d9b83c6c1710426e4"
+      "hash": "2f1ac580b574b8f58413f488143ce9a52859c0f2126508f2ef41fd1fbdd6651d"
     },
     {
       "path": "assets/Shaders/common.slang",
-      "hash": "8d6c13488dec6ded178f1c73f93ddf8de3124d808426e7974f3fdeae0112a625"
+      "hash": "a40161bc79252d542bd62f09fe4a9f828e9c84a20b2ccc63609c9c49bbef37bd"
     }
   ],
-  "importer_version": 6
+  "importer_version": 15
 }

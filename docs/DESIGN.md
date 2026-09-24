@@ -12,12 +12,12 @@
 
 ### 当前边界
 - ✅ GPU 渲染管线（BVH → HiZ → SW/HW Raster → Compute Shade）
-- ✅ 材质系统（MaterialSystem + Entity-based Material + BinQueue/BinSpace）
+- ✅ 材质系统（MaterialPass + MaterialItems + SlotBuffer）
 - ✅ 资产管线（GUID Manifest + Scanner + Validator + Workspace）
 - ✅ Slang 着色器集成（编译 + 反射 + 依赖追踪）
 - ✅ ECS / QVVS / Job System 基础能力
 - 📋 光照系统（PBR directional light 已有，无 point/area/IBL/shadow map）
-- 📋 流式加载（框架已有 `ClusterStreamer`，Page 管理未完善）
+- 📋 流式加载（框架已有 `PageFaults` / `PageStream`，Page 管理未完善）
 - ❌ 编辑器 / 物理 / 动画 / UI / 粒子
 
 ### 不解决什么
@@ -33,7 +33,7 @@
 ### 模块分层
 
 ```text
-Runtime (Program.cs)
+Runtime (RuntimeApp.cs)
   -> Render
      -> Graph / Materials / Pipelines / Systems / RHI
   -> Assets
@@ -78,19 +78,19 @@ Upload Globals
 
 | 层级 | 当前代码 | 状态 |
 |---|---|---|
-| RenderPass | `ClusterCullPass`, `ClusterSWRasterPass`, `ClusterBinningPass` 等 | `stable` |
-| Stage（静态函数） | `ClusterTraverseStage`, `ClusterRasterBinStage`, `ClusterHiZStage`, `ClusterShade` 等 | `stable` |
+| Pass | `BvhPatchPass`, `ClusterTraversePass`, `RasterBinPass`, `ClusterDrawPass` 等 | `stable` |
+| Stage（struct 编排器） | `ClusterSceneStage`, `ClusterRasterStage`, `ClusterShadeStage`, `ClusterOutputStage` | `stable` |
 | Pipeline / Feature | `ClusterPipeline.cs` | `current-entry` |
 
 ### 3.3 材质系统
 
 - `MeshAsset`：只保留几何和 region 元数据，不再直接引用具体 `Material`
 - `MeshMaterialBindings`：当前 ECS authoring 数据，数组下标就是 mesh-local material slot
-- `MaterialAsset`：单一材质资产，持有 root params + 匿名 pass entity snapshots
-- `Material`：运行时材质容器，持有 `ShaderParamBag` 和 `PassEntities[]`
-- `RenderWorld`：由 extract 阶段展开 `(source entity, material pass)` 级别的执行态实体
-- `MaterialRef`：pass entity 回指 `Material`，供管线读取共享参数
-- `BinQueue` / `BinSpace` / `MaterialSlotBuffer`：Cluster pipeline 的派生数据，用于把 RenderWorld pass entities 映射到 GPU slot/bin 路径
+- `MaterialAsset`：单一材质资产，加载后生成运行时 `Material`
+- `Material`：运行时材质容器，持有直接材质字段和 `MaterialPass[]`
+- `RenderWorld`：extract 阶段只提供 mesh/material handle 与 instance dirty state
+- `MaterialItems`：解释 `MaterialPass.Target`，维护 `MaterialBin`、SlotBuffer、material binding 和 scalar region
+- `ClusterSlotBuffer`：Cluster pipeline 内部派生数据，用于把 mesh-local material slot 映射到 raster/shade/deform bin
 - `ShaderAsset.Metadata.MaterialBindings` + `EntryPointAttributes` 已接入资源布局和 pass/component authoring 路径
 - 通用的 ECS authoring 设计见 [`docs/core/ecs_authoring.md`](core/ecs_authoring.md)
 - 材质作为其中一个实例，见 [`docs/materials/authoring_system.md`](materials/authoring_system.md)
@@ -99,25 +99,25 @@ Upload Globals
 
 | 结构 | 当前状态 |
 |---|---|
-| `GPUCluster` | 64B |
-| `GpuInstanceHeader` | `BVHRootIndex + MaterialSlotOffset + MetadataOffset + MetadataCount + BoundsExpansion` |
-| `ClusterShade` | 统一编排 ShadeBin + MaterialShade |
+| `GPUCluster` | 88B |
+| `GpuInstanceHeader` | 通过 `InstanceHeaderLayout` 注册字段写入，不硬编码 header 字段 |
+| `ClusterShadeStage` | 统一编排 ShadeBin + MaterialShade |
 
-### 3.5 资源绑定（全 Dynamic 隐式签名）
+### 3.5 资源绑定与 PipelineState
 
-- 所有 PSO 使用 `DefaultVariableType = Dynamic` + Diligent 隐式反射
-- 无显式 `IPipelineResourceSignature`（BATCH-08 已消灭 Sig0/Sig1 双签名）
-- 每个 shader group 持有 1 个 SRB，per-dispatch 绑定所有资源
-- `MaterialPSOGroup.ComputeShaderGroups()` 已有纯 CPU 测试
+- PipelineState 由 `PipelineCache` 通过完整 `ComputeState` / `GraphicsState` key 统一创建、预热和释放
+- 资源绑定由 `ShaderBindingTable` / `BindingKey` 显式描述，PipelineState key 覆盖 binding layout、shader entry、material state、render target state 等影响项
+- PipelineState 生命周期归 `PipelineCache`；cluster 内部保存 `PipelineTicket`，执行时解析为 `PipelineHandle`
+- Material binding 由 `MaterialItems` dirty/build 时解析成 `MaterialBindings`，pass 不反查 `AssetStore` / `Material`
 
 ---
 
 ## 4. Current Gaps And Next Priorities
 
-Phase 0、Phase 1、Phase 2 的当前基线工作已完成，当前剩余问题主要转为中长期维护与新系统补全：
+当前基线工作已完成，剩余问题主要转为中长期维护与新系统补全：
 
-- `src/SomeEngine.Runtime/Program.cs` 仍然过大且无测试
-- 光照 / page streaming / tessellation 仍处于下一阶段
+- `src/SomeEngine.Runtime/RuntimeApp.cs` 仍然过大且无测试
+- 光照 / page streaming / tessellation 仍待补全
 - 编辑器 / 物理 / 动画 / UI 仍未真正落地
 
 ---
@@ -128,33 +128,33 @@ Phase 0、Phase 1、Phase 2 的当前基线工作已完成，当前剩余问题�
 2. **Stage 无状态**：Stage 是纯组合函数，状态归 Pipeline 或 pass 持有
 3. **Render Graph 管理资源状态**：避免手动 barrier
 4. **Span API 优先**：避免 `unsafe`
-5. **先 hardening 再前推功能**：基线未稳时先做 corrective；当前已可进入下一阶段
+5. **Hardening 优先于功能前推**：基线未稳时优先 corrective；当前可继续补全新系统
 
 ---
 
-## 6. Implementation Phases
+## 6. Implementation Areas
 
-### Phase 0: Baseline & Documentation
+### Baseline & Documentation
 - 状态：`DONE`
 - 文档基线、tracker、debt、onboarding、batch artifacts 已接入
 
-### Phase 1: Core Hardening
+### Core Hardening
 - 状态：`DONE`
 - ECS 测试同步点、DeformCache 资源级镜像测试均已补齐
-- 全 Dynamic PSO 简化（BATCH-08：消灭 dual-sig + StaticPSOInit + SRBPool）
+- PipelineState / binding 简化：生产路径使用 `PipelineTicket`、`ShaderBindings`、`PassBindings`，不再依赖旧全局 pipeline/binding owner
 
-### Phase 2: Documentation Coverage
+### Documentation Coverage
 - 状态：`DONE`
 - ECS / QVVS / Source Generator / VRB / 资产管线文档已补齐
 
-### Phase 3: Rendering Features
+### Rendering Features
 - 状态：`CURRENT`
 - material 主线：`TASK-304`（Material ECS 重构）已完成
 - 光照系统强化
 - Page 流式加载
 - HW / SW 双路径继续稳定化
 
-### Phase 4: Engine Systems
+### Engine Systems
 - 动画系统
 - 物理系统
 - 编辑器

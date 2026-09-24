@@ -4,34 +4,21 @@
 #include "common.slang"
 #include "cluster_common.slang"
 
-// ═══════════════════════════════════════════════════════════════
-//  IVertexEvaluate — 可编程顶点变形接口
-//
-//  用户继承此接口实现自定义顶点变形（蒙皮、WPO、程序化动画等）。
-//  引擎在运行时选择 inline（光栅内联求值）或 cached（PreDeform CS）路径，
-//  用户代码无需感知。
-// ═══════════════════════════════════════════════════════════════
-
-// ── 顶点求值上下文 ──
-// 提供几何基础数据和 PageHeap 访问，用户可通过 StreamCursor
-// 读取法线/UV/骨骼权重等任意 SoA 属性流。
 struct VertexEvalContext
 {
-    // 基础几何
-    float3       objectPos;       // 反量化后物体空间位置
-    float3       worldPos;        // ApplyTransform 后世界位置
-    uint         localVertIdx;    // cluster 内局部顶点索引
-    uint         instanceID;      // 实例 ID
-    GpuTransform transform;       // 当前实例的 transform
-
-    // PageHeap 访问 — 用户可自由读取法线/UV/骨骼权重等
     ByteAddressBuffer pageHeap;
-    uint         pageOffset;      // 当前 page 在 PageHeap 中的字节偏移
-    uint         vStart;          // 顶点起始索引
-    uint         totalVertexCount;// page 内总顶点数
-    uint         attrOffset;      // PageHeader.AttributesOffset
+    uint pageOffset;
+    uint posOffset;
+    uint attrOffset;
+    uint idxOffset;
+    uint vStart;
+    uint totalVertexCount;
+    uint localVertIdx;
+    int3 intBase;
+    uint instanceID;
+    GpuTransform transform;
+    uint IsPreviousFrame;
 
-    // 构建 StreamCursor，用户按流顺序 advance 读取各属性
     StreamCursor getStreamCursor()
     {
         StreamCursor c;
@@ -41,30 +28,89 @@ struct VertexEvalContext
     }
 };
 
-// ── 核心接口 ──
-interface IVertexEvaluate
+float3 EvalObjectPosition(VertexEvalContext ctx)
 {
-    associatedtype DeformedVertex;     // 用户定义的输出结构
+    return FetchVertexPosition(
+        ctx.pageHeap,
+        ctx.pageOffset,
+        ctx.posOffset,
+        ctx.vStart,
+        ctx.localVertIdx,
+        ctx.intBase);
+}
 
-    // 核心变形 — 用户只需实现这个方法
-    DeformedVertex evaluate(VertexEvalContext ctx);
+float3 EvalWorldPosition(VertexEvalContext ctx)
+{
+    return ApplyTransform(EvalObjectPosition(ctx), ctx.transform);
+}
 
-    // 从用户自定义输出中提取世界空间位置（光栅必需）
-    float3 getPosition(DeformedVertex v);
+float3 RotateByTransform(float3 v, GpuTransform transform)
+{
+    float3 qvec = transform.Rotation.xyz;
+    float qw = transform.Rotation.w;
+    float3 uv = cross(qvec, v);
+    float3 uuv = cross(qvec, uv);
+    return v + ((uv * qw) + uuv) * 2.0;
+}
 
-    // ── Cache 序列化（压缩格式存储） ──
-    // 返回每顶点在 cache 中的字节数（编译期常量）
-    uint getCacheStride();
-    // 将 DeformedVertex 写入 cache（压缩）
-    void writeCache(RWByteAddressBuffer buf, uint byteAddr, DeformedVertex v);
-    // 从 cache 读取 DeformedVertex（解压）
-    DeformedVertex readCache(ByteAddressBuffer buf, uint byteAddr);
+struct StaticVertexAttributes
+{
+    float3 worldNormal;
+    float4 worldTangent;
+    float2 uv0;
 };
 
-// ── 默认实现：静态网格（无变形）──
+StaticVertexAttributes EvalStaticVertexAttributes(VertexEvalContext ctx)
+{
+    StreamCursor cursor = ctx.getStreamCursor();
+    uint normalBase = cursor.advance(3);
+    uint tangentBase = cursor.advance(4);
+    uint uvBase = cursor.advance(4);
+
+    float3 normal = FetchNormal3(ctx.pageHeap, normalBase, ctx.vStart, ctx.localVertIdx);
+    float4 tangent = FetchTangent(ctx.pageHeap, tangentBase, ctx.vStart, ctx.localVertIdx);
+
+    StaticVertexAttributes attrs;
+    attrs.worldNormal = normalize(RotateByTransform(normal, ctx.transform));
+    attrs.worldTangent = float4(normalize(RotateByTransform(tangent.xyz, ctx.transform)), tangent.w);
+    attrs.uv0 = FetchUV(ctx.pageHeap, uvBase, ctx.vStart, ctx.localVertIdx);
+    return attrs;
+}
+
+interface IVertexEvaluate
+{
+    associatedtype DeformedVertex;
+
+    DeformedVertex evaluate(VertexEvalContext ctx);
+    float3 getPosition(DeformedVertex v);
+
+    uint getCacheByteSize(uint vertexCount);
+    void writeCache(
+        RWByteAddressBuffer cache,
+        uint cacheBaseByte,
+        uint vertexCount,
+        uint localVertIdx,
+        DeformedVertex current,
+        DeformedVertex previous);
+    DeformedVertex readCache(
+        ByteAddressBuffer cache,
+        uint cacheBaseByte,
+        uint vertexCount,
+        uint localVertIdx);
+    DeformedVertex readPreviousCache(
+        ByteAddressBuffer cache,
+        uint cacheBaseByte,
+        uint vertexCount,
+        uint localVertIdx);
+};
+
 struct StaticDeformedVertex
 {
     float3 position;
+    float3 basePosition;
+    float3 worldNormal;
+    float4 worldTangent;
+    float2 uv0;
 };
 
 struct StaticVertexEval : IVertexEvaluate
@@ -73,8 +119,15 @@ struct StaticVertexEval : IVertexEvaluate
 
     DeformedVertex evaluate(VertexEvalContext ctx)
     {
+        float3 worldPosition = EvalWorldPosition(ctx);
+        StaticVertexAttributes attrs = EvalStaticVertexAttributes(ctx);
+
         DeformedVertex v;
-        v.position = ctx.worldPos;   // identity — 无变形
+        v.position = worldPosition;
+        v.basePosition = worldPosition;
+        v.worldNormal = attrs.worldNormal;
+        v.worldTangent = attrs.worldTangent;
+        v.uv0 = attrs.uv0;
         return v;
     }
 
@@ -83,31 +136,68 @@ struct StaticVertexEval : IVertexEvaluate
         return v.position;
     }
 
-    // Cache: float3, preserving world-space precision for cached raster/shade paths.
-    uint getCacheStride() { return 12; }
-
-    void writeCache(RWByteAddressBuffer buf, uint byteAddr, DeformedVertex v)
+    uint getCacheByteSize(uint vertexCount)
     {
-        buf.Store(byteAddr,     asuint(v.position.x));
-        buf.Store(byteAddr + 4, asuint(v.position.y));
-        buf.Store(byteAddr + 8, asuint(v.position.z));
+        return vertexCount * 72u;
     }
 
-    DeformedVertex readCache(ByteAddressBuffer buf, uint byteAddr)
+    void writeCache(
+        RWByteAddressBuffer cache,
+        uint cacheBaseByte,
+        uint vertexCount,
+        uint localVertIdx,
+        DeformedVertex current,
+        DeformedVertex previous)
     {
+        uint byteAddr = cacheBaseByte + localVertIdx * 72u;
+        cache.Store3(byteAddr + 0u, asuint(current.position));
+        cache.Store3(byteAddr + 12u, asuint(current.basePosition));
+        cache.Store3(byteAddr + 24u, asuint(current.worldNormal));
+        cache.Store4(byteAddr + 36u, asuint(current.worldTangent));
+        cache.Store2(byteAddr + 52u, asuint(current.uv0));
+        cache.Store3(byteAddr + 60u, asuint(previous.position));
+    }
+
+    DeformedVertex readCache(
+        ByteAddressBuffer cache,
+        uint cacheBaseByte,
+        uint vertexCount,
+        uint localVertIdx)
+    {
+        uint byteAddr = cacheBaseByte + localVertIdx * 72u;
         DeformedVertex v;
-        v.position = float3(
-            asfloat(buf.Load(byteAddr)),
-            asfloat(buf.Load(byteAddr + 4)),
-            asfloat(buf.Load(byteAddr + 8)));
+        v.position = asfloat(cache.Load3(byteAddr + 0u));
+        v.basePosition = asfloat(cache.Load3(byteAddr + 12u));
+        v.worldNormal = asfloat(cache.Load3(byteAddr + 24u));
+        v.worldTangent = asfloat(cache.Load4(byteAddr + 36u));
+        v.uv0 = asfloat(cache.Load2(byteAddr + 52u));
+        return v;
+    }
+
+    DeformedVertex readPreviousCache(
+        ByteAddressBuffer cache,
+        uint cacheBaseByte,
+        uint vertexCount,
+        uint localVertIdx)
+    {
+        uint byteAddr = cacheBaseByte + localVertIdx * 72u;
+        DeformedVertex v;
+        v.position = asfloat(cache.Load3(byteAddr + 60u));
+        v.basePosition = v.position;
+        v.worldNormal = float3(0.0, 1.0, 0.0);
+        v.worldTangent = float4(1.0, 0.0, 0.0, 1.0);
+        v.uv0 = float2(0.0);
         return v;
     }
 };
 
-// ── Demo: 正弦波变形 ──
 struct WaveDeformedVertex
 {
     float3 position;
+    float3 basePosition;
+    float3 worldNormal;
+    float4 worldTangent;
+    float2 uv0;
 };
 
 struct WaveVertexEval : IVertexEvaluate
@@ -116,11 +206,19 @@ struct WaveVertexEval : IVertexEvaluate
 
     DeformedVertex evaluate(VertexEvalContext ctx)
     {
-        DeformedVertex v;
+        float3 basePosition = EvalWorldPosition(ctx);
+        StaticVertexAttributes attrs = EvalStaticVertexAttributes(ctx);
+
         float freq = 3.0;
         float amplitude = 0.3;
-        float offset = sin(ctx.worldPos.x * freq) * cos(ctx.worldPos.z * freq) * amplitude;
-        v.position = ctx.worldPos + float3(0, offset, 0);
+        float offset = sin(basePosition.x * freq) * cos(basePosition.z * freq) * amplitude;
+
+        DeformedVertex v;
+        v.position = basePosition + float3(0.0, offset, 0.0);
+        v.basePosition = basePosition;
+        v.worldNormal = attrs.worldNormal;
+        v.worldTangent = attrs.worldTangent;
+        v.uv0 = attrs.uv0;
         return v;
     }
 
@@ -129,134 +227,58 @@ struct WaveVertexEval : IVertexEvaluate
         return v.position;
     }
 
-    // Cache: float3, preserving world-space precision for cached raster/shade paths.
-    uint getCacheStride() { return 12; }
-
-    void writeCache(RWByteAddressBuffer buf, uint byteAddr, DeformedVertex v)
+    uint getCacheByteSize(uint vertexCount)
     {
-        buf.Store(byteAddr,     asuint(v.position.x));
-        buf.Store(byteAddr + 4, asuint(v.position.y));
-        buf.Store(byteAddr + 8, asuint(v.position.z));
+        return vertexCount * 72u;
     }
 
-    DeformedVertex readCache(ByteAddressBuffer buf, uint byteAddr)
+    void writeCache(
+        RWByteAddressBuffer cache,
+        uint cacheBaseByte,
+        uint vertexCount,
+        uint localVertIdx,
+        DeformedVertex current,
+        DeformedVertex previous)
     {
+        uint byteAddr = cacheBaseByte + localVertIdx * 72u;
+        cache.Store3(byteAddr + 0u, asuint(current.position));
+        cache.Store3(byteAddr + 12u, asuint(current.basePosition));
+        cache.Store3(byteAddr + 24u, asuint(current.worldNormal));
+        cache.Store4(byteAddr + 36u, asuint(current.worldTangent));
+        cache.Store2(byteAddr + 52u, asuint(current.uv0));
+        cache.Store3(byteAddr + 60u, asuint(previous.position));
+    }
+
+    DeformedVertex readCache(
+        ByteAddressBuffer cache,
+        uint cacheBaseByte,
+        uint vertexCount,
+        uint localVertIdx)
+    {
+        uint byteAddr = cacheBaseByte + localVertIdx * 72u;
         DeformedVertex v;
-        v.position = float3(
-            asfloat(buf.Load(byteAddr)),
-            asfloat(buf.Load(byteAddr + 4)),
-            asfloat(buf.Load(byteAddr + 8)));
+        v.position = asfloat(cache.Load3(byteAddr + 0u));
+        v.basePosition = asfloat(cache.Load3(byteAddr + 12u));
+        v.worldNormal = asfloat(cache.Load3(byteAddr + 24u));
+        v.worldTangent = asfloat(cache.Load4(byteAddr + 36u));
+        v.uv0 = asfloat(cache.Load2(byteAddr + 52u));
         return v;
     }
-};
 
-// ═══════════════════════════════════════════════════════════════
-//  IVertexSource — 光栅 kernel 的顶点来源抽象
-//
-//  InlineSource<T>: 光栅时内联调用 T.evaluate()
-//  CachedSource<T>: 从 PreDeform 填充的 DeformedCacheBuffer 读取
-// ═══════════════════════════════════════════════════════════════
-
-// ── 顶点 Fetch 参数包 ──
-struct VertexFetchArgs
-{
-    ByteAddressBuffer pageHeap;
-    uint     pageOffset;
-    uint     posOffset;
-    uint     attrOffset;
-    uint     totalVertexCount;
-    uint     vStart;
-    int3     intBase;
-    uint     localVertIdx;
-    uint     instanceID;
-    GpuTransform transform;
-    float3   quantOrigin;
-    float    quantStep;
-    float4x4 viewProj;
-    uint     visibleClusterIndex;  // DeformCache 寻址用
-};
-
-interface IVertexSource
-{
-    float4 fetchClipPosition(VertexFetchArgs args);
-};
-
-// ── 辅助：从 PageHeap 读取并反量化顶点位置 ──
-float3 dequantizePosition(VertexFetchArgs args)
-{
-    uint posByteAddr = args.pageOffset + args.posOffset
-                     + (args.vStart + args.localVertIdx) * 6;
-    uint alignedAddr = posByteAddr & ~3u;
-    uint offset = posByteAddr & 3u;
-    uint2 raw = args.pageHeap.Load2(alignedAddr);
-
-    uint p0, p1, p2;
-    if (offset == 0)
+    DeformedVertex readPreviousCache(
+        ByteAddressBuffer cache,
+        uint cacheBaseByte,
+        uint vertexCount,
+        uint localVertIdx)
     {
-        p0 = raw.x & 0xFFFF;
-        p1 = (raw.x >> 16) & 0xFFFF;
-        p2 = raw.y & 0xFFFF;
-    }
-    else
-    {
-        p0 = (raw.x >> 16) & 0xFFFF;
-        p1 = raw.y & 0xFFFF;
-        p2 = (raw.y >> 16) & 0xFFFF;
-    }
-
-    int3 globalIntPos = int3(int(p0), int(p1), int(p2)) + args.intBase;
-    return float3(globalIntPos) * args.quantStep + args.quantOrigin;
-}
-
-// ── Inline Source: 光栅时内联调用变形 ──
-struct InlineSource<T : IVertexEvaluate> : IVertexSource
-{
-    T evaluator;    // 持有用户实例（含资源绑定）
-
-    float4 fetchClipPosition(VertexFetchArgs args)
-    {
-        float3 objectPos = dequantizePosition(args);
-        float3 worldPos  = ApplyTransform(objectPos, args.transform);
-
-        VertexEvalContext ctx;
-        ctx.objectPos       = objectPos;
-        ctx.worldPos        = worldPos;
-        ctx.localVertIdx    = args.localVertIdx;
-        ctx.instanceID      = args.instanceID;
-        ctx.transform       = args.transform;
-        ctx.pageHeap        = args.pageHeap;
-        ctx.pageOffset      = args.pageOffset;
-        ctx.vStart          = args.vStart;
-        ctx.totalVertexCount = args.totalVertexCount;
-        ctx.attrOffset      = args.attrOffset;
-
-        T.DeformedVertex v = evaluator.evaluate(ctx);
-        float3 finalWorldPos = evaluator.getPosition(v);
-        return mul(float4(finalWorldPos, 1.0), args.viewProj);
-    }
-};
-
-// ── Cached Source: 从 DeformCache 读取预变形顶点 ──
-struct CachedSource<TVE : IVertexEvaluate> : IVertexSource
-{
-    ByteAddressBuffer deformCache;
-    StructuredBuffer<uint> cacheOffsets;  // 单独的寻址 buffer
-    TVE evaluator;
-
-    float4 fetchClipPosition(VertexFetchArgs args)
-    {
-        uint baseByte = cacheOffsets[args.visibleClusterIndex];
-        if (baseByte >= 0xFFFFFFFDu)
-        {
-            InlineSource<TVE> fallback;
-            fallback.evaluator = evaluator;
-            return fallback.fetchClipPosition(args);
-        }
-
-        uint byteAddr = baseByte + args.localVertIdx * evaluator.getCacheStride();
-        TVE.DeformedVertex v = evaluator.readCache(deformCache, byteAddr);
-        float3 worldPos = evaluator.getPosition(v);
-        return mul(float4(worldPos, 1.0), args.viewProj);
+        uint byteAddr = cacheBaseByte + localVertIdx * 72u;
+        DeformedVertex v;
+        v.position = asfloat(cache.Load3(byteAddr + 60u));
+        v.basePosition = v.position;
+        v.worldNormal = float3(0.0, 1.0, 0.0);
+        v.worldTangent = float4(1.0, 0.0, 0.0, 1.0);
+        v.uv0 = float2(0.0);
+        return v;
     }
 };
 

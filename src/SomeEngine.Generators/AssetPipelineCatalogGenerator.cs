@@ -7,7 +7,7 @@ using Microsoft.CodeAnalysis;
 namespace SomeEngine.Generators;
 
 [Generator]
-public sealed class AssetPipelineCatalogGenerator : IIncrementalGenerator
+public sealed class AssetCatalogGen : IIncrementalGenerator
 {
     private const string ProviderInterfaceName = "SomeEngine.Assets.IAssetProvider";
     private const string ImporterInterfaceName = "SomeEngine.Assets.IAssetImporter";
@@ -21,7 +21,7 @@ public sealed class AssetPipelineCatalogGenerator : IIncrementalGenerator
                 string source = GenerateCatalog(compilation);
                 if (!string.IsNullOrEmpty(source))
                 {
-                    spc.AddSource("GeneratedAssetPipelineCatalog.g.cs", source);
+                    spc.AddSource("AssetCatalog.g.cs", source);
                 }
             });
     }
@@ -50,7 +50,7 @@ public sealed class AssetPipelineCatalogGenerator : IIncrementalGenerator
         sb.AppendLine();
         sb.AppendLine("namespace SomeEngine.Assets;");
         sb.AppendLine();
-        sb.AppendLine("public static class GeneratedAssetPipelineCatalog");
+        sb.AppendLine("public static class AssetCatalog");
         sb.AppendLine("{");
         sb.AppendLine("    public static IReadOnlyList<IAssetProvider> CreateProviders()");
         sb.AppendLine("        => new IAssetProvider[]");

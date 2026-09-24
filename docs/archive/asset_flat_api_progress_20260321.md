@@ -40,8 +40,8 @@
 
 已完成：
 
-- `SourceMetaManager`
-- `AssetMetaManager`
+- `SourceMetaFiles`
+- `AssetMetaFiles`
 - `SlangShaderImporter` 的稳定 GUID 导入链
 - include/import dependency 追踪
 - fingerprint 判定
@@ -94,12 +94,12 @@
 manifest 当前已支持的索引/反查：
 
 - `TryGetAsset(AssetGuid)`
-- `TryGetAssetByPath(string)`
-- `TryGetSourcePath(SourceGuid)`
-- `TryGetSourceGuid(string)`
-- `GetAssetsBySource(SourceGuid)`
-- `GetAssetsBySourcePath(string)`
-- `TryGetAssetBySourceAndSubAssetKey(SourceGuid, string)`
+- `TryAssetPath(string)`
+- `TrySourcePath(SourceGuid)`
+- `TrySourceGuid(string)`
+- `AssetsBySource(SourceGuid)`
+- `AssetsBySourcePath(string)`
+- `TrySourceAsset(SourceGuid, string)`
 
 manifest 当前已支持的图能力：
 
@@ -149,10 +149,10 @@ manifest 当前已支持的图能力：
 - `Get(AssetId)`
 - `TryGetPath(AssetId)`
 - `TryGetId(string assetPath)`
-- `TryGetSourcePath(SourceGuid)`
-- `TryGetSourceGuid(string sourcePath)`
-- `GetAssetsBySource(SourceGuid)`
-- `GetAssetsBySourcePath(string)`
+- `TrySourcePath(SourceGuid)`
+- `TrySourceGuid(string sourcePath)`
+- `AssetsBySource(SourceGuid)`
+- `AssetsBySourcePath(string)`
 - `List(string? assetType)`
 - `List<TAsset>()`
 - `GetDependencies(AssetId)`

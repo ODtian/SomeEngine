@@ -69,3 +69,24 @@ Dev Lead 负责任务拆分、batch 编排、review 和 debt 分流。
 - Batch review 后
 - 任务状态变化后
 - 新增/解决 debt 后
+
+## Decision Log
+
+> 来自 .codex 工作区 Render Graph 调研 batch 的架构决策迁移
+
+| Date | Decision | Rationale |
+|---|---|---|
+| 2026-06-21 | Handle-based resource ref over string-based | 零开销查找，string 仅 debug |
+| 2026-06-21 | Greedy interval aliasing over ILP | O(n log n) 且足够好 |
+| 2026-06-21 | Phase pipeline (IRenderGraphPhase) | 可扩展，参考 AMD RPS |
+| 2026-06-21 | D3D12 Enhanced Barrier priority | 更精确，减少不必要 transition |
+| 2026-06-21 | No Immediate Mode | UE5 的 immediate mode 是迁移期逃逸阀，我们从头设计不需要 |
+| 2026-06-21 | MarkOutput() over NeverCull flag | NeverCull 是声明式盲区的妥协，显式 output 才是正道 |
+| 2026-06-21 | All passes must declare dependencies | UE5 parameterless pass 破坏声明式模型，无图外 pass |
+| 2026-06-21 | Unified external resource model | 无 UseExternalAccessMode，ResourceFlags.External 自动处理 barrier |
+| 2026-06-21 | Explicit setOutput() over extraction side effect | QueueTextureExtraction 副作用隐式决定 culling root，不可 |
+| 2026-06-21 | Builder→Compiled→Executed typestate | Compile 后不可 addPass，类型系统保证 |
+| 2026-06-21 | CompileConfig over global CVar | UE5 GRDG* 全局变量不可测试、不可组合 |
+| 2026-06-21 | Explicit queue declaration | UE5 OverridePassFlags 隐式转换 queue 是 bug 温床 |
+| 2026-06-21 | MergeGroup over implicit merge | UE5 pass merge 隐式且不可预测，用户显式声明组才合并 |
+| 2026-06-21 | Chain API over _RDG_ macro reflection | C# 可用 Source Generator 但核心模型不依赖反射 |

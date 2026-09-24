@@ -2,19 +2,21 @@ using System.IO;
 using SomeEngine.Assets;
 using SomeEngine.Assets.Pipeline;
 using SomeEngine.Assets.Schema;
+using static SomeEngine.Tests.TestProjectPaths;
 
 namespace SomeEngine.Tests.Assets;
 
-public class GeneratedAssetPipelineCatalogTests
+public class AssetCatalogTests
 {
     [Fact]
     public void CreateProvidersAndImporters_ExposeBuiltInAssetPipelineTypes()
     {
-        IReadOnlyList<IAssetProvider> providers = GeneratedAssetPipelineCatalog.CreateProviders();
-        IReadOnlyList<IAssetImporter> importers = GeneratedAssetPipelineCatalog.CreateImporters();
+        IReadOnlyList<IAssetProvider> providers = AssetCatalog.CreateProviders();
+        IReadOnlyList<IAssetImporter> importers = AssetCatalog.CreateImporters();
 
         Assert.Contains(providers, provider => provider.AssetType == nameof(ShaderAsset));
         Assert.Contains(providers, provider => provider.AssetType == nameof(MaterialAsset));
+        Assert.Contains(providers, provider => provider.AssetType == nameof(ClusterRenderAsset));
         Assert.Contains(providers, provider => provider.AssetType == nameof(MaterialInstanceAsset));
         Assert.Contains(providers, provider => provider.AssetType == nameof(MeshAsset));
         Assert.Contains(providers, provider => provider.AssetType == nameof(TextureAsset));
@@ -32,7 +34,7 @@ public class GeneratedAssetPipelineCatalogTests
             AssetGuid materialGuid = AssetGuid.New();
             string materialPath = Path.Combine(dir, "assets", "Materials", "generated.material.asset");
             Directory.CreateDirectory(Path.GetDirectoryName(materialPath)!);
-            MaterialAssetSerializer.Save(new MaterialAsset
+            MaterialAssetCodec.Save(new MaterialAsset
             {
                 AssetGuid = materialGuid.ToFlatString(),
                 Name = "GeneratedMaterial",
@@ -41,7 +43,7 @@ public class GeneratedAssetPipelineCatalogTests
                 Scalars = [],
             }, materialPath);
 
-            AssetDatabase db = GeneratedAssetPipelineCatalog.CreateDatabase(dir);
+            AssetDatabase db = AssetCatalog.CreateDatabase(dir);
             db.Import("assets/Materials/generated.material.asset");
             MaterialAsset? loaded = db.Load<MaterialAsset>("assets/Materials/generated.material.asset");
 
@@ -54,10 +56,4 @@ public class GeneratedAssetPipelineCatalogTests
         }
     }
 
-    private static string CreateTempDir()
-    {
-        string dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
-        Directory.CreateDirectory(dir);
-        return dir;
-    }
 }

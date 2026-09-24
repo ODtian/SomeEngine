@@ -1,117 +1,112 @@
-# Compute Shade Pipeline 设计文档
+# 着色管线
 
-> **状态：✅ 全 Dynamic 隐式签名方案已实施（BATCH-08）**
+> 当前有效方向：旧 shade bin、旧 material slot、旧 PipelineState slice、`ClusterPipelineStateSet` 设计全部作废。保留 SlotBuffer 和 binning 算法，但归 pipeline 内部派生数据所有。
 
----
+## 作废内容
 
-## 1. 概要
+Material shade 不再通过：
 
-VisBuffer Resolve + Compute Material Shading，参考 UE5 Nanite Compute Shade Binning。
+- shade bin 旧公共框架。
+- material slot buffer 旧协议。
+- slot offset 写回 `RenderWorld`。
+- PipelineState slice。
+- `ClusterPipelineStateSet`。
+- 旧 binding set cache。
+- reflected bind recipe。
+- cluster-specific baker output。
 
-当前管线：
+这些概念不能改名保留。
 
-`VisBuffer → ShadeBin (Count/Reserve/Scatter) → MaterialPSOGroup 分组 → Per-Bin MaterialShade Dispatch → Color`
+## 输入
 
----
+Shade pass 从 pipeline 派生 item 直接驱动。item 来源是：
 
-## 2. Shade Binning（3-Pass Counting Sort）
-
-### Pass 1: Count
-- 全屏 CS，每线程读 VisBuffer 像素
-- 查询 `MaterialSlotBuffer[offset + localMaterialIndex].ShadingBin`
-- 对每个 Bin `InterlockedAdd` 累计像素数 → `BinCounts[]`
-
-### Pass 2: Reserve
-- 对 `BinCounts[]` 做前缀和
-- 计算每 Bin 在全局输出数组中的起始偏移 → `BinOffsets[]`
-
-### Pass 3: Scatter
-- 再次全屏 CS，每像素按 Bin ID + `BinOffsets[]` 写入像素坐标
-- 输出：紧凑的 `PixelCoordBuffer[]`，按 Bin 分段排列
-
-### 实现文件
-
-| 文件 | 职责 |
-|------|------|
-| `ClusterShadeBinningPass.cs` | ShadeBinningResources + Count/Reserve/Scatter 三个 pass 类 |
-| `ClusterShade.cs` | 静态编排器，组合 ShadeBin + MaterialShade |
-| `cluster_shade_binning.slang` | GPU shader |
-
----
-
-## 3. Material Shade Dispatch
-
-对每个 Shade Bin dispatch 一次 CS：
-
-1. 读 `PixelCoordBuffer` → `(x, y)`
-2. 读 VisBuffer → `VisibleClusterIndex + TriangleID`
-3. 反查 PageHeap 顶点，计算重心坐标
-4. 插值 UV/Normal/Tangent
-5. 材质求值（PBR: BaseColor/Normal/Metallic/Roughness）
-6. 写入 `OutputColor` UAV
-
-### 全 Dynamic 隐式签名绑定（BATCH-08）
-
-所有资源使用单一 `PipelineResourceLayoutDesc { DefaultVariableType = Dynamic }` + Diligent 隐式反射。不再有显式 `IPipelineResourceSignature`。
-
-每个 shader group（连续同 shader 的 bin）持有 **1 个 SRB**，每次 dispatch 前通过 `Set()` 绑定所有资源（per-pass + per-material），利用 Diligent 的 ring buffer 自动回收描述符。
-
-```
-PSO 创建: per-shader-group，通过 GlobalPsoCache 缓存
-SRB 创建: per-group 一次（存入 MaterialPSOGroup.SRB）
-每帧执行: Set(所有资源) → CommitShaderResources → DispatchComputeIndirect
-描述符回收: ring buffer 自动回收，无需手动 Dispose
+```text
+RenderWorld instance state
+AssetStore runtime asset
+Material
+MaterialPass
+Shader
+pipeline visibility result
+pipeline SlotBuffer
 ```
 
-#### Immutable Sampler
+`RenderWorld` 只提供 CPU 对象状态，不提供 material pass entity、shader entry fact、slot/bin、PipelineState 或 BindSet。
 
-`MaterialSampler` 烘入 `PipelineResourceLayoutDesc.ImmutableSamplers`，运行时零 sampler 描述符开销。材质运行时 API 不再提供 sampler override；需要修改 sampler 时应调整管线签名/PSO 定义。
+## SlotBuffer
 
-### 泛型着色管线
+Shade pass 可以消费 pipeline-owned SlotBuffer。
 
-```slang
-void CSShade<TVE : IVertexEvaluate, TMaterial : ISurfaceEvaluate>(
-    uniform TVE vertexEval, uniform TMaterial material, uint3 tid)
+SlotBuffer 是 GPU index table：
+
+```text
+slot offset + local index + shade field -> shade bin / material group
 ```
 
-- `IVertexEvaluate`：顶点变形（Static/Wave/Skinned）
-- `ISurfaceEvaluate`：材质求值（StandardPBR/Unlit/Custom）
+SlotBuffer 不再叫 material slot buffer。slot offset 进入 pipeline instance header，不写回 `RenderWorld` source state。
 
-### 实现文件
+## Bin
 
-| 文件 | 职责 |
-|------|------|
-| `ClusterMaterialShadePass.cs` | Per-bin dispatch，绑定 per-pass + per-material 资源到 group SRB |
-| `ClusterShade.cs` | PSO 分组构建、pass 编排、`StaticPSOInit.Once` 初始化 |
-| `MaterialPSOGroup.cs` | 纯 CPU break-on-change 分组逻辑 + SRB 持有 + IDisposable |
-| `cluster_shade_material.slang` | 标准 PBR 着色 |
-| `cluster_shade_unlit.slang` | Unlit 着色 |
-| `cluster_shade_pipeline.slang` | 泛型着色管线共享代码 |
-| `vertex_evaluate.slang` | IVertexEvaluate 接口 + 实现 |
+Shade binning 算法保留：
 
----
+- count。
+- reserve。
+- scatter。
+- bin counts。
+- bin offsets。
+- indirect args。
+- pixel coord buffer。
 
-## 4. 样板代码基础设施
+输入从旧 material slot buffer 改为 pipeline SlotBuffer 和 pipeline material/bin table。
 
-### StaticPSOInit
+逻辑仍然是：
 
-所有 PSO 类的 `EnsureInitialized` 使用 `StaticPSOInit.Once(ref bool, Lock, Action)` 消除手写 double-check 样板。
+```text
+vis buffer / visible clusters
+  -> 查 instance
+  -> 查 local material index
+  -> 查 SlotBuffer
+  -> 得到 shade bin
+  -> 写入对应 bin 的 count / offset / args
+```
 
-### SRBPool
+## PipelineState
 
-所有 PSO 类的 SRB 池使用 `SRBPool` 类封装 `ConcurrentBag<IShaderResourceBinding>`，提供 `Rent(pso)` / `Return(srb)` 接口。
+Shade pass 不使用 `ClusterPipelineStateSet` 或 dispatch table。
 
----
+Shade pass 通过全局 PipelineCache 在 dirty 时声明 PipelineState 需求，得到 `PipelineTicket`。pass、material bin 或 pipeline 派生数据只保存 ticket；执行路径通过 `RenderGraphContext.GetPipeline` 解析 ready `PipelineHandle`。
 
-## 5. 当前状态
+PipelineState 生命周期归全局 PipelineCache。
 
-- [x] ShadeBin 3-pass（Count / Reserve / Scatter）
-- [x] `ClusterShade` 静态编排器替代原 `ClusterShadeBinStage` / `ClusterShadeStage`
-- [x] `MaterialPSOGroup.ComputeShaderGroups()` 按 shader break-on-change 分组
-- [x] 全 Dynamic 隐式签名绑定（BATCH-08：消灭 Sig0/Sig1 双签名）
-- [x] Dynamic SRB per-group（BATCH-08：per-dispatch Set + Commit）
-- [x] Immutable Sampler（BATCH-08：MaterialSampler 烘入 layout）
-- [x] StaticPSOInit + SRBPool 样板消除（BATCH-08：覆盖全部 PSO 类）
-- [ ] 1x1 vs 2x2 Quad 双模式（当前统一 1x1）
-- [ ] 更多 `ISurfaceEvaluate` 实现（SSS、Refraction 等）
-- [ ] Bindless 描述符索引（Dynamic SRB 为中间态）
+## Binding
+
+Shade pass 不使用旧 `BindRecipe`、`BindRole` 或旧 binding set cache。
+
+Material 字段由生成器生成 binding input。Shade pass 用 binding input 查全局 BindSet owner，取得 `BindingSetHandle`。
+
+frame、pass、material、transient binding handle 放在使用位置，不包成聚合引用。
+
+## Vertex
+
+着色管线不消费 `VertexLayoutReq`。
+
+mesh/shader 基础兼容性只由 vertex stride check 提供：
+
+```text
+mesh vertex stride == shader entry required stride
+```
+
+attribute 语义由 shader/eval 自己解释，不进入通用 material pass。
+
+## Baker
+
+着色管线不消费 cluster-specific baker output。
+
+`ClusterShaderBaker`、`ClusterComponentBaker`、`ClusterPassRules` 这类把材质直接烘成 cluster shade component 的设计作废。
+
+shade pass 从运行时 material、shader metadata、pipeline item、SlotBuffer 和 GPU buffer 构建提交数据。
+
+## 重建参考
+
+- [RenderWorld 与 Pipeline Reference](render_world_pipeline_reference.md)
+- [RenderWorld 与 Material 重构文档](render_world_pipeline_refactor.md)
